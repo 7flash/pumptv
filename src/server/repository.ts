@@ -22,6 +22,7 @@ function toClip(row: any): Clip {
     requestId: row.requestId,
     videoUrl: row.videoUrl,
     expandedPrompt: row.expandedPrompt ?? null,
+    h3Prompt: row.h3Prompt ?? null,
     inferenceSeconds: row.inferenceSeconds ?? null,
     directive: row.directive,
     directiveId: row.directiveId ?? null,
@@ -31,6 +32,10 @@ function toClip(row: any): Clip {
     resolution: row.resolution,
     startsAtMs: Number(row.startsAtMs || 0),
     durationSeconds: Number(row.durationSeconds || 5),
+    showrunnerModel: row.showrunnerModel ?? null,
+    showrunnerPlanJson: row.showrunnerPlanJson ?? null,
+    showrunnerInputTokens: row.showrunnerInputTokens ?? null,
+    showrunnerOutputTokens: row.showrunnerOutputTokens ?? null,
   };
 }
 
@@ -213,9 +218,34 @@ export async function recoverGeneratingDirectives() {
 
 export async function recentStory(limit = 6) {
   const rows = await dbMeasure.measureSync("Load recent canon", () =>
-    db.clips.select("directive").orderBy("episode", "DESC").limit(limit).all(),
+    db.clips.select().orderBy("episode", "DESC").limit(limit).all(),
   );
-  return (rows || []).reverse().map((row: any) => row.directive as string);
+
+  return (rows || []).reverse().map((row: any) => {
+    if (row.showrunnerPlanJson) {
+      try {
+        const plan = JSON.parse(row.showrunnerPlanJson) as {
+          premise?: string;
+          action?: string;
+          endingBeat?: string;
+        };
+        return [
+          `Directive: ${row.directive}`,
+          plan.premise ? `Premise: ${plan.premise}` : null,
+          plan.action ? `Action: ${plan.action}` : null,
+          plan.endingBeat ? `Ending: ${plan.endingBeat}` : null,
+        ]
+          .filter(Boolean)
+          .join(" | ");
+      } catch {
+        // Legacy/bad plan JSON falls through to durable prompt/directive canon.
+      }
+    }
+
+    return row.h3Prompt
+      ? `Directive: ${row.directive} | Generated shot: ${row.h3Prompt}`
+      : String(row.directive);
+  });
 }
 
 export async function nextEpisode() {

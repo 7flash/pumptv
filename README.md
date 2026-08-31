@@ -1,12 +1,13 @@
 # SLOP TV
 
-An endless shared AI-generated livestream where the audience decides what happens next. v0.5 replaces the unbounded prompt FIFO with a **scene ballot**: web viewers and Pump.fun chat propose ideas, each identity gets one movable vote, one winner becomes canon, and every losing idea expires.
+An endless shared AI-generated livestream where the audience decides what happens next. v0.6 adds a **jsx-ai showrunner** between the winning scene ballot and MiniMax H3 Max: chat chooses intent, the showrunner turns it into a structured five-second shot plan, and deterministic code renders the final H3 prompt.
 
 ## Stack
 
 - **TradJS** server + `tradjs/client` frontend
 - **sqlite-zod-orm** for rooms, ballots, proposals, votes, winning directives, clips, and leases
-- **measure-fn** for HTTP / DB / arbitration / worker / Pump.fun / fal boundaries
+- **measure-fn** for HTTP / DB / arbitration / worker / Pump.fun / showrunner / fal boundaries
+- **jsx-ai** for composable, provider-agnostic showrunner prompting and structured tool output
 - **fal + MiniMax H3 Max** for video
 - **fal FFmpeg Extract Frame** for server-side last-frame continuity
 - a small read-only Pump.fun Socket.IO adapter over `ws`
@@ -15,7 +16,7 @@ An endless shared AI-generated livestream where the audience decides what happen
 
 ```bash
 cp .env.example .env
-# add FAL_KEY and optionally SLOP_PUMPFUN_MINT
+# add FAL_KEY + the API key for SLOP_SHOWRUNNER_MODEL; optionally add SLOP_PUMPFUN_MINT
 bun install
 bun run dev:all
 ```
@@ -28,6 +29,51 @@ bun run worker
 ```
 
 Open `http://localhost:3000`.
+
+
+## Prompt generation / AI showrunner
+
+Raw viewer text is **not** sent directly to H3 anymore. The generation path is:
+
+```text
+winning ballot directive
+        │
+        ▼
+jsx-ai ShowrunnerPrompt.tsx
+  system rules + recent canon
+  + untrusted viewer directive
+        │
+        ▼
+emit_shot_plan tool call
+  premise / action / continuity
+  camera / visuals / audio
+  dialogue / endingBeat
+        │
+        ▼
+deterministic renderH3Prompt()
+        │
+        ▼
+MiniMax H3 Max
+```
+
+`src/server/showrunner.tsx` uses `jsx-ai`'s custom JSX runtime and `callLLM()`. Provider selection is controlled by the model name:
+
+```bash
+SLOP_SHOWRUNNER_MODEL=gemini-2.5-flash
+GEMINI_API_KEY=...
+
+# alternatives:
+# SLOP_SHOWRUNNER_MODEL=gpt-4o
+# OPENAI_API_KEY=...
+# SLOP_SHOWRUNNER_MODEL=claude-3-5-haiku-latest
+# ANTHROPIC_API_KEY=...
+```
+
+The showrunner must call one `emit_shot_plan` tool. Its arguments are validated before use. If the showrunner provider is unavailable or returns malformed output, the worker falls back to a deterministic continuity plan so the live stream can keep moving.
+
+Viewer/Pump.fun text is only placed in a user-role message and is explicitly treated as untrusted story intent. It never enters the system instruction block.
+
+Every clip persists `showrunnerModel`, the structured plan JSON, showrunner token usage, the exact H3 prompt, and fal's expanded prompt. This makes prompt behavior replayable/debuggable and gives us data for later showrunner evals.
 
 ## Pump.fun commands
 
@@ -78,7 +124,7 @@ current generated buffer
 │ tie: earliest idea   │
 └──────────┬───────────┘
            │
-           ├── winner -> durable directive -> H3 Max -> canon
+           ├── winner -> durable directive -> jsx-ai showrunner -> H3 Max -> canon
            │
            └── losers -> expired forever
 ```
@@ -190,6 +236,11 @@ No failed generation can silently pick a different chat winner.
                              │
                     one winning directive
                              │
+                     jsx-ai showrunner
+                  structured five-second plan
+                             │
+                    deterministic H3 prompt
+                             │
             previous clip -> last-frame extract
                              │
                              ▼
@@ -242,8 +293,9 @@ src/
     pumpfun.ts                # !next / !vote adapter
     pumpfun-socket.ts
     worker.ts                 # buffer-aware ballot deadline + generation
-    generate.ts
-    prompt.ts
+    generate.ts               # fal orchestration
+    showrunner.tsx             # jsx-ai LLM shot planner
+    prompt.ts                  # sanitization + deterministic H3 renderer
     state-stream.ts
     observability.ts
 ```
@@ -255,6 +307,7 @@ src/
 - `arbitration`
 - `worker`
 - `pumpfun`
+- `showrunner`
 - `fal`
 
 The important latency to watch in production is the distribution from **ballot lock → generated clip persisted**. That measurement should drive the generation-lead setting rather than a fixed guess forever.

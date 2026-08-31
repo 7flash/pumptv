@@ -12,6 +12,7 @@ export type Clip = {
   requestId: string;
   videoUrl: string;
   expandedPrompt: string | null;
+  h3Prompt: string | null;
   inferenceSeconds: number | null;
   directive: string;
   directiveId: number | null;
@@ -21,6 +22,10 @@ export type Clip = {
   resolution: Resolution;
   startsAtMs: number;
   durationSeconds: number;
+  showrunnerModel: string | null;
+  showrunnerPlanJson: string | null;
+  showrunnerInputTokens: number | null;
+  showrunnerOutputTokens: number | null;
 };
 
 export type Directive = {

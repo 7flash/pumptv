@@ -1,7 +1,8 @@
 import { fal } from "@fal-ai/client";
 import type { Clip, Resolution } from "../shared/contracts.ts";
 import { falMeasure } from "./observability.ts";
-import { AUTOPILOT, buildPrompt, OPENING } from "./prompt.ts";
+import { AUTOPILOT, OPENING, renderH3Prompt } from "./prompt.ts";
+import { planNextShot } from "./showrunner.tsx";
 import {
   claimQueuedDirective,
   completeDirective,
@@ -49,9 +50,14 @@ export async function generateNextClip(input: {
       ? await extractLastFrame(input.previousClip.videoUrl)
       : null;
 
-    const prompt = buildPrompt({
+    const showrunner = await planNextShot({
       directive,
       recentStory: story,
+      episode,
+      hasAnchor: Boolean(anchorFrameUrl),
+    });
+    const prompt = renderH3Prompt({
+      plan: showrunner.plan,
       episode,
       hasAnchor: Boolean(anchorFrameUrl),
     });
@@ -104,6 +110,7 @@ export async function generateNextClip(input: {
       requestId: result.requestId,
       videoUrl: data.video.url,
       expandedPrompt: data.expanded_prompt ?? null,
+      h3Prompt: prompt,
       inferenceSeconds: data.timings?.inference ?? null,
       directive,
       directiveId: claimed?.id ?? null,
@@ -113,6 +120,10 @@ export async function generateNextClip(input: {
       resolution: input.resolution,
       startsAtMs,
       durationSeconds: CLIP_SECONDS,
+      showrunnerModel: showrunner.model,
+      showrunnerPlanJson: JSON.stringify(showrunner.plan),
+      showrunnerInputTokens: showrunner.inputTokens,
+      showrunnerOutputTokens: showrunner.outputTokens,
     });
 
     if (claimed) await completeDirective(claimed.id);
