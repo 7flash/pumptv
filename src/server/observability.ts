@@ -1,7 +1,11 @@
 import { configure, createMeasure } from "measure-fn";
 
+const measureSilent = /^(1|true|yes)$/i.test(
+  (process.env.MEASURE_SILENT || "").trim(),
+);
+
 configure({
-  silent: process.env.MEASURE_SILENT !== "0",
+  silent: measureSilent,
   timestamps: process.env.MEASURE_TIMESTAMPS !== "0",
   maxResultLength: 240,
 });

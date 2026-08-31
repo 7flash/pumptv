@@ -890,18 +890,82 @@ export async function closePromptRoundIfDue(now = Date.now()) {
   return closePromptRound();
 }
 
-export async function operatorInjectAndForce(text: string) {
+export async function operatorInjectProposal(text: string) {
   const round = await roundForNewSuggestion();
   const sourceId = `operator:${Date.now()}:${crypto.randomUUID()}`;
-  const proposal = await submitPumpfunProposal({
-    text,
-    sourceId,
-    author: "operator",
-    authorAddress: null,
-    sourceRoom: "cli",
-    voterKey: sourceId,
-    voterHandle: "operator",
+
+  return dbMeasure.measureSync.assert("Inject operator proposal", () => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      let proposal =
+        db.raw<any>(
+          `SELECT * FROM proposals WHERE roundId = ? AND normalizedText = ? AND status = 'open' LIMIT 1`,
+          round.id,
+          normalizeProposalText(text),
+        )[0] || null;
+      if (!proposal) proposal = similarProposal(round.id, text);
+
+      if (!proposal) {
+        const count = Number(
+          (
+            db.raw<any>(
+              `SELECT COUNT(*) AS count FROM proposals WHERE roundId = ?`,
+              round.id,
+            )[0] || {}
+          ).count || 0,
+        );
+        if (count >= MAX_PROPOSALS_PER_ROUND) {
+          db.exec("COMMIT");
+          return null;
+        }
+
+        proposal = db.proposals.insert({
+          roundId: round.id,
+          text,
+          normalizedText: normalizeProposalText(text),
+          status: "open",
+          source: "pumpfun",
+          sourceId,
+          author: "operator",
+          authorAddress: null,
+          sourceRoom: "cli",
+          operatorVoteOverride: null,
+        });
+      }
+
+      if (!proposal) throw new Error("Could not inject operator proposal");
+
+      // Operator injection is intentionally NOT a Pump.fun chat event:
+      // it adds a candidate, but does not start the voting deadline and
+      // does not create a queued generation directive. `control trigger`
+      // is the explicit commit boundary.
+      db.proposalVotes.insert({
+        roundId: round.id,
+        proposalId: Number((proposal as any).id),
+        voterKey: sourceId,
+        voterHandle: "operator",
+        source: "pumpfun",
+        sourceId,
+      });
+
+      db.exec("COMMIT");
+      const loaded = loadRoundById(round.id);
+      if (!loaded) throw new Error("Could not reload operator proposal round");
+      return (
+        loaded.proposals.find((p) => p.id === Number((proposal as any).id)) ||
+        null
+      );
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
   });
+}
+
+export async function operatorInjectAndForce(text: string) {
+  const proposal = await operatorInjectProposal(text);
   if (!proposal) throw new Error("Could not inject operator proposal");
   return closePromptRound(proposal.id);
 }

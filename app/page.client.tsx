@@ -1224,8 +1224,8 @@ function CandidateRows({
   );
 }
 
-function LiveProgramOverlay() {
-  if (!program) return null;
+function OutsideProgram() {
+  if (!program || !liveOverlayEnabled) return null;
 
   const phase = program.phase;
   const generating =
@@ -1243,84 +1243,160 @@ function LiveProgramOverlay() {
       ? votingRound
       : null;
 
-  if (phase === "idle" && !votingRound?.proposals.length) {
-    return (
-      <div
-        className="liveProgram idleProgram"
-        title="Waiting for Pump.fun suggestions"
-      >
-        <span>•••</span>
-      </div>
-    );
-  }
-
   return (
-    <div
-      className={`liveProgram phase-${phase} ${generating ? "generating" : ""} ${ready ? "ready" : ""}`}
+    <section
+      className={`outsideProgram phase-${phase} ${generating ? "generating" : ""} ${ready ? "ready" : ""}`}
+      title={program.reason || tooltipStatus()}
+      aria-label="Next episode status"
     >
-      <div className="programGlass">
-        <div className="programPulse" aria-hidden="true">
-          <i />
-          <i />
-          <i />
-        </div>
-        <div className="programHead">
-          <span className="programEpisode">{program.targetEpisode + 1}</span>
-          {voting && program.countdownEndsAtMs ? (
-            <strong data-vote-countdown>
-              {formatClock(program.countdownEndsAtMs - liveNowMs())}
-            </strong>
-          ) : null}
-          {generating && program.generationStartedAtMs ? (
-            <strong data-generation-elapsed>
-              {formatClock(liveNowMs() - program.generationStartedAtMs)}
-            </strong>
-          ) : null}
-          {!voting && !generating ? <strong>{stageGlyph(phase)}</strong> : null}
-        </div>
-
-        {program.directive && (generating || locked || ready) ? (
-          <div className="winnerCard">
-            <span>{program.directive.text}</span>
-            <i>{directiveAuthor(program.directive)}</i>
-          </div>
+      <div className="outsideProgramHead">
+        <span className="outsideProgramGlyph" aria-hidden="true">
+          {stageGlyph(phase)}
+        </span>
+        <b>{program.targetEpisode + 1}</b>
+        {voting && program.countdownEndsAtMs ? (
+          <strong data-vote-countdown>
+            {formatClock(program.countdownEndsAtMs - liveNowMs())}
+          </strong>
         ) : null}
-
-        {voting ? <CandidateRows round={primaryRound} /> : null}
-        {generating ? (
-          <div className={`stageTrack ${phase}`}>
-            <i />
-            <i />
-            <i />
-          </div>
-        ) : null}
-        {(phase === "paused" || phase === "setup" || phase === "offline") &&
-        program.reason ? (
-          <div className="programReason" title={program.reason}>
-            !
-          </div>
-        ) : null}
-
-        {futureRound?.proposals.length ? (
-          <div
-            className="futureRound"
-            title={`Pump.fun is already choosing episode ${futureRound.targetEpisode + 1}`}
-          >
-            <div className="futureRoundHead">
-              <span>{futureRound.targetEpisode + 1}</span>
-              {futureRound.votingStartedAtMs &&
-              futureRound.closesAtMs > liveNowMs() ? (
-                <b data-future-vote-countdown>
-                  {formatClock(futureRound.closesAtMs - liveNowMs())}
-                </b>
-              ) : (
-                <b>○</b>
-              )}
-            </div>
-            <CandidateRows round={futureRound} limit={3} />
-          </div>
+        {generating && program.generationStartedAtMs ? (
+          <strong data-generation-elapsed>
+            {formatClock(liveNowMs() - program.generationStartedAtMs)}
+          </strong>
         ) : null}
       </div>
+
+      {program.directive && (generating || locked || ready) ? (
+        <div className="outsideWinner">
+          <span>{program.directive.text}</span>
+          <i>{directiveAuthor(program.directive)}</i>
+        </div>
+      ) : null}
+
+      {voting ? <CandidateRows round={primaryRound} /> : null}
+
+      {futureRound?.proposals.length ? (
+        <div className="outsideFuture">
+          <div className="outsideFutureHead">
+            <span>◉</span>
+            <b>{futureRound.targetEpisode + 1}</b>
+            {futureRound.votingStartedAtMs &&
+            futureRound.closesAtMs > liveNowMs() ? (
+              <strong data-future-vote-countdown>
+                {formatClock(futureRound.closesAtMs - liveNowMs())}
+              </strong>
+            ) : null}
+          </div>
+          <CandidateRows round={futureRound} limit={3} />
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function OutsideTool(props: {
+  active?: boolean;
+  icon: "overlay" | "info";
+  action: "overlay" | "info";
+  title: string;
+}) {
+  return (
+    <button
+      className={`outsideTool ${props.active ? "on" : ""}`}
+      type="button"
+      data-action={props.action}
+      data-control={props.action}
+      title={props.title}
+      aria-label={props.title}
+      aria-pressed={Boolean(props.active)}
+    >
+      <ControlIcon name={props.icon} />
+    </button>
+  );
+}
+
+function WorldStatePanel() {
+  if (!infoOpen) return null;
+  return (
+    <aside className="outsideWorld" aria-label="World state">
+      <button
+        className="outsideWorldClose"
+        type="button"
+        data-action="close-info"
+        title="Close"
+        aria-label="Close"
+      >
+        ×
+      </button>
+
+      {worldState ? (
+        <div className="outsideWorldBody">
+          <div className="outsideWorldLocation">
+            <b>{worldState.location || "—"}</b>
+            {worldState.locationDetails ? (
+              <p>{worldState.locationDetails}</p>
+            ) : null}
+            {worldState.lastEndingBeat ? (
+              <em>{worldState.lastEndingBeat}</em>
+            ) : null}
+          </div>
+
+          {worldState.characters.length ? (
+            <div className="outsideWorldGroup">
+              {worldState.characters.map((item) => (
+                <article key={item.id}>
+                  <b>{item.name}</b>
+                  <span>{item.status}</span>
+                  {item.position ? <small>{item.position}</small> : null}
+                </article>
+              ))}
+            </div>
+          ) : null}
+
+          {worldState.props.length ? (
+            <div className="outsideWorldGroup compact">
+              {worldState.props.map((item) => (
+                <article key={item.id}>
+                  <b>{item.name}</b>
+                  <span>{item.status}</span>
+                  {item.position ? <small>{item.position}</small> : null}
+                </article>
+              ))}
+            </div>
+          ) : null}
+
+          {worldState.openThreads.length ? (
+            <div className="outsideThreads">
+              {worldState.openThreads.slice(0, 6).map((item) => (
+                <span key={item}>{item}</span>
+              ))}
+            </div>
+          ) : null}
+        </div>
+      ) : null}
+    </aside>
+  );
+}
+
+function OutsideConsole() {
+  return (
+    <div className="outsideConsole">
+      <div className="outsideTools">
+        <OutsideTool
+          active={liveOverlayEnabled}
+          icon="overlay"
+          action="overlay"
+          title={liveOverlayEnabled ? "Hide next episode" : "Show next episode"}
+        />
+        <OutsideTool
+          active={infoOpen}
+          icon="info"
+          action="info"
+          title="World state"
+        />
+      </div>
+      <OutsideProgram />
+      <WorldStatePanel />
     </div>
   );
 }
@@ -1359,7 +1435,6 @@ function TactileTV({ clip }: { clip: Clip | null }) {
             </div>
           ) : null}
           <div className="glassGlow" />
-          <LiveProgramOverlay />
           <CurrentPrompt clip={clip} />
           {isReplay ? (
             <button
@@ -1397,22 +1472,6 @@ function TactileTV({ clip }: { clip: Clip | null }) {
             action="captions"
           />
           <KnobControl
-            active={liveOverlayEnabled}
-            title={
-              liveOverlayEnabled
-                ? "Hide intermission status"
-                : "Show intermission status"
-            }
-            icon="overlay"
-            action="overlay"
-          />
-          <KnobControl
-            active={infoOpen}
-            title="Info and world state"
-            icon="info"
-            action="info"
-          />
-          <KnobControl
             title="Fullscreen"
             icon="fullscreen"
             action="fullscreen"
@@ -1423,97 +1482,6 @@ function TactileTV({ clip }: { clip: Clip | null }) {
             <i key={i} />
           ))}
         </div>
-      </div>
-    </div>
-  );
-}
-
-function InfoModal() {
-  const voteSeconds = Math.max(
-    1,
-    Math.round((room?.voteWindowMs || 15_000) / 1000),
-  );
-  const infoRound = program?.votingRound || program?.decisionRound || null;
-  const infoCandidates = sortedCandidates(infoRound);
-  return (
-    <div
-      className="infoShade"
-      role="dialog"
-      aria-modal="true"
-      aria-label="PumpTV information"
-    >
-      <div className="infoModal">
-        <button
-          className="infoClose"
-          type="button"
-          data-action="close-info"
-          aria-label="Close"
-        >
-          ×
-        </button>
-        <section className="howPanel">
-          <div className="infoGlyph">$</div>
-          <code>!next your idea</code>
-          <code>!vote @handle</code>
-          <p>
-            Posting the same or a near-duplicate idea counts as another vote for
-            the same suggestion. Voting begins with the first suggestion and
-            auto-locks after {voteSeconds}s.
-          </p>
-          <p>
-            The browser is watch-only. Pump.fun chat controls what happens next.
-          </p>
-          {infoCandidates.length ? (
-            <div className="modalCandidates">
-              {infoCandidates.map((item, index) => (
-                <div key={item.id}>
-                  <em>{index + 1}</em>
-                  <span>
-                    {item.text}
-                    <small>
-                      {authorLabel(item.author, item.authorAddress)}
-                    </small>
-                  </span>
-                  <b>{item.voteCount}</b>
-                </div>
-              ))}
-            </div>
-          ) : null}
-        </section>
-        <section className="worldPanel">
-          <div className="infoGlyph">◎</div>
-          <h2>{worldState?.location || "—"}</h2>
-          <p>{worldState?.locationDetails || ""}</p>
-          {worldState?.characters.length ? (
-            <div className="worldGroup">
-              {worldState.characters.map((item) => (
-                <article key={item.id}>
-                  <b>{item.name}</b>
-                  <span>{item.status}</span>
-                  <small>{item.position}</small>
-                </article>
-              ))}
-            </div>
-          ) : null}
-          {worldState?.props.length ? (
-            <div className="worldGroup">
-              {worldState.props.map((item) => (
-                <article key={item.id}>
-                  <b>{item.name}</b>
-                  <span>{item.status}</span>
-                  <small>{item.position}</small>
-                </article>
-              ))}
-            </div>
-          ) : null}
-          {worldState?.openThreads.length ? (
-            <div className="threadGroup">
-              {worldState.openThreads.map((item) => (
-                <span key={item}>{item}</span>
-              ))}
-            </div>
-          ) : null}
-        </section>
       </div>
     </div>
   );
@@ -1609,16 +1577,310 @@ function EpisodeShelf() {
   );
 }
 
+function OutsideInterfaceStyles() {
+  return (
+    <style>{`
+      .outsideConsole {
+        width: min(980px, calc(100vw - 150px));
+        margin: 12px auto 0;
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: start;
+        gap: 10px;
+        position: relative;
+        z-index: 8;
+      }
+
+      .outsideTools {
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+
+      .outsideTool {
+        width: 42px;
+        height: 42px;
+        display: grid;
+        place-items: center;
+        padding: 0;
+        border: 1px solid rgba(255,255,255,.14);
+        border-radius: 14px;
+        background: rgba(12,13,16,.72);
+        color: rgba(255,255,255,.68);
+        box-shadow: inset 0 1px rgba(255,255,255,.05), 0 8px 28px rgba(0,0,0,.18);
+        backdrop-filter: blur(16px);
+        cursor: pointer;
+      }
+
+      .outsideTool svg {
+        width: 19px;
+        height: 19px;
+        fill: currentColor;
+      }
+
+      .outsideTool svg .stroke {
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.8;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .outsideTool.on {
+        color: #fff;
+        border-color: rgba(255,255,255,.32);
+        background: rgba(34,36,42,.82);
+      }
+
+      .outsideProgram {
+        min-height: 42px;
+        display: grid;
+        gap: 10px;
+        padding: 10px 12px;
+        border: 1px solid rgba(255,255,255,.12);
+        border-radius: 16px;
+        background: rgba(10,11,14,.68);
+        box-shadow: inset 0 1px rgba(255,255,255,.04), 0 12px 36px rgba(0,0,0,.16);
+        backdrop-filter: blur(18px);
+        overflow: hidden;
+      }
+
+      .outsideProgramHead,
+      .outsideFutureHead {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-height: 20px;
+      }
+
+      .outsideProgramGlyph {
+        width: 18px;
+        text-align: center;
+        opacity: .75;
+      }
+
+      .outsideProgramHead > b,
+      .outsideFutureHead > b {
+        font: 700 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        opacity: .72;
+      }
+
+      .outsideProgramHead > strong,
+      .outsideFutureHead > strong {
+        margin-left: auto;
+        font: 700 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        letter-spacing: .04em;
+        opacity: .82;
+      }
+
+      .outsideWinner {
+        display: grid;
+        gap: 3px;
+        padding: 2px 2px 4px;
+      }
+
+      .outsideWinner > span {
+        font-size: 14px;
+        line-height: 1.35;
+      }
+
+      .outsideWinner > i,
+      .outsideProgram .rankIdea > i {
+        font-size: 10px;
+        opacity: .46;
+        font-style: normal;
+      }
+
+      .outsideProgram .liveRanking {
+        display: grid;
+        gap: 6px;
+      }
+
+      .outsideProgram .rankRow {
+        display: grid;
+        grid-template-columns: 22px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 8px;
+        border-radius: 10px;
+        background: rgba(255,255,255,.035);
+      }
+
+      .outsideProgram .rankRow > em,
+      .outsideProgram .rankRow > b {
+        font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-style: normal;
+        opacity: .7;
+      }
+
+      .outsideProgram .rankIdea {
+        min-width: 0;
+        display: grid;
+        gap: 3px;
+        position: relative;
+        padding-bottom: 4px;
+      }
+
+      .outsideProgram .rankIdea > span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+      }
+
+      .outsideProgram .rankIdea > small {
+        position: absolute;
+        left: 0;
+        bottom: 0;
+        height: 1px;
+        border-radius: 999px;
+        background: currentColor;
+        opacity: .28;
+      }
+
+      .outsideProgram .rankRow.winner {
+        background: rgba(255,255,255,.075);
+      }
+
+      .outsideFuture {
+        display: grid;
+        gap: 7px;
+        padding-top: 8px;
+        border-top: 1px solid rgba(255,255,255,.08);
+      }
+
+      .outsideWorld {
+        grid-column: 2;
+        position: relative;
+        padding: 14px 42px 14px 14px;
+        border: 1px solid rgba(255,255,255,.12);
+        border-radius: 16px;
+        background: rgba(10,11,14,.86);
+        box-shadow: 0 16px 52px rgba(0,0,0,.28);
+        backdrop-filter: blur(22px);
+      }
+
+      .outsideWorldClose {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        width: 26px;
+        height: 26px;
+        border: 0;
+        border-radius: 50%;
+        background: rgba(255,255,255,.06);
+        color: inherit;
+        font-size: 18px;
+        line-height: 1;
+        cursor: pointer;
+      }
+
+      .outsideWorldBody {
+        display: grid;
+        gap: 12px;
+      }
+
+      .outsideWorldLocation {
+        display: grid;
+        gap: 5px;
+      }
+
+      .outsideWorldLocation > b {
+        font-size: 14px;
+      }
+
+      .outsideWorldLocation > p,
+      .outsideWorldLocation > em {
+        margin: 0;
+        max-width: 76ch;
+        font-size: 12px;
+        line-height: 1.45;
+        opacity: .7;
+        font-style: normal;
+      }
+
+      .outsideWorldLocation > em {
+        opacity: .92;
+      }
+
+      .outsideWorldGroup {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 7px;
+      }
+
+      .outsideWorldGroup article {
+        display: grid;
+        gap: 3px;
+        padding: 9px 10px;
+        border-radius: 10px;
+        background: rgba(255,255,255,.035);
+      }
+
+      .outsideWorldGroup article > b {
+        font-size: 11px;
+      }
+
+      .outsideWorldGroup article > span,
+      .outsideWorldGroup article > small {
+        font-size: 10px;
+        line-height: 1.35;
+        opacity: .68;
+      }
+
+      .outsideWorldGroup.compact article {
+        padding-block: 7px;
+      }
+
+      .outsideThreads {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .outsideThreads > span {
+        max-width: 46ch;
+        padding: 6px 8px;
+        border: 1px solid rgba(255,255,255,.08);
+        border-radius: 999px;
+        font-size: 10px;
+        line-height: 1.25;
+        opacity: .7;
+      }
+
+      .minimalTop .wordmark > b {
+        display: none;
+      }
+
+      @media (max-width: 760px) {
+        .outsideConsole {
+          width: min(94vw, 680px);
+          grid-template-columns: 1fr;
+          margin-top: 8px;
+        }
+
+        .outsideTools {
+          flex-direction: row;
+        }
+
+        .outsideWorld {
+          grid-column: 1;
+        }
+      }
+    `}</style>
+  );
+}
+
 function App() {
   const clip = visibleClip();
   const state = engineState();
   return (
     <main className="viewerApp">
+      <OutsideInterfaceStyles />
       <section className="watchDeck">
         <div className="minimalTop">
-          <div className="wordmark">
+          <div className="wordmark" title="PumpTV" aria-label="PumpTV">
             <span>P</span>
-            <b>PUMPTV</b>
           </div>
           <div className="tinyStatus">
             <i className={`statusDot ${state}`} title={tooltipStatus()} />
@@ -1630,7 +1892,7 @@ function App() {
         <div className="tvCenter">
           <TactileTV clip={clip} />
         </div>
-        <InfoModal />
+        <OutsideConsole />
         {error ? (
           <div className="fatalBadge" title={error}>
             !

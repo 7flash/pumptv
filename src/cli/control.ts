@@ -26,13 +26,14 @@ if (existsSync(configPath)) {
 }
 
 const repo = await import("../server/repository.ts");
+const { db } = await import("../server/db.ts");
 const command = process.argv[2] || "status";
 const args = process.argv.slice(3);
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function usage() {
   console.log(
-    `PumpTV control\n\n  bun run control -- status\n  bun run control -- watch\n  bun run control -- json\n  bun run control -- set-votes <proposalId> <count|auto>\n  bun run control -- trigger\n  bun run control -- force <proposalId>\n  bun run control -- inject <prompt...>\n`,
+    `PumpTV control\n\n  bun run control -- status\n  bun run control -- watch\n  bun run control -- json\n  bun run control -- set-votes <proposalId> <count|auto>\n  bun run control -- trigger\n  bun run control -- force <proposalId>\n  bun run control -- inject <prompt...>\n  bun run control -- inject-force <prompt...>\n  bun run control -- clear-queue\n`,
   );
 }
 
@@ -148,7 +149,77 @@ if (command === "status") {
   const directive = await repo.forceProposalAsNext(id);
   if (!directive) throw new Error("No open round with proposals");
   console.log(`[control] forced #${id} → ${directive.text}`);
+} else if (command === "clear-queue") {
+  const room = await repo.getRoomRow();
+  const workerHeartbeatAtMs = Number(room.heartbeatAtMs || 0);
+  const workerIsLive =
+    workerHeartbeatAtMs > 0 && Date.now() - workerHeartbeatAtMs < 5_000;
+  if (workerIsLive) {
+    throw new Error(
+      "Generation worker is still online. Stop PumpTV first, wait ~6 seconds, then run clear-queue.",
+    );
+  }
+
+  const before = Number(
+    (
+      db.raw<any>(
+        "SELECT COUNT(*) AS count FROM directives WHERE source = 'pumpfun' AND status IN ('queued', 'generating')",
+      )[0] || {}
+    ).count || 0,
+  );
+
+  const now = Date.now();
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    db.exec(
+      `UPDATE directives
+       SET status = 'used', usedEpisode = NULL
+       WHERE source = 'pumpfun' AND status IN ('queued', 'generating')`,
+    );
+    db.exec(
+      `UPDATE proposals SET status = 'lost'
+       WHERE status = 'open'`,
+    );
+    db.exec(
+      `UPDATE promptRounds
+       SET status = 'closed',
+           closedAtMs = COALESCE(closedAtMs, ${now}),
+           winnerProposalId = NULL
+       WHERE status = 'open'`,
+    );
+    db.exec(
+      `UPDATE rooms
+       SET workerState = 'idle',
+           generationStage = 'idle',
+           generationStartedAtMs = NULL,
+           leaseOwner = NULL,
+           leaseUntilMs = 0
+       WHERE name = '${(process.env.PUMPTV_ROOM || "main").replaceAll("'", "''")}'`,
+    );
+    db.exec("COMMIT");
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {}
+    throw error;
+  }
+
+  console.log(
+    `[control] discarded ${before} queued/generating prompt${before === 1 ? "" : "s"}; next generation now requires a fresh winner/trigger`,
+  );
 } else if (command === "inject") {
+  const text = args.join(" ").trim();
+  if (!text) {
+    usage();
+    process.exit(1);
+  }
+  const proposal = await repo.operatorInjectProposal(text);
+  if (!proposal) throw new Error("Could not inject operator proposal");
+  const round = await repo.getPromptRoundForProposal(proposal.id);
+  console.log(
+    `[control] injected #${proposal.id} → EP ${(round?.targetEpisode ?? 0) + 1} (NOT locked; run \`bun run control -- trigger\` when ready)`,
+  );
+} else if (command === "inject-force") {
   const text = args.join(" ").trim();
   if (!text) {
     usage();

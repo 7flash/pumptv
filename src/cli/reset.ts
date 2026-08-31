@@ -43,6 +43,7 @@ const { db, dbPath } = await import("../server/db.ts");
 const { ROOM_NAME } = await import("../server/lease.ts");
 
 const args = process.argv.slice(2);
+const requeue = args.includes("--requeue");
 let fromEpisode = cleanEpisodeArg(args[0]);
 if (args[0] === "--from") fromEpisode = cleanEpisodeArg(args[1]);
 
@@ -87,7 +88,7 @@ try {
         ).count || 0,
       );
       const answer = await rl.question(
-        `Reset from EP ${fromEpisode}? ${futureCount} episode${futureCount === 1 ? "" : "s"} will be removed and their Pump.fun prompts re-queued. [y/N] `,
+        `Reset from EP ${fromEpisode}? ${futureCount} episode${futureCount === 1 ? "" : "s"} will be removed; Pump.fun prompts will ${requeue ? "be re-queued" : "remain consumed"}. [y/N] `,
       );
 
       if (!/^y(es)?$/i.test(answer.trim())) {
@@ -95,17 +96,22 @@ try {
       } else {
         db.exec("BEGIN IMMEDIATE");
         try {
-          // Re-queue the chat messages that originally produced the removed episodes.
-          db.exec(
-            `UPDATE directives
-             SET status = 'queued', usedEpisode = NULL
-             WHERE source = 'pumpfun' AND usedEpisode >= ${fromInternal}`,
-          );
-          db.exec(
-            `UPDATE directives
-             SET status = 'queued', usedEpisode = NULL
-             WHERE source = 'pumpfun' AND status = 'generating'`,
-          );
+          if (requeue) {
+            // Explicit opt-in: replay the prompts that originally produced the removed episodes.
+            db.exec(
+              `UPDATE directives
+               SET status = 'queued', usedEpisode = NULL
+               WHERE source = 'pumpfun' AND usedEpisode >= ${fromInternal}`,
+            );
+          } else {
+            // Default reset is a clean rewind. Removed episodes do not silently create
+            // a generation backlog; a fresh Pump.fun winner/operator trigger is required.
+            db.exec(
+              `UPDATE directives
+               SET status = 'used', usedEpisode = NULL
+               WHERE source = 'pumpfun' AND usedEpisode >= ${fromInternal}`,
+            );
+          }
 
           db.exec(
             `DELETE FROM worldStateSnapshots WHERE episode >= ${fromInternal}`,

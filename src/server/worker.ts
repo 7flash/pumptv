@@ -33,6 +33,10 @@ const MIN_GENERATION_INTERVAL_MS = Math.max(
   0,
   Number(process.env.PUMPTV_MIN_GENERATION_INTERVAL_MS || 0),
 );
+const WORKER_HEARTBEAT_MS = Math.max(
+  500,
+  Number(process.env.PUMPTV_WORKER_HEARTBEAT_MS || 1_000),
+);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const owner = `${hostname()}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`;
@@ -120,12 +124,15 @@ async function generationTick() {
     return { generated: false, sleepMs: IDLE_POLL_MS };
   }
 
-  const heartbeat = setInterval(
+  const leaseHeartbeat = setInterval(
     () => {
       renewRoomLease(owner, LEASE_TTL_MS);
     },
     Math.max(1_000, Math.floor(LEASE_TTL_MS / 3)),
   );
+  const workerHeartbeat = setInterval(() => {
+    void touchWorkerHeartbeat().catch(() => {});
+  }, WORKER_HEARTBEAT_MS);
 
   try {
     await recoverGeneratingDirectives();
@@ -152,11 +159,20 @@ async function generationTick() {
 
     let clip;
     try {
-      clip = await generateNextClip({
-        previousClip: lockedLatest,
-        resolution: lockedRoom.resolution,
-        mode: "full",
-      });
+      clip = await workerMeasure.measure.assert(
+        {
+          label: "Generate episode",
+          episode,
+          resolution: lockedRoom.resolution,
+          mode: "full",
+        },
+        () =>
+          generateNextClip({
+            previousClip: lockedLatest,
+            resolution: lockedRoom.resolution,
+            mode: "full",
+          }),
+      );
     } catch (error) {
       const failures = Number(lockedRoom.generationFailureCount || 0) + 1;
       const recovery = classifyGenerationFailure(error, failures);
@@ -193,7 +209,8 @@ async function generationTick() {
 
     return { generated: true, sleepMs: 80 };
   } finally {
-    clearInterval(heartbeat);
+    clearInterval(leaseHeartbeat);
+    clearInterval(workerHeartbeat);
     releaseRoomLease(owner);
   }
 }
@@ -209,18 +226,18 @@ export async function runRoomWorker() {
   console.log(`[worker] db=${dbPath}`);
 
   while (!stopping) {
-    const result = await workerMeasure.measure("Room tick", () =>
-      generationTick(),
-    );
-    if (!result) {
-      await setWorkerState(
-        "error",
-        "Generation tick failed; retrying automatically.",
-      );
+    try {
+      const result = await generationTick();
+      await sleep(result.sleepMs);
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : String(error || "Unknown worker error");
+      console.error(`[worker] tick failed · ${message}`);
+      await setWorkerState("error", message);
       await sleep(ERROR_BACKOFF_MS);
-      continue;
     }
-    await sleep(result.sleepMs);
   }
 
   releaseRoomLease(owner);
