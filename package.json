@@ -1,10 +1,12 @@
 {
   "name": "slopstream",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "type": "module",
   "scripts": {
     "dev": "tradjs serve",
+    "worker": "bun src/worker.ts",
+    "dev:all": "sh -c 'bun src/worker.ts & worker=$!; trap \"kill $worker 2>/dev/null || true\" EXIT INT TERM; tradjs serve'",
     "build": "tradjs build",
     "start": "tradjs serve 3000"
   },

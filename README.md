@@ -1,147 +1,255 @@
 # SLOP TV
 
-An infinite, interactive AI-generated livestream. Viewers type what should happen next; each directive is persisted, consumed in FIFO order, and used to steer the next MiniMax H3 Max clip on fal. The browser captures the last frame of the current clip and sends it back as the first-frame anchor for the next generation.
+One endless AI-generated livestream, one shared canon, many viewers steering what happens next.
 
-This version is intentionally structured around:
+This version uses the stack deliberately:
 
-- **TradJS** for file-system routes, SSR shell, API routes, and `tradjs/client` browser rendering.
-- **sqlite-zod-orm** for the durable directive queue and generated clip timeline.
-- **measure-fn** for scoped timing/error traces at HTTP, database, fal upload, and fal generation boundaries.
+- **TradJS** for SSR, file-system API routes, streaming `Response`s, and the `tradjs/client` frontend.
+- **sqlite-zod-orm** for the room record, durable viewer queue, and generated clip timeline.
+- **measure-fn** for scoped HTTP / DB / fal / worker traces.
+- **fal + MiniMax H3 Max** for video generation.
+- **fal FFmpeg Extract Frame** for server-side last-frame continuity.
 
-## Runtime
+The important change in v0.3 is that **viewers do not generate clips anymore**. A single authoritative worker owns the room timeline.
 
-This is a **Bun-first** app. TradJS and sqlite-zod-orm both target Bun.
+## Run it
+
+This is Bun-first.
 
 ```bash
 cp .env.example .env
-# set FAL_KEY
+# add FAL_KEY
 bun install
-bun run dev
 ```
 
-Open http://localhost:3000.
+For local development, run web + worker together:
+
+```bash
+bun run dev:all
+```
+
+Or run them separately, which is closer to production:
+
+```bash
+# terminal 1
+bun run dev
+
+# terminal 2
+bun run worker
+```
+
+Open `http://localhost:3000`.
+
+## Architecture
+
+```text
+                         ┌──────── viewer A
+                         │
+TradJS /api/events ──────┼──────── viewer B
+       SSE fanout        │
+                         └──────── viewer N
+                              │
+                              │ POST /api/directives
+                              ▼
+                      sqlite-zod-orm
+                    persistent FIFO queue
+                              │
+                              ▼
+                    authoritative worker
+                  renewable SQLite lease
+                              │
+              ┌───────────────┴───────────────┐
+              │                               │
+              ▼                               ▼
+     fal FFmpeg extract-frame          prompt + recent canon
+       previous video → last frame             │
+              │                               │
+              └───────────────┬───────────────┘
+                              ▼
+                       MiniMax H3 Max
+                              │
+                              ▼
+                      persist next clip
+                              │
+                              ▼
+                     shared live timeline
+```
+
+There is no browser canvas capture and no public `/api/generate` route.
 
 ## Project shape
 
 ```text
 app/
-  layout.tsx                 # TradJS root layout
-  page.tsx                   # server-rendered mount shell
-  page.client.tsx            # tradjs/client player + chat state machine
+  layout.tsx
+  page.tsx
+  page.client.tsx             # tradjs/client: playback + chat only
   globals.css
   api/
-    generate/route.ts        # generate next H3 Max clip
-    directives/route.ts      # persist viewer directives
-    state/route.ts           # restore current timeline + queue
+    directives/route.ts       # enqueue viewer direction
+    events/route.ts           # SSE room/timeline stream
+    room/route.ts             # admin room settings
+    state/route.ts            # initial snapshot / fallback
 
 src/
-  shared/contracts.ts        # server/client DTOs only
+  worker.ts                    # executable worker entry
+  shared/
+    contracts.ts
   server/
-    db.ts                    # sqlite-zod-orm schema + DB boot
-    repository.ts            # all persistence operations
-    observability.ts         # measure-fn scopes/config
-    prompt.ts                # continuity prompt construction
-    generate.ts              # fal orchestration
+    db.ts                      # sqlite-zod-orm schemas
+    repository.ts              # all durable app state
+    lease.ts                   # atomic SQLite generation lease
+    worker.ts                  # room loop + buffer policy
+    generate.ts                # frame extraction + H3 generation
+    prompt.ts                  # continuity/showrunner prompt
+    state-stream.ts            # one DB poller, SSE fanout to viewers
+    observability.ts           # measure-fn scopes
 ```
 
-The important dependency direction is:
+Dependency direction:
 
 ```text
-TradJS route -> server service -> repository -> sqlite-zod-orm
-                         \\-> fal
+tradjs/client ────────> JSON/SSE only
 
-tradjs/client -> JSON API only
+TradJS routes ────────> repository ────────> sqlite-zod-orm
+                               ▲
+                               │
+authoritative worker ─> generate ──────────> fal
+          │
+          └────────────> SQLite lease
 ```
-
-No database or fal implementation code is imported into the browser.
 
 ## Persistence model
 
-`sqlite-zod-orm` owns two tables and auto-creates/additively migrates them from Zod schemas:
+### `rooms`
+
+The room is global server state, not browser state:
+
+- `running`
+- `resolution`
+- `workerState`: `idle | generating | error`
+- `lastError`
+- `leaseOwner`
+- `leaseUntilMs`
+- `heartbeatAtMs`
 
 ### `directives`
 
-- `text`
-- `status`: `queued | used`
-- `usedEpisode`
-- automatic timestamps
+Viewer instructions use a recoverable state machine:
+
+```text
+queued -> generating -> used
+             |
+             └-- worker crashes --> recovered on next lease
+```
+
+If a worker dies before a clip is saved, the claimed directive returns to `queued`. If the clip was saved but the final status write did not happen, recovery sees the clip's `directiveId` and marks the directive `used` instead of repeating it.
 
 ### `clips`
 
-- fal request ID and video URL
-- expanded prompt + inference duration
-- viewer/autopilot directive
+Each clip persists:
+
+- fal request ID / video URL
+- viewer or autopilot directive + `directiveId`
 - episode number
-- whether a continuity frame was used
-- resolution
-- automatic timestamps
+- extracted continuity-frame URL
+- resolution / inference timing
+- `startsAtMs`
+- `durationSeconds`
 
-On refresh, `/api/state` restores the most recent clip and recent chat history, then generation continues from that clip instead of creating a new universe.
+`startsAtMs` turns the generated clips into a real shared wall-clock timeline. Every browser computes which clip should be playing from server time, so late joiners enter the same moment instead of starting at episode 1.
 
-## Generation loop
+## Worker / lease behavior
+
+The worker maintains a small future buffer instead of generating as fast as fal allows.
+
+Default target:
 
 ```text
-play current clip
+SLOP_TARGET_BUFFER_MS=6500
+```
+
+With five-second clips, this keeps roughly one clip ahead. When enough future video exists, the worker sleeps. When the buffer drops below target, it tries to acquire the room lease and generate exactly one successor.
+
+The lease is acquired with `BEGIN IMMEDIATE` through `sqlite-zod-orm`'s raw SQL escape hatch and renewed while a long fal request is in flight. If a process dies, its lease expires and another worker can take over.
+
+That means running two worker processes is safe for the single-room MVP: only the lease holder is allowed to claim a directive or generate the next episode.
+
+## Continuity
+
+For episode 1:
+
+```text
+text prompt -> H3 Max text-to-video
+```
+
+For every later episode:
+
+```text
+previous video URL
       |
-      +--> browser captures final frame
-                    |
-                    v
-            POST /api/generate
-                    |
-       server reads oldest queued directive
-          or falls back to autopilot
-                    |
-                    v
-            H3 Max image-to-video
-                    |
-                    v
-              persist new clip
-                    |
-                    v
-               buffer + play
-                    |
-                    +---- repeat
+      v
+fal-ai/ffmpeg-api/extract-frame
+      frame_type: last
+      |
+      v
+last-frame image URL
+      |
+      v
+H3 Max image-to-video
 ```
 
-The opening generation uses text-to-video. Every later generation uses image-to-video with the captured final frame.
+This removes the old CORS-sensitive browser canvas round trip entirely.
 
-## measure-fn structure
+## Live delivery
 
-The code uses scoped measures rather than hand-written timers:
+`/api/events` is Server-Sent Events. Each TradJS web process runs **one** state polling loop and fans the resulting snapshot out to all connected viewers, rather than performing a separate SQLite poll per viewer.
 
-- `http`: API request work
-- `db`: queue/timeline reads and writes
-- `fal`: continuity-frame uploads and H3 generation
+The client also keeps a server-clock offset. Every 250 ms it checks the shared timeline locally and advances clips at their scheduled wall-clock boundary. It corrects playback drift when necessary.
 
-`measure-fn` catches/logs errors and returns `null`, so boundaries explicitly check measured results before continuing.
+Audio begins muted because browsers normally block autoplay with sound. `ENABLE SOUND` is a local viewer action and does not modify the room.
 
-Set `MEASURE_TIMESTAMPS=0` if you do not want timestamps in local traces.
+## Room admin
 
-## Important MVP limitation
+Generation controls are server-side now. The public viewer UI cannot pause the global room or change everyone else's quality.
 
-This is now durable, but generation is still initiated by the watching browser. For a public shared livestream, move `generateNextClip()` behind one authoritative room worker/lease. Otherwise two viewers could race and generate two clips for the same next episode.
+Set an admin token in production:
 
-The next production step should be:
-
-```text
-many viewers
-    |
-    v
-TradJS chat API -> SQLite directives
-                      |
-                      v
-             authoritative room worker
-                      |
-             generate one next clip
-                      |
-                      v
-              clips / stream manifest
-                      |
-        SSE/WebSocket/HLS broadcast
+```bash
+SLOP_ADMIN_TOKEN=change-me
 ```
 
-SQLite remains reasonable for one room / one writer. If you introduce multiple generator processes, move the queue/lease to a datastore designed for cross-process coordination.
+Pause generation:
 
-## CORS note
+```bash
+curl -X PATCH http://localhost:3000/api/room \
+  -H 'content-type: application/json' \
+  -H 'x-slop-admin-token: change-me' \
+  -d '{"running":false}'
+```
 
-The current continuity mechanism captures the final frame in a browser canvas. fal media therefore needs usable CORS headers. If that becomes unreliable in production, extract the final frame server-side (e.g. ffmpeg) or copy generated videos into your own CORS-controlled object storage.
+Resume at 480P:
+
+```bash
+curl -X PATCH http://localhost:3000/api/room \
+  -H 'content-type: application/json' \
+  -H 'x-slop-admin-token: change-me' \
+  -d '{"running":true,"resolution":"480P"}'
+```
+
+When `SLOP_ADMIN_TOKEN` is empty, the PATCH route is intentionally open for local development.
+
+## measure-fn scopes
+
+- `http` — TradJS API work
+- `db` — durable queue / timeline / room operations
+- `fal` — frame extraction + H3 generation
+- `worker` — room ticks
+
+The raw SQL lease is intentionally tiny and isolated in `lease.ts`; it still uses the same `sqlite-zod-orm` database instance as the rest of the app.
+
+## Production boundary
+
+This architecture is appropriate for one room on one shared SQLite volume. Multiple TradJS web processes are fine; multiple worker processes are protected by the database lease.
+
+The next scale boundary is **multiple machines without a shared local SQLite file**. At that point keep the same repository/worker contracts but move the lease/queue to a networked coordination store (or move the whole persistence layer to a network database). The client and TradJS route shape do not need to change.

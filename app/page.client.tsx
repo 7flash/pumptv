@@ -2,22 +2,22 @@ import { render } from "tradjs/client";
 import type {
   Clip,
   Directive,
-  Resolution,
+  RoomState,
   StreamState,
 } from "../src/shared/contracts.ts";
 
+let timeline: Clip[] = [];
 let current: Clip | null = null;
-let next: Clip | null = null;
-let running = true;
-let generating = false;
-let waitingToAdvance = false;
-let ended = false;
-let status = "Booting the infinite slop machine…";
-let input = "";
-let resolution: Resolution = "768P";
-let error: string | null = null;
+let room: RoomState | null = null;
 let directives: Directive[] = [];
 let queuedCount = 0;
+let serverOffsetMs = 0;
+let input = "";
+let error: string | null = null;
+let soundEnabled = false;
+let transport = "CONNECTING";
+let source: EventSource | null = null;
+let clockTimer: ReturnType<typeof setInterval> | null = null;
 
 function redraw() {
   const root = document.getElementById("slop-root");
@@ -32,142 +32,92 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
   return payload as T;
 }
 
-async function captureLastFrame(videoUrl: string): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const video = document.createElement("video");
-    video.crossOrigin = "anonymous";
-    video.muted = true;
-    video.playsInline = true;
-    video.preload = "auto";
-
-    const cleanup = () => {
-      video.pause();
-      video.removeAttribute("src");
-      video.load();
-    };
-
-    video.onerror = () => {
-      cleanup();
-      reject(new Error("Could not load the previous clip for continuity."));
-    };
-    video.onloadedmetadata = () => {
-      video.currentTime = Math.max(0, video.duration - 0.08);
-    };
-    video.onseeked = () => {
-      try {
-        const canvas = document.createElement("canvas");
-        canvas.width = video.videoWidth || 1344;
-        canvas.height = video.videoHeight || 768;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) throw new Error("Canvas unavailable");
-        ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-        const frame = canvas.toDataURL("image/jpeg", 0.88);
-        cleanup();
-        resolve(frame);
-      } catch (cause) {
-        cleanup();
-        reject(cause);
-      }
-    };
-    video.src = videoUrl;
-  });
+function liveNowMs() {
+  return Date.now() + serverOffsetMs;
 }
 
-async function refreshState() {
-  const state = await json<StreamState>("/api/state");
+function activeClipAt(nowMs: number) {
+  return (
+    timeline.find(
+      (clip) =>
+        clip.startsAtMs <= nowMs &&
+        nowMs < clip.startsAtMs + clip.durationSeconds * 1000,
+    ) || null
+  );
+}
+
+function syncVideoClock() {
+  if (!current) return;
+  const video = document.querySelector(
+    "video.video",
+  ) as HTMLVideoElement | null;
+  if (!video) return;
+
+  const expected = Math.max(0, (liveNowMs() - current.startsAtMs) / 1000);
+  if (expected >= current.durationSeconds) return;
+  if (
+    Number.isFinite(video.duration) &&
+    Math.abs(video.currentTime - expected) > 0.7
+  ) {
+    video.currentTime = Math.min(expected, Math.max(0, video.duration - 0.05));
+  }
+  video.muted = !soundEnabled;
+  void video.play().catch(() => {});
+}
+
+function syncActiveClip(forceRedraw = false) {
+  const next = activeClipAt(liveNowMs());
+  const changed = next?.id !== current?.id;
+  current = next;
+
+  if (changed || forceRedraw) {
+    redraw();
+    queueMicrotask(syncVideoClock);
+  } else {
+    syncVideoClock();
+  }
+}
+
+function applyState(state: StreamState) {
+  serverOffsetMs = state.serverNowMs - Date.now();
+  room = state.room;
+  timeline = state.timeline;
   directives = state.recentDirectives;
   queuedCount = state.queuedCount;
-  if (!current && state.latestClip) current = state.latestClip;
-  redraw();
-}
-
-async function generate(anchor: string | null) {
-  return json<Clip>("/api/generate", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ imageDataUrl: anchor, resolution }),
-  });
-}
-
-async function queueNext(fromClip: Clip) {
-  if (!running || generating || next) return;
-  generating = true;
+  transport = "LIVE FEED";
   error = null;
-  status = "Generating the next five seconds…";
-  redraw();
-
-  try {
-    const frame = await captureLastFrame(fromClip.videoUrl);
-    next = await generate(frame);
-    status = next.inferenceSeconds
-      ? `Next clip buffered · ${next.inferenceSeconds.toFixed(2)}s inference`
-      : "Next clip buffered";
-    await refreshState();
-
-    if (waitingToAdvance) advance();
-  } catch (cause) {
-    error =
-      cause instanceof Error
-        ? cause.message
-        : "Could not generate the next clip.";
-    status = "Generation stalled";
-  } finally {
-    generating = false;
-    redraw();
-    if (running && current && !next && !waitingToAdvance) {
-      queueMicrotask(() => {
-        if (current) void queueNext(current);
-      });
-    }
-  }
+  syncActiveClip(true);
 }
 
 async function boot() {
   try {
-    const state = await json<StreamState>("/api/state");
-    directives = state.recentDirectives;
-    queuedCount = state.queuedCount;
-
-    if (state.latestClip) {
-      current = state.latestClip;
-      status = "LIVE · restored timeline";
-    } else {
-      generating = true;
-      status = "Generating opening shot…";
-      redraw();
-      current = await generate(null);
-      generating = false;
-      status = "LIVE · prebuffering next clip";
-    }
-    redraw();
-    if (current) void queueNext(current);
+    applyState(await json<StreamState>("/api/state"));
   } catch (cause) {
-    generating = false;
     error =
-      cause instanceof Error ? cause.message : "Could not start the stream.";
-    status = "Offline";
+      cause instanceof Error ? cause.message : "Could not load the stream.";
+    transport = "OFFLINE";
     redraw();
   }
-}
 
-function advance() {
-  ended = true;
-  if (!running) return;
+  source = new EventSource("/api/events");
+  source.onopen = () => {
+    transport = "LIVE FEED";
+    redraw();
+  };
+  source.onmessage = (event) => {
+    try {
+      applyState(JSON.parse(event.data) as StreamState);
+    } catch {
+      error = "Received an invalid room update.";
+      redraw();
+    }
+  };
+  source.onerror = () => {
+    transport = "RECONNECTING";
+    redraw();
+  };
 
-  if (next) {
-    const buffered = next;
-    next = null;
-    current = buffered;
-    waitingToAdvance = false;
-    ended = false;
-    status = "LIVE · prebuffering next clip";
-    redraw();
-    void queueNext(buffered);
-  } else {
-    waitingToAdvance = true;
-    status = "Buffering the timeline…";
-    redraw();
-  }
+  clockTimer = setInterval(() => syncActiveClip(false), 250);
 }
 
 async function submitDirective(event: SubmitEvent) {
@@ -183,7 +133,6 @@ async function submitDirective(event: SubmitEvent) {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ text }),
     });
-    await refreshState();
   } catch (cause) {
     error =
       cause instanceof Error ? cause.message : "Could not queue directive.";
@@ -191,16 +140,35 @@ async function submitDirective(event: SubmitEvent) {
   }
 }
 
-function toggleRunning() {
-  running = !running;
-  status = running
-    ? "LIVE · resuming generation"
-    : "PAUSED · no new clips will be generated";
+function toggleSound() {
+  soundEnabled = !soundEnabled;
   redraw();
+  queueMicrotask(syncVideoClock);
+}
 
-  if (!running) return;
-  if (ended && next) advance();
-  else if (current && !next) void queueNext(current);
+function streamStatus() {
+  if (!room) return transport;
+  if (!room.running) return "PAUSED · generator stopped";
+  if (room.workerState === "error") return "DEGRADED · retrying";
+  if (current) return "LIVE";
+  if (timeline.length) return "BUFFERING · generator catching up";
+  return room.workerState === "generating"
+    ? "GENERATING OPENING"
+    : "WAITING FOR WORKER";
+}
+
+function bufferLabel() {
+  if (!room?.bufferedUntilMs) return "0.0s BUFFER";
+  const seconds = Math.max(0, room.bufferedUntilMs - liveNowMs()) / 1000;
+  return `${seconds.toFixed(1)}s BUFFER`;
+}
+
+function directiveLabel(directive: Directive) {
+  if (directive.status === "queued") return "QUEUED";
+  if (directive.status === "generating") {
+    return `GENERATING${directive.usedEpisode !== null ? ` · EP ${directive.usedEpisode + 1}` : ""}`;
+  }
+  return `USED${directive.usedEpisode !== null ? ` · EP ${directive.usedEpisode + 1}` : ""}`;
 }
 
 function App() {
@@ -213,14 +181,15 @@ function App() {
             className="video"
             src={current.videoUrl}
             autoPlay
+            muted={!soundEnabled}
             playsInline
-            crossOrigin="anonymous"
-            onEnded={advance}
+            onLoadedMetadata={syncVideoClock}
+            onEnded={() => syncActiveClip(true)}
           />
         ) : (
           <div className="void">
             <div className="spinner" />
-            <p>{status}</p>
+            <p>{streamStatus()}</p>
           </div>
         )}
 
@@ -231,16 +200,21 @@ function App() {
             SLOP TV
           </div>
           <div className="meta">
-            <span>{status}</span>
+            <span>{streamStatus()}</span>
             <span>EP {current ? current.episode + 1 : "—"}</span>
-            <span>{resolution}</span>
+            <span>{room?.resolution || "—"}</span>
+            <span>{bufferLabel()}</span>
+            <button className="soundToggle" onClick={toggleSound}>
+              {soundEnabled ? "SOUND ON" : "ENABLE SOUND"}
+            </button>
           </div>
         </header>
 
         <div className="lowerThird">
           <p className="nowPlaying">
-            {current?.directive || "Generating reality…"}
+            {current?.directive || "The room worker is manufacturing reality…"}
           </p>
+          {room?.lastError ? <p className="error">{room.lastError}</p> : null}
           {error ? <p className="error">{error}</p> : null}
         </div>
       </section>
@@ -250,31 +224,24 @@ function App() {
           <div>
             <h1>WRITE THE NEXT SCENE</h1>
             <p>
-              Anything you type is persisted and consumed by the timeline in
-              FIFO order.
+              Everyone watches one authoritative timeline. Your message enters
+              its persistent FIFO future.
             </p>
           </div>
-          <button
-            className={running ? "pause" : "resume"}
-            onClick={toggleRunning}
-          >
-            {running ? "STOP BURN" : "GO LIVE"}
-          </button>
+          <div className={`workerBadge ${room?.workerState || "idle"}`}>
+            {room?.workerState || transport}
+          </div>
         </div>
 
         <div className="messages">
           <div className="systemMessage">
-            <span>STREAM</span>
-            SQLite keeps the canon and viewer queue. The previous final frame
-            becomes the next opening frame.
+            <span>SHARED ROOM</span>
+            One server worker owns generation through a renewable SQLite lease.
+            Viewers only watch and enqueue directives.
           </div>
           {directives.map((directive) => (
             <div className={`message ${directive.status}`} key={directive.id}>
-              <span>
-                {directive.status === "queued"
-                  ? "QUEUED"
-                  : `USED${directive.usedEpisode !== null ? ` · EP ${directive.usedEpisode + 1}` : ""}`}
-              </span>
+              <span>{directiveLabel(directive)}</span>
               {directive.text}
             </div>
           ))}
@@ -286,7 +253,7 @@ function App() {
             onInput={(event: any) => {
               input = (event.currentTarget as HTMLTextAreaElement).value;
             }}
-            placeholder="the raccoon opens the tape and it contains footage of this exact livestream…"
+            placeholder="the raccoon realizes the VHS tape is predicting chat messages five seconds early…"
             maxLength={500}
             rows={3}
             onKeyDown={(event: any) => {
@@ -299,20 +266,9 @@ function App() {
             }}
           />
           <div className="composerBottom">
-            <label>
-              QUALITY
-              <select
-                value={resolution}
-                onChange={(event: any) => {
-                  resolution = (event.currentTarget as HTMLSelectElement)
-                    .value as Resolution;
-                  redraw();
-                }}
-              >
-                <option value="480P">480P · cheaper</option>
-                <option value="768P">768P · prettier</option>
-              </select>
-            </label>
+            <div className="qualityReadout">
+              {room?.resolution || "—"} · SERVER OWNED
+            </div>
             <div className="queueCount">{queuedCount} queued</div>
             <button type="submit">SEND TO FUTURE ↗</button>
           </div>
@@ -320,7 +276,7 @@ function App() {
 
         <footer>
           <span>TradJS + sqlite-zod-orm + measure-fn</span>
-          <span>H3 Max on fal · safety checker on</span>
+          <span>{transport} · H3 Max on fal</span>
         </footer>
       </aside>
     </>
@@ -332,6 +288,10 @@ export default function mount() {
   void boot();
 
   return () => {
+    source?.close();
+    source = null;
+    if (clockTimer) clearInterval(clockTimer);
+    clockTimer = null;
     const root = document.getElementById("slop-root");
     if (root) render(null, root);
   };
