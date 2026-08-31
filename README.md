@@ -111,7 +111,7 @@ Fresh database:
 
 ```text
 [worker] generating EP 1 · 480P · opening
-[showrunner] planned EP 1 via Codex ...
+[showrunner] staged EP 1 via JSX-AI tools · ... calls · Codex ...
 [worker] published EP 1 · ...ms
 ```
 
@@ -128,6 +128,10 @@ logs should show:
 ```text
 [pumpfun] queued @username → a shopping cart rolls in by itself
 [worker] generating EP 2 · 480P · pump.fun prompt
-[showrunner] planned EP 2 via Codex ...
+[showrunner] staged EP 2 via JSX-AI tools · ... calls · Codex ...
 [worker] published EP 2 · ...ms
 ```
+## v0.18 showrunner architecture
+
+The JSX-AI showrunner is tool-driven rather than JSON-text-driven. The prompt is composed from reusable JSX components for identity, continuity doctrine, canon context, recent episodes, Pump.fun intent, and production tools. `stage_shot` is mandatory once; canon is updated only through patch tools such as `set_location`, `upsert_character`, `upsert_prop`, `open_thread`, and `resolve_thread`. PumpTV uses JSX-AI's `natural` tool strategy for the native Codex path so JSX-AI itself renders/parses the tool protocol into `result.toolCalls`. The server applies those calls to durable canon; it no longer scrapes a JSON object from model text.
+
