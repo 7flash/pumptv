@@ -7,11 +7,11 @@ import { db } from "./db.ts";
 import { dbMeasure } from "./observability.ts";
 import { sanitizeLine } from "./prompt.ts";
 
-const PROMPT_WINDOW_MS = Number(process.env.SLOP_PROMPT_WINDOW_MS || 4_500);
+const PROMPT_WINDOW_MS = Number(process.env.PUMPTV_PROMPT_WINDOW_MS || 4_500);
 export const GENERATION_LEAD_MS = Number(
-  process.env.SLOP_GENERATION_LEAD_MS || 4_500,
+  process.env.PUMPTV_GENERATION_LEAD_MS || 4_500,
 );
-const MAX_PROPOSALS = Number(process.env.SLOP_MAX_PROPOSALS_PER_ROUND || 40);
+const MAX_PROPOSALS = Number(process.env.PUMPTV_MAX_PROPOSALS_PER_ROUND || 40);
 
 function normalizedText(text: string) {
   return sanitizeLine(text, 500).toLocaleLowerCase();

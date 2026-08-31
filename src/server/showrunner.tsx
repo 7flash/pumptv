@@ -9,8 +9,9 @@ import {
   normalizeWorldState,
   worldStateForShowrunner,
 } from "./world-state.ts";
+import { codexCallOptions, getCodexConfig } from "./codex-config.ts";
 
-const MODEL = process.env.SLOP_SHOWRUNNER_MODEL || "gemini-2.5-flash";
+const MODEL = getCodexConfig().model;
 
 const ShotPlanSchema = z.object({
   premise: z.string(),
@@ -194,12 +195,14 @@ export async function planNextShot(input: {
     const result = await showrunnerMeasure.measure(
       { label: "Plan next shot", episode: input.episode, model: MODEL },
       () =>
-        callLLM(<ShowrunnerPrompt {...promptInput} />, {
-          model: MODEL,
-          strategy: "hybrid",
-          temperature: generationMode === "fast" ? 0.25 : 0.35,
-          maxTokens: generationMode === "fast" ? 950 : 1500,
-        }),
+        callLLM(
+          <ShowrunnerPrompt {...promptInput} />,
+          codexCallOptions({
+            strategy: "hybrid",
+            temperature: generationMode === "fast" ? 0.25 : 0.35,
+            maxTokens: generationMode === "fast" ? 950 : 1500,
+          }),
+        ),
     );
 
     const toolCall = result?.toolCalls.find(

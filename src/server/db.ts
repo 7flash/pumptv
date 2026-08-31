@@ -1,16 +1,16 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
 import { Database, z } from "sqlite-zod-orm";
-import { measureSync } from "measure-fn";
+import { dbMeasure } from "./observability.ts";
 
-export const dbPath = process.env.SLOP_DB_PATH || ".data/slopstream.sqlite";
+export const dbPath = process.env.PUMPTV_DB_PATH || ".data/pumptv.sqlite";
 mkdirSync(dirname(dbPath), { recursive: true });
 
 const defaultResolution =
-  process.env.SLOP_RESOLUTION === "480P" ? "480P" : "768P";
+  process.env.PUMPTV_RESOLUTION === "480P" ? "480P" : "768P";
 
-const openedDb = measureSync(
-  "Open slop database",
+const openedDb = dbMeasure.measureSync(
+  "Open PumpTV database",
   () =>
     new Database(
       dbPath,
@@ -26,7 +26,7 @@ const openedDb = measureSync(
           heartbeatAtMs: z.number().default(0),
           generationMode: z.enum(["full", "fast", "emergency"]).default("full"),
           generationPauseKind: z
-            .enum(["cooldown", "funds", "rate_limit", "provider"])
+            .enum(["config", "cooldown", "funds", "rate_limit", "provider"])
             .nullable()
             .default(null),
           generationPauseReason: z.string().nullable().default(null),
@@ -126,7 +126,7 @@ const openedDb = measureSync(
 if (!openedDb) throw new Error("Could not open SQLite database");
 export const db = openedDb;
 
-measureSync("Create directive source index", () =>
+dbMeasure.measureSync("Create directive source index", () =>
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS directives_source_source_id_unique
      ON directives(source, sourceId)
@@ -134,7 +134,7 @@ measureSync("Create directive source index", () =>
   ),
 );
 
-measureSync("Create one-open-round index", () =>
+dbMeasure.measureSync("Create one-open-round index", () =>
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS prompt_rounds_one_open_unique
      ON promptRounds(status)
@@ -142,21 +142,21 @@ measureSync("Create one-open-round index", () =>
   ),
 );
 
-measureSync("Create proposal merge index", () =>
+dbMeasure.measureSync("Create proposal merge index", () =>
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS proposals_round_text_unique
      ON proposals(roundId, normalizedText)`,
   ),
 );
 
-measureSync("Create proposal voter index", () =>
+dbMeasure.measureSync("Create proposal voter index", () =>
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS proposal_votes_round_voter_unique
      ON proposalVotes(roundId, voterKey)`,
   ),
 );
 
-measureSync("Create world state episode index", () =>
+dbMeasure.measureSync("Create world state episode index", () =>
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS world_state_snapshots_episode_unique
      ON worldStateSnapshots(episode)`,

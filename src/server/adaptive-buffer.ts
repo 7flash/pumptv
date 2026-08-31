@@ -7,15 +7,15 @@ import type {
 const CLIP_MS = 5_000;
 const MIN_CLIPS_AHEAD = Math.max(
   2,
-  Number(process.env.SLOP_MIN_CLIPS_AHEAD || 2),
+  Number(process.env.PUMPTV_MIN_CLIPS_AHEAD || 2),
 );
 const TARGET_CLIPS_AHEAD = Math.max(
   MIN_CLIPS_AHEAD,
-  Math.min(3, Number(process.env.SLOP_TARGET_CLIPS_AHEAD || 3)),
+  Math.min(3, Number(process.env.PUMPTV_TARGET_CLIPS_AHEAD || 3)),
 );
-const DEFAULT_LEAD_MS = Number(process.env.SLOP_GENERATION_LEAD_MS || 4_500);
+const DEFAULT_LEAD_MS = Number(process.env.PUMPTV_GENERATION_LEAD_MS || 4_500);
 const SAFETY_MARGIN_MS = Number(
-  process.env.SLOP_BUFFER_SAFETY_MARGIN_MS || 1_000,
+  process.env.PUMPTV_BUFFER_SAFETY_MARGIN_MS || 1_000,
 );
 
 function finite(values: Array<number | null | undefined>) {

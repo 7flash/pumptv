@@ -1,9 +1,9 @@
 import { httpMeasure } from "../../../src/server/observability.ts";
-import { getStreamState } from "../../../src/server/repository.ts";
+import { getRuntimeStreamState } from "../../../src/server/runtime-state.ts";
 
 export async function GET() {
   const state = await httpMeasure.measure("GET /api/state", () =>
-    getStreamState(),
+    getRuntimeStreamState(),
   );
   if (!state)
     return Response.json(

@@ -1,14 +1,14 @@
 {
-  "name": "slopstream",
-  "version": "0.11.0",
+  "name": "pumptv",
+  "version": "0.15.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tradjs serve",
+    "dev": "tradjs serve 3000",
+    "start": "tradjs serve 3000",
+    "web": "tradjs serve 3000",
     "worker": "bun src/worker.ts",
-    "dev:all": "sh -c 'bun src/worker.ts & worker=$!; trap \"kill $worker 2>/dev/null || true\" EXIT INT TERM; tradjs serve'",
-    "build": "tradjs build",
-    "start": "tradjs serve 3000"
+    "build": "tradjs build"
   },
   "dependencies": {
     "@fal-ai/client": "^1.6.2",
@@ -16,7 +16,8 @@
     "sqlite-zod-orm": "^3.33.0",
     "tradjs": "^4.3.0",
     "ws": "^8.18.0",
-    "jsx-ai": "^0.1.5"
+    "jsx-ai": "latest",
+    "bgrun": "^3.14.0"
   },
   "devDependencies": {
     "@types/bun": "latest",

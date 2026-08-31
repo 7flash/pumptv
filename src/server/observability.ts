@@ -1,6 +1,7 @@
 import { configure, createMeasure } from "measure-fn";
 
 configure({
+  silent: process.env.MEASURE_SILENT !== "0",
   timestamps: process.env.MEASURE_TIMESTAMPS !== "0",
   maxResultLength: 240,
 });

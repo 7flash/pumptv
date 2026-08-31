@@ -1,16 +1,16 @@
 import type { GenerationPauseKind } from "../shared/contracts.ts";
 
 const FUNDS_RETRY_BASE_MS = Number(
-  process.env.SLOP_FUNDS_RETRY_BASE_MS || 30_000,
+  process.env.PUMPTV_FUNDS_RETRY_BASE_MS || 30_000,
 );
 const FUNDS_RETRY_MAX_MS = Number(
-  process.env.SLOP_FUNDS_RETRY_MAX_MS || 15 * 60_000,
+  process.env.PUMPTV_FUNDS_RETRY_MAX_MS || 15 * 60_000,
 );
 const PROVIDER_RETRY_BASE_MS = Number(
-  process.env.SLOP_PROVIDER_RETRY_BASE_MS || 3_000,
+  process.env.PUMPTV_PROVIDER_RETRY_BASE_MS || 3_000,
 );
 const PROVIDER_RETRY_MAX_MS = Number(
-  process.env.SLOP_PROVIDER_RETRY_MAX_MS || 60_000,
+  process.env.PUMPTV_PROVIDER_RETRY_MAX_MS || 60_000,
 );
 
 function errorParts(error: unknown, depth = 0): string[] {
@@ -52,7 +52,7 @@ export function classifyGenerationFailure(
   error: unknown,
   failures: number,
 ): {
-  kind: Exclude<GenerationPauseKind, "cooldown">;
+  kind: Exclude<GenerationPauseKind, "cooldown" | "config">;
   reason: string;
   retryAtMs: number;
 } {

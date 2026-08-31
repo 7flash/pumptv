@@ -6,9 +6,9 @@ import {
 } from "../../../src/server/repository.ts";
 
 function authorized(request: Request) {
-  const expected = process.env.SLOP_ADMIN_TOKEN;
+  const expected = process.env.PUMPTV_ADMIN_TOKEN;
   if (!expected) return true;
-  return request.headers.get("x-slop-admin-token") === expected;
+  return request.headers.get("x-pumptv-admin-token") === expected;
 }
 
 export async function GET() {

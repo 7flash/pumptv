@@ -11,7 +11,7 @@ export type PromptRoundStatus = "open" | "closed";
 export type ReconciliationStatus =
   "verified" | "corrected" | "fallback" | "skipped";
 export type GenerationPauseKind =
-  "cooldown" | "funds" | "rate_limit" | "provider";
+  "config" | "cooldown" | "funds" | "rate_limit" | "provider";
 
 export type Clip = {
   id: number;
@@ -168,17 +168,28 @@ export type PumpfunChatStatus = {
   lastError: string | null;
 };
 
+export type ManagedWorkerStatus = {
+  name: string;
+  state: "unknown" | "starting" | "running" | "error";
+  pid: number | null;
+  error: string | null;
+  checkedAtMs: number;
+};
+
 export type RoomState = {
   name: string;
   running: boolean;
   resolution: Resolution;
   workerState: WorkerState;
+  workerOnline: boolean;
+  workerHeartbeatAtMs: number | null;
   lastError: string | null;
   bufferedUntilMs: number | null;
   buffer: BufferHealth;
   pumpfun: PumpfunChatStatus;
   generation: GenerationAvailability;
   viewerCount: number;
+  workerProcess: ManagedWorkerStatus;
 };
 
 export type StreamState = {

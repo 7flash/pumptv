@@ -5,3 +5,7 @@ node_modules/
 out/
 dist/
 .DS_Store
+
+.config.toml
+bun.lock
+package-lock.json

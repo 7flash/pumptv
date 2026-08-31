@@ -34,7 +34,7 @@ let voterId = "";
 const localVotes = new Map<number, number>();
 
 function redraw() {
-  const root = document.getElementById("slop-root");
+  const root = document.getElementById("pumptv-root");
   if (root) render(<App />, root);
 }
 
@@ -222,7 +222,7 @@ function applyState(state: StreamState) {
 }
 
 function ensureVoterId() {
-  const key = "slopstream-voter-id";
+  const key = "pumptv-voter-id";
   voterId = localStorage.getItem(key) || "";
   if (!voterId) {
     voterId = crypto.randomUUID();
@@ -423,7 +423,7 @@ function shortAddress(value: string | null) {
 }
 
 function authorName(directive: Directive | null) {
-  if (!directive) return "SLOP AI";
+  if (!directive) return "PUMPTV AI";
   if (directive.author)
     return directive.author.startsWith("@")
       ? directive.author
@@ -494,14 +494,11 @@ function nextPromptText() {
 }
 
 function currentPromptText() {
-  return (
-    displayClip()?.directive ||
-    "The GPU cauldron is manufacturing the opening reality…"
-  );
+  return displayClip()?.directive || "Opening scene is rendering…";
 }
 
 function clipAttribution(clip: Clip | null) {
-  if (!clip || !clip.directiveId) return "SLOP AI · OPENING / AUTOPILOT";
+  if (!clip || !clip.directiveId) return "PUMPTV AI · OPENING / AUTOPILOT";
   const author = clip.directiveAuthor
     ? clip.directiveAuthor.startsWith("@")
       ? clip.directiveAuthor
@@ -522,6 +519,7 @@ function clipAttribution(clip: Clip | null) {
 
 function generationPauseLabel() {
   if (!room?.generation.paused) return null;
+  if (room.generation.kind === "config") return "⚙ CONFIG REQUIRED";
   if (room.generation.kind === "funds")
     return "💸 GENERATION PAUSED · TOP UP WHEN READY";
   if (room.generation.kind === "cooldown") return "⏳ NEXT DROP DELAYED";
@@ -530,6 +528,7 @@ function generationPauseLabel() {
 }
 
 function generationRetryLabel() {
+  if (room?.generation.kind === "config") return "RESTART AFTER CONFIG CHANGE";
   const retryAt = room?.generation.retryAtMs;
   if (!retryAt) return "AUTO RETRY";
   const seconds = Math.max(0, retryAt - liveNowMs()) / 1000;
@@ -588,12 +587,29 @@ function App() {
     ? activeDirective
       ? attribution(activeDirective)
       : clipAttribution(shown)
-    : "SLOP AI · OPENING / AUTOPILOT";
+    : "PUMPTV AI · OPENING";
   const nextByline = upcomingDirective
     ? attribution(upcomingDirective)
     : nextClip?.directiveId
       ? "LOCKED FROM CHAT"
-      : "SLOP AI · AUTOPILOT";
+      : "PUMPTV AI · AUTOPILOT";
+  const workerProcess = room?.workerProcess;
+  const workerStarting = Boolean(
+    room &&
+    !room.workerOnline &&
+    (workerProcess?.state === "starting" || workerProcess?.state === "running"),
+  );
+  const workerOffline = Boolean(room && !room.workerOnline && !workerStarting);
+  const configRequired = room?.generation.kind === "config";
+  const status = configRequired
+    ? "SETUP REQUIRED"
+    : workerStarting
+      ? "STARTING ENGINE"
+      : workerOffline
+        ? published.length
+          ? "ARCHIVE"
+          : "ENGINE OFFLINE"
+        : streamStatus();
 
   return (
     <>
@@ -610,141 +626,63 @@ function App() {
             onEnded={handleVideoEnded as any}
           />
         ) : (
-          <div className="void">
-            <div className="coinLoader">
-              <span>$SLOP</span>
+          <div className={`void${workerOffline ? " offline" : ""}`}>
+            <div className="pumpOrb">
+              <span>▶</span>
             </div>
             <strong>
-              {room?.generation.paused
-                ? "ARCHIVE IS STILL OPEN"
-                : "GENERATING REALITY"}
+              {configRequired
+                ? "FAL KEY REQUIRED"
+                : workerStarting
+                  ? "STARTING GENERATION ENGINE"
+                  : workerOffline
+                    ? "GENERATION ENGINE OFFLINE"
+                    : room?.generation.paused
+                      ? "GENERATION PAUSED"
+                      : "MAKING EPISODE 1"}
             </strong>
             <p>
-              {streamStatus()} ·{" "}
-              {room?.generation.paused
-                ? "pick an episode below while the GPU rests"
-                : "do not refresh your brain"}
+              {configRequired
+                ? "Set [fal].key in the repo-root .config.toml, then restart the managed PumpTV process so the worker is refreshed with the new config."
+                : workerStarting
+                  ? "PumpTV is starting the generation worker through bgrun. This normally takes a moment."
+                  : workerOffline
+                    ? workerProcess?.error ||
+                      "PumpTV could not start the managed generation worker. Check the pumptv-worker bgrun logs."
+                    : room?.generation.paused
+                      ? room.generation.reason ||
+                        "Existing episodes stay available while generation waits."
+                      : "The first five seconds are rendering. Voting opens while the next scene is prepared."}
             </p>
           </div>
         )}
 
-        <div className="videoWash" />
-        <div className="grain" />
-        <div className="scanlines" />
-
-        <div className="tickerTape" aria-hidden="true">
-          <div>
-            <span>🟢 $SLOP PLOT CAP: ∞</span>
-            <span>💬 CHAT IS THE DEV</span>
-            <span>🧠 BRAINROT ENGINE: MAX</span>
-            <span>🎥 5 SEC CANDLES ONLY</span>
-            <span>🪙 NO ROADMAP · ONLY LORE</span>
-            <span>🚀 NEXT PROMPT ALWAYS LOADING</span>
-            <span>🟢 $SLOP PLOT CAP: ∞</span>
-            <span>💬 CHAT IS THE DEV</span>
-          </div>
-        </div>
+        <div className="videoShade" />
 
         <header className="topbar">
           <div className="brandLockup">
-            <div className="coinMark">
-              <span>S</span>
-            </div>
+            <div className="coinMark">P</div>
             <div>
               <div className="brand">
-                <span className="liveDot" />
-                SLOP TV
+                PUMP<span>TV</span>
               </div>
-              <div className="brandSub">$SLOP · infinite story market</div>
+              <div className="brandSub">infinite live story</div>
             </div>
           </div>
           <div className="meta">
-            <span className={`liveState ${streamStatus().toLowerCase()}`}>
-              {streamStatus()}
+            <span className={`liveState ${workerOffline ? "offline" : ""}`}>
+              <i />
+              {status}
             </span>
             <span>EP {shown ? shown.episode + 1 : "—"}</span>
-            <span>{room?.resolution || "—"}</span>
             <span className="viewerCount">
-              👁 {room?.viewerCount ?? 0} WATCHING
-            </span>
-            <span>{bufferLabel()}</span>
-            <span className={`bufferModeTag ${room?.buffer.mode || "full"}`}>
-              {bufferModeLabel()}
+              {room?.viewerCount ?? 0} watching
             </span>
             <button className="soundToggle" onClick={toggleSound}>
-              {soundEnabled ? "🔊 SOUND ON" : "🔇 UNMUTE"}
+              {soundEnabled ? "Sound on" : "Unmute"}
             </button>
           </div>
         </header>
-
-        <div className="sceneHud">
-          <article className="nowCard">
-            <div className="cardEyebrow">
-              <span
-                className={`statusChip ${replaying ? "replayChip" : "liveChip"}`}
-              >
-                {replaying
-                  ? replayClipId != null
-                    ? "↶ REWATCHING"
-                    : "⏸ ARCHIVE LOOP"
-                  : "● NOW PLAYING"}
-              </span>
-              <span>EP {shown ? shown.episode + 1 : "—"}</span>
-            </div>
-            <h2>{currentPromptText()}</h2>
-            <div className="promptAttribution">
-              <span>SUGGESTED BY</span>
-              <strong>{currentByline}</strong>
-            </div>
-            <progress
-              className="sceneProgress"
-              data-current-progress
-              max={shown?.durationSeconds || 5}
-              value={
-                shown && !replaying
-                  ? Math.max(0, (liveNowMs() - shown.startsAtMs) / 1000)
-                  : 0
-              }
-            />
-            {replaying ? (
-              <button
-                className="returnLive"
-                type="button"
-                onClick={returnToLive}
-                disabled={!current}
-              >
-                {current
-                  ? "● RETURN TO LIVE"
-                  : "⏳ LIVE RESUMES WHEN NEXT EP DROPS"}
-              </button>
-            ) : null}
-          </article>
-
-          <article className={`nextCard ${nextLocked ? "locked" : "open"}`}>
-            <div className="cardEyebrow">
-              <span
-                className={`statusChip ${nextLocked ? "nextChip" : "voteChip"}`}
-              >
-                {nextLocked
-                  ? replaying
-                    ? "🔒 LIVE NEXT"
-                    : "🔒 LOCKED NEXT"
-                  : replaying
-                    ? "🗳️ LIVE QUEUE"
-                    : "🗳️ NEXT PROMPT"}
-              </span>
-              <strong data-next-countdown>
-                {nextLocked ? "READY" : "VOTING NOW"}
-              </strong>
-            </div>
-            <p>
-              {upcomingDirective?.text ||
-                nextClip?.directive ||
-                nextPromptText()}
-            </p>
-            <div className="nextMeta">{nextByline}</div>
-          </article>
-        </div>
 
         {room?.generation.paused ? (
           <div
@@ -754,26 +692,81 @@ function App() {
             <span>{generationRetryLabel()}</span>
             <p>
               {room.generation.reason ||
-                "Existing episodes stay online while generation waits."}
+                "Replays stay online while generation waits."}
+            </p>
+          </div>
+        ) : workerStarting ? (
+          <div className="generationPause starting">
+            <strong>STARTING ENGINE</strong>
+            <span>
+              BGRUN ·{" "}
+              {workerProcess?.pid ? `PID ${workerProcess.pid}` : "SPAWNING"}
+            </span>
+            <p>
+              The web process is ensuring <code>pumptv-worker</code> through the
+              bgrun SDK.
+            </p>
+          </div>
+        ) : workerOffline ? (
+          <div className="generationPause offline">
+            <strong>ENGINE OFFLINE</strong>
+            <span>BGRUN WORKER FAILED</span>
+            <p>
+              {workerProcess?.error ||
+                "Check `bunx bgrun pumptv-worker --logs` for the worker startup error."}
             </p>
           </div>
         ) : null}
 
-        {published.length ? (
-          <nav className="episodeRail" aria-label="Episode replay timeline">
-            <div className="episodeRailHead">
-              <span>REPLAY LINE</span>
-              <b>
-                {replayClipId != null
-                  ? `REWATCHING EP ${(shown?.episode ?? 0) + 1}`
-                  : current
-                    ? "● LIVE EDGE"
-                    : "ARCHIVE EDGE"}
-              </b>
-              <em>{published.length} EP IN LOCAL RAIL</em>
+        {shown ? (
+          <article className="nowOverlay">
+            <div className="nowTopline">
+              <span className={replaying ? "replayPill" : "livePill"}>
+                {replaying ? "REWATCH" : "NOW"}
+              </span>
+              <span>EP {shown.episode + 1}</span>
+              {replaying ? (
+                <button
+                  type="button"
+                  onClick={returnToLive}
+                  disabled={!current}
+                >
+                  Return to live
+                </button>
+              ) : null}
             </div>
-            <div className="episodeTrack">
-              {published.map((clip) => {
+            <h1>{currentPromptText()}</h1>
+            <div className="promptAttribution">{currentByline}</div>
+            <progress
+              className="sceneProgress"
+              data-current-progress
+              max={shown.durationSeconds || 5}
+              value={
+                !replaying
+                  ? Math.max(0, (liveNowMs() - shown.startsAtMs) / 1000)
+                  : 0
+              }
+            />
+          </article>
+        ) : null}
+
+        <nav className="episodeRail" aria-label="Episode replay timeline">
+          <div className="episodeRailHead">
+            <span>EPISODES</span>
+            <b>
+              {replayClipId != null
+                ? `Rewatching EP ${(shown?.episode ?? 0) + 1}`
+                : current
+                  ? "Live edge"
+                  : published.length
+                    ? "Archive"
+                    : "Waiting for first episode"}
+            </b>
+            <em>{published.length ? `${published.length} available` : ""}</em>
+          </div>
+          <div className="episodeTrack">
+            {published.length ? (
+              published.map((clip) => {
                 const active = shown?.id === clip.id;
                 const live = current?.id === clip.id && replayClipId == null;
                 return (
@@ -785,47 +778,41 @@ function App() {
                     title={`EP ${clip.episode + 1}: ${clip.directive}`}
                   >
                     <i />
-                    <span>EP {clip.episode + 1}</span>
+                    <span>{clip.episode + 1}</span>
                   </button>
                 );
-              })}
-            </div>
-          </nav>
-        ) : null}
+              })
+            ) : (
+              <div className="episodeEmpty">
+                Episode history will appear here.
+              </div>
+            )}
+          </div>
+        </nav>
 
-        {room?.lastError ? (
+        {room?.lastError && !configRequired ? (
           <p className="error stageError">{room.lastError}</p>
-        ) : null}
-        {room?.pumpfun.lastError ? (
-          <p className="error stageError pumpError">
-            Pump.fun: {room.pumpfun.lastError}
-          </p>
         ) : null}
         {error ? <p className="error stageError clientError">{error}</p> : null}
       </section>
 
       <aside className="chatPanel">
-        <div className="chatHeader">
+        <header className="chatHeader">
           <div>
-            <div className="panelKicker">LIVE PLOT TERMINAL</div>
-            <h1>WHAT HAPPENS NEXT?</h1>
-            <p>Drop brainrot. One identity = one vote. Winner becomes canon.</p>
+            <div className="panelKicker">NEXT SCENE</div>
+            <h2>What happens next?</h2>
           </div>
-          <div className={`workerBadge ${room?.workerState || "idle"}`}>
-            {room?.workerState || transport}
+          <div className="roundClock" data-round-countdown>
+            {arena?.status === "open" ? "…" : "—"}
           </div>
-        </div>
+        </header>
 
         <section
           className={`lockedNextPanel ${nextLocked ? "hasNext" : "waiting"}`}
         >
           <div className="lockedTopline">
             <span>
-              {nextLocked
-                ? replaying
-                  ? "🔒 LIVE NEXT PROMPT"
-                  : "🔒 NEXT PROMPT LOCKED"
-                : "🟢 NEXT PROMPT IS LIVE"}
+              {nextLocked ? "LOCKED NEXT" : open ? "VOTING NOW" : "WAITING"}
             </span>
             <b data-next-countdown>{nextLocked ? "READY" : "VOTING NOW"}</b>
           </div>
@@ -835,245 +822,106 @@ function App() {
           <div className="lockedByline">{nextByline}</div>
         </section>
 
-        <section className={`bufferDeck ${room?.buffer.health || "empty"}`}>
-          <div className="bufferDeckTop">
-            <span>{bufferModeLabel()}</span>
-            <b>{bufferHealthLabel()}</b>
+        <section className="queueSection">
+          <div className="queueHeader">
+            <div>
+              <span>VOTE QUEUE</span>
+              <strong>{arena ? `EP ${arena.targetEpisode + 1}` : "—"}</strong>
+            </div>
+            <em>
+              {totalVotes} {totalVotes === 1 ? "vote" : "votes"}
+            </em>
           </div>
-          <div className="bufferRail">
-            <i
-              style={{
-                width: `${Math.min(100, room ? (room.buffer.bufferMs / room.buffer.targetBufferMs) * 100 : 0)}%`,
-              }}
-            />
-          </div>
-          <div className="bufferStats">
-            <span>{latencyLabel()}</span>
-            <em>{room?.buffer.health.toUpperCase() || "EMPTY"}</em>
-          </div>
-          <p>
-            {room?.buffer.mode === "full"
-              ? "Full showrunner + vision audit online."
-              : room?.buffer.mode === "fast"
-                ? "Vision is temporarily skipped so the stream can rebuild headroom."
-                : "Deterministic continuity planner active. H3 stays live while optional AI steps are bypassed."}
-          </p>
-        </section>
 
-        <div className="messages">
-          <details className="canonBrain" open>
-            <summary>
-              <span>🧠 {replaying ? "LIVE CANON BRAIN" : "CANON BRAIN"}</span>
-              <b>
-                {worldState
-                  ? `REV ${worldState.revision} · EP ${(worldStateEpisode ?? 0) + 1}`
-                  : "SYNCING"}
-              </b>
-            </summary>
-            {worldState ? (
-              <div className="canonBrainBody">
-                {replayClipId != null &&
-                worldStateEpisode !== shown?.episode ? (
-                  <div className="replayCanonNotice">
-                    REPLAY VIEW · CANON BRAIN IS PINNED TO LIVE EDGE EP{" "}
-                    {(worldStateEpisode ?? 0) + 1}
-                  </div>
-                ) : null}
-                <div className="canonLocation">
-                  <span>📍 CURRENT MAP TILE</span>
-                  <strong>{worldState.location}</strong>
-                  <p>{worldState.locationDetails}</p>
-                </div>
-                <div className="canonStats">
-                  <span>{worldState.characters.length} CHAR</span>
-                  <span>{worldState.props.length} PROPS</span>
-                  <span>{worldState.openThreads.length} OPEN LOOPS</span>
-                  <span>{canonEntityCount()} ENTITIES</span>
-                </div>
-                <div
-                  className={`realityCheck ${worldStateAudit?.status || "pending"}`}
+          <div className="candidates">
+            {candidates.length ? (
+              candidates.map((proposal, rank) => (
+                <button
+                  type="button"
+                  className={candidateClass(proposal, rank)}
+                  key={proposal.id}
+                  disabled={!open || proposal.status !== "open"}
+                  onClick={() => voteProposal(proposal.id)}
                 >
-                  <div>
-                    <span>RENDERED REALITY CHECK</span>
-                    <strong>{realityCheckLabel()}</strong>
-                  </div>
-                  {worldStateAudit?.summary ? (
-                    <p>{worldStateAudit.summary}</p>
-                  ) : (
-                    <p>Waiting for sampled-frame reconciliation.</p>
-                  )}
-                  {worldStateAudit?.drift.length ? (
-                    <ul>
-                      {worldStateAudit.drift.slice(0, 3).map((item, index) => (
-                        <li key={`${index}-${item}`}>{item}</li>
-                      ))}
-                    </ul>
-                  ) : null}
-                </div>
-                {worldState.characters.length ? (
-                  <div className="canonGroup">
-                    <span className="canonGroupTitle">CAST BAGHOLDERS</span>
-                    <div className="canonChips">
-                      {worldState.characters.slice(0, 5).map((character) => (
-                        <span
-                          className="canonChip characterChip"
-                          key={character.id}
-                          title={`${character.appearance} · ${character.wardrobe}`}
-                        >
-                          {canonCharacterLabel(character)}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-                {worldState.props.length ? (
-                  <div className="canonGroup">
-                    <span className="canonGroupTitle">LORE OBJECTS</span>
-                    <div className="canonChips">
-                      {worldState.props.slice(0, 6).map((prop) => (
-                        <span
-                          className="canonChip propChip"
-                          key={prop.id}
-                          title={prop.description}
-                        >
-                          {canonPropLabel(prop)}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                ) : null}
-                {worldState.openThreads.length ? (
-                  <div className="canonGroup">
-                    <span className="canonGroupTitle">UNRESOLVED ALPHA</span>
-                    <ol className="threadList">
-                      {worldState.openThreads
-                        .slice(0, 4)
-                        .map((thread, index) => (
-                          <li key={`${index}-${thread}`}>{thread}</li>
-                        ))}
-                    </ol>
-                  </div>
-                ) : null}
-                <div className="endingTape">
-                  <span>LAST FRAME MEMORY</span>
-                  <p>{worldState.lastEndingBeat}</p>
-                </div>
-              </div>
-            ) : (
-              <div className="canonBrainEmpty">WORLD MODEL IS BOOTING…</div>
-            )}
-          </details>
-
-          <section className="arena">
-            <div className="arenaHeader">
-              <div>
-                <span>
-                  {arena
-                    ? `NEXT PROMPT QUEUE · ROUND #${arena.id}`
-                    : "NEXT PROMPT QUEUE"}
-                </span>
-                <strong>
-                  {arena
-                    ? `VOTING FOR EP ${arena.targetEpisode + 1} · ${open ? "OPEN" : "LOCKED"}`
-                    : "BOOTING BALLOT"}
-                </strong>
-              </div>
-              <div className="roundNumbers">
-                <b data-round-countdown>
-                  {arena?.status === "open" ? "…" : "LOCKED"}
-                </b>
-                <em>
-                  {totalVotes} {totalVotes === 1 ? "VOTE" : "VOTES"}
-                </em>
-              </div>
-            </div>
-
-            <div className="queueLegend">
-              <span>RANK</span>
-              <span>PROMPT</span>
-              <span>VOTES</span>
-            </div>
-
-            <div className="candidates">
-              {candidates.length ? (
-                candidates.map((proposal, rank) => (
-                  <button
-                    type="button"
-                    className={candidateClass(proposal, rank)}
-                    key={proposal.id}
-                    disabled={!open || proposal.status !== "open"}
-                    onClick={() => voteProposal(proposal.id)}
-                  >
-                    <span className="rankBadge">
-                      {String(rank + 1).padStart(2, "0")}
+                  <span className="rankBadge">{rank + 1}</span>
+                  <span className="candidateBody">
+                    <span className="candidateText">{proposal.text}</span>
+                    <span className="candidateMeta">
+                      #{proposal.id} · {proposalSource(proposal)}
                     </span>
-                    <span className="candidateBody">
-                      <span className="candidateMeta">
-                        <em>
-                          #{proposal.id} · {proposalSource(proposal)}
-                        </em>
-                        {rank === 0 && proposal.voteCount > 0 ? (
-                          <i>LEADING</i>
-                        ) : null}
-                        {arena && localVotes.get(arena.id) === proposal.id ? (
-                          <i>YOUR VOTE</i>
-                        ) : null}
-                      </span>
-                      <span className="candidateText">{proposal.text}</span>
-                      <progress
-                        className="voteMeter"
-                        value={proposal.voteCount}
-                        max={Math.max(1, totalVotes)}
+                    <span className="voteBar">
+                      <i
+                        style={{
+                          width: `${totalVotes ? Math.max(5, (proposal.voteCount / totalVotes) * 100) : 0}%`,
+                        }}
                       />
                     </span>
-                    <span className="voteStack">
-                      <strong>{proposal.voteCount}</strong>
-                      <small>
-                        {proposal.voteCount === 1 ? "VOTE" : "VOTES"}
-                      </small>
-                    </span>
-                  </button>
-                ))
-              ) : (
-                <div className="emptyBallot">
-                  <b>QUEUE EMPTY</b>
-                  {open
-                    ? "Be first. Submit the next mutation below."
-                    : "The next ballot opens as soon as playback has safe generation headroom."}
-                </div>
-              )}
-            </div>
-          </section>
-
-          <details className="canonLog">
-            <summary>
-              RECENT CANON / WINNERS <span>{directives.length}</span>
-            </summary>
-            <div className="canonItems">
-              {directives.map((directive) => (
-                <div
-                  className={`message ${directive.status}`}
-                  key={directive.id}
-                >
-                  <span>{directiveLabel(directive)}</span>
-                  {directive.text}
-                </div>
-              ))}
-            </div>
-          </details>
-
-          <div className="systemMessage">
-            <span>{pumpfunLabel()}</span>
-            Pump.fun: <b>!next your idea</b> proposes + votes. <b>!vote 42</b>{" "}
-            moves your vote. Duplicate ideas merge instead of clogging the lore.
+                  </span>
+                  <span className="voteStack">
+                    <strong>{proposal.voteCount}</strong>
+                    <small>
+                      {arena && localVotes.get(arena.id) === proposal.id
+                        ? "YOURS"
+                        : rank === 0 && proposal.voteCount
+                          ? "LEAD"
+                          : "VOTES"}
+                    </small>
+                  </span>
+                </button>
+              ))
+            ) : (
+              <div className="emptyBallot">
+                <b>
+                  {configRequired
+                    ? "SETUP REQUIRED"
+                    : workerStarting
+                      ? "ENGINE STARTING"
+                      : workerOffline
+                        ? "ENGINE OFFLINE"
+                        : open
+                          ? "BE FIRST"
+                          : "QUEUE OPENS SOON"}
+                </b>
+                <span>
+                  {configRequired
+                    ? "Add your fal key to .config.toml. The worker is online; video generation is intentionally paused until credentials exist."
+                    : workerStarting
+                      ? "The managed generation worker is starting through bgrun."
+                      : workerOffline
+                        ? workerProcess?.error ||
+                          "The managed generation worker failed to start. Check its bgrun logs."
+                        : open
+                          ? "Drop the next scene below. Your submission also casts your vote."
+                          : "PumpTV opens voting as soon as the generation buffer is safe."}
+                </span>
+              </div>
+            )}
           </div>
-        </div>
+        </section>
+
+        <details className="canonMini">
+          <summary>
+            <span>Canon brain</span>
+            <b>
+              {worldState
+                ? `${worldState.characters.length} cast · ${worldState.openThreads.length} threads`
+                : "booting"}
+            </b>
+          </summary>
+          {worldState ? (
+            <div className="canonMiniBody">
+              <strong>{worldState.location || "Unknown location"}</strong>
+              <p>{worldState.lastEndingBeat || worldState.locationDetails}</p>
+              <div>{realityCheckLabel()}</div>
+            </div>
+          ) : (
+            <div className="canonMiniBody">
+              <p>Canon starts after episode 1.</p>
+            </div>
+          )}
+        </details>
 
         <form className="composer" onSubmit={submitProposal as any}>
-          <div className="composerTitle">
-            <span>CREATE NEXT PROMPT</span>
-            <em>{open ? "LIVE" : "LOCKED"}</em>
-          </div>
           <textarea
             value={input}
             disabled={!open}
@@ -1082,8 +930,14 @@ function App() {
             }}
             placeholder={
               open
-                ? "make the raccoon ape into a cursed vending machine coin and the machine starts screaming tomorrow's chat…"
-                : "round locked — the winner is becoming reality…"
+                ? "make the next scene unreasonably specific…"
+                : configRequired
+                  ? "add [fal].key to .config.toml first…"
+                  : workerStarting
+                    ? "generation engine is starting…"
+                    : workerOffline
+                      ? "generation engine is offline"
+                      : "waiting for the next vote round…"
             }
             maxLength={500}
             rows={3}
@@ -1097,26 +951,22 @@ function App() {
             }}
           />
           <div className="composerBottom">
-            <div className="qualityReadout">
-              {room?.resolution || "—"} ·{" "}
-              {room?.buffer.mode.toUpperCase() || "FULL"} · 1 WALLET / 1 VOTE
-            </div>
-            <div className="queueCount">
-              {queuedCount
-                ? `${queuedCount} WINNER LOCKED`
-                : `${candidates.length} IN QUEUE`}
-            </div>
+            <span>
+              {room?.pumpfun.enabled
+                ? pumpfunLabel()
+                : "WEB + PUMP.FUN PROMPTS"}
+            </span>
             <button type="submit" disabled={!open}>
-              SEND IT ↗
+              Suggest + vote
             </button>
           </div>
         </form>
 
         <footer>
-          <span>tradjs · jsx-ai · sqlite-zod-orm</span>
           <span>
-            👁 {room?.viewerCount ?? 0} WATCHING · {transport} · H3 MAX
+            {room?.buffer.mode.toUpperCase() || "FULL"} · {bufferLabel()}
           </span>
+          <span>{room?.viewerCount ?? 0} watching</span>
         </footer>
       </aside>
     </>
@@ -1132,7 +982,7 @@ export default function mount() {
     source = null;
     if (clockTimer) clearInterval(clockTimer);
     clockTimer = null;
-    const root = document.getElementById("slop-root");
+    const root = document.getElementById("pumptv-root");
     if (root) render(null, root);
   };
 }

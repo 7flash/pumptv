@@ -1,4 +1,4 @@
-import { getStreamState } from "./repository.ts";
+import { getRuntimeStreamState } from "./runtime-state.ts";
 import { viewerJoined, viewerLeft } from "./presence.ts";
 
 const encoder = new TextEncoder();
@@ -28,7 +28,7 @@ async function poll() {
   if (polling || subscribers.size === 0) return;
   polling = true;
   try {
-    const state = await getStreamState();
+    const state = await getRuntimeStreamState();
     const payload = JSON.stringify(state);
     if (payload !== lastPayload) {
       lastPayload = payload;

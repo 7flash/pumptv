@@ -100,7 +100,7 @@ async function connectOnce(input: {
       // Socket.IO namespace connected: join the token/mint chat room. Ack id=0.
       if (frame.startsWith("40")) {
         socket.send(
-          `420${JSON.stringify(["joinRoom", { roomId: input.mint, username: "slopstream-reader" }])}`,
+          `420${JSON.stringify(["joinRoom", { roomId: input.mint, username: "pumptv-reader" }])}`,
         );
         return;
       }

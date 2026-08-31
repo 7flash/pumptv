@@ -19,9 +19,9 @@ import { dbMeasure } from "./observability.ts";
 import { EMPTY_WORLD_STATE, parseWorldStateJson } from "./world-state.ts";
 import { getViewerCount } from "./presence.ts";
 
-const PUMPFUN_MINT = (process.env.SLOP_PUMPFUN_MINT || "").trim();
-const PUMPFUN_PREFIX = process.env.SLOP_PUMPFUN_PREFIX ?? "!next";
-const PUMPFUN_VOTE_PREFIX = process.env.SLOP_PUMPFUN_VOTE_PREFIX ?? "!vote";
+const PUMPFUN_MINT = (process.env.PUMPTV_PUMPFUN_MINT || "").trim();
+const PUMPFUN_PREFIX = process.env.PUMPTV_PUMPFUN_PREFIX ?? "!next";
+const PUMPFUN_VOTE_PREFIX = process.env.PUMPTV_PUMPFUN_VOTE_PREFIX ?? "!vote";
 
 function toClip(row: any): Clip {
   return {
@@ -137,6 +137,10 @@ function toRoom(
     running: Boolean(row.running),
     resolution: row.resolution,
     workerState: row.workerState,
+    workerOnline:
+      Number(row.heartbeatAtMs || 0) > 0 &&
+      Date.now() - Number(row.heartbeatAtMs || 0) < 5_000,
+    workerHeartbeatAtMs: Number(row.heartbeatAtMs || 0) || null,
     lastError: row.lastError ?? null,
     bufferedUntilMs,
     buffer:
@@ -166,6 +170,13 @@ function toRoom(
       failureCount: Number(row.generationFailureCount || 0),
     },
     viewerCount: getViewerCount(),
+    workerProcess: {
+      name: "pumptv-worker",
+      state: "unknown",
+      pid: null,
+      error: null,
+      checkedAtMs: 0,
+    },
   };
 }
 
@@ -206,6 +217,16 @@ export async function updateRoomSettings(input: {
   return getRoomRow();
 }
 
+export async function touchWorkerHeartbeat() {
+  const room = await getRoomRow();
+  return dbMeasure.measureSync("Touch worker heartbeat", () =>
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({ heartbeatAtMs: Date.now() }),
+  );
+}
+
 export async function setWorkerState(
   state: WorkerState,
   error: string | null = null,
@@ -227,7 +248,7 @@ export async function setWorkerState(
 }
 
 export async function setGenerationPause(input: {
-  kind: "cooldown" | "funds" | "rate_limit" | "provider";
+  kind: "config" | "cooldown" | "funds" | "rate_limit" | "provider";
   reason: string;
   retryAtMs: number;
   failureCount?: number;
@@ -589,7 +610,7 @@ export async function getLatestClip(): Promise<Clip | null> {
 }
 
 export async function getTimeline(
-  limit = Number(process.env.SLOP_TIMELINE_WINDOW || 64),
+  limit = Number(process.env.PUMPTV_TIMELINE_WINDOW || 64),
 ): Promise<Clip[]> {
   const safeLimit = Math.max(8, Math.min(240, Math.floor(limit || 64)));
   const rows = await dbMeasure.measureSync(

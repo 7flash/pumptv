@@ -12,8 +12,8 @@ import {
 } from "./world-state.ts";
 import type { ClipFrameSample } from "./video-frames.ts";
 
-const ENABLED = process.env.SLOP_RECONCILE_VISION !== "0";
-const MODEL = process.env.SLOP_RECONCILER_MODEL || "google/gemini-2.5-flash";
+const ENABLED = process.env.PUMPTV_RECONCILE_VISION !== "0";
+const MODEL = process.env.PUMPTV_RECONCILER_MODEL || "google/gemini-2.5-flash";
 
 const ReconciliationSchema = z.object({
   status: z.enum(["verified", "corrected"]),

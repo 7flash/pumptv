@@ -1,7 +1,7 @@
 import { measureSync } from "measure-fn";
 import { db } from "./db.ts";
 
-export const ROOM_NAME = process.env.SLOP_ROOM || "main";
+export const ROOM_NAME = process.env.PUMPTV_ROOM || "main";
 
 type LeaseRow = {
   id: number;

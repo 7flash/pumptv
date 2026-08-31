@@ -15,13 +15,15 @@ import { runPumpfunSocket, type PumpfunMessage } from "./pumpfun-socket.ts";
 import { getLatestClip, getRoomRow, setPumpChatState } from "./repository.ts";
 import { arbitrationMeasure, pumpMeasure } from "./observability.ts";
 
-const MINT = (process.env.SLOP_PUMPFUN_MINT || "").trim();
-const PREFIX = process.env.SLOP_PUMPFUN_PREFIX ?? "!next";
-const VOTE_PREFIX = process.env.SLOP_PUMPFUN_VOTE_PREFIX ?? "!vote";
-const LEASE_TTL_MS = Number(process.env.SLOP_PUMPFUN_LEASE_TTL_MS || 30_000);
-const POLL_MS = Number(process.env.SLOP_PUMPFUN_LEASE_POLL_MS || 1_000);
-const MAX_TEXT = Number(process.env.SLOP_PUMPFUN_MAX_PROMPT_LENGTH || 500);
-const USER_COOLDOWN_MS = Number(process.env.SLOP_PUMPFUN_USER_COOLDOWN_MS || 0);
+const MINT = (process.env.PUMPTV_PUMPFUN_MINT || "").trim();
+const PREFIX = process.env.PUMPTV_PUMPFUN_PREFIX ?? "!next";
+const VOTE_PREFIX = process.env.PUMPTV_PUMPFUN_VOTE_PREFIX ?? "!vote";
+const LEASE_TTL_MS = Number(process.env.PUMPTV_PUMPFUN_LEASE_TTL_MS || 30_000);
+const POLL_MS = Number(process.env.PUMPTV_PUMPFUN_LEASE_POLL_MS || 1_000);
+const MAX_TEXT = Number(process.env.PUMPTV_PUMPFUN_MAX_PROMPT_LENGTH || 500);
+const USER_COOLDOWN_MS = Number(
+  process.env.PUMPTV_PUMPFUN_USER_COOLDOWN_MS || 0,
+);
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const owner = `pump:${hostname()}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`;
@@ -194,7 +196,7 @@ export async function runPumpfunChatIngestor() {
   if (!MINT) {
     await setPumpChatState("disabled", null);
     console.log(
-      "[pumpfun] disabled; set SLOP_PUMPFUN_MINT to ingest live chat",
+      "[pumpfun] disabled; set PUMPTV_PUMPFUN_MINT to ingest live chat",
     );
     return;
   }

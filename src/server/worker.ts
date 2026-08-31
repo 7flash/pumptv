@@ -16,14 +16,15 @@ import {
   recoverGeneratingDirectives,
   setWorkerState,
   setGenerationPause,
+  touchWorkerHeartbeat,
 } from "./repository.ts";
 
-const LEASE_TTL_MS = Number(process.env.SLOP_LEASE_TTL_MS || 30_000);
-const IDLE_POLL_MS = Number(process.env.SLOP_IDLE_POLL_MS || 250);
-const ERROR_BACKOFF_MS = Number(process.env.SLOP_ERROR_BACKOFF_MS || 2_000);
+const LEASE_TTL_MS = Number(process.env.PUMPTV_LEASE_TTL_MS || 30_000);
+const IDLE_POLL_MS = Number(process.env.PUMPTV_IDLE_POLL_MS || 250);
+const ERROR_BACKOFF_MS = Number(process.env.PUMPTV_ERROR_BACKOFF_MS || 2_000);
 const MIN_GENERATION_INTERVAL_MS = Math.max(
   0,
-  Number(process.env.SLOP_MIN_GENERATION_INTERVAL_MS || 0),
+  Number(process.env.PUMPTV_MIN_GENERATION_INTERVAL_MS || 0),
 );
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -74,7 +75,31 @@ async function waitForPromptWindow(
 }
 
 async function generationTick() {
+  await touchWorkerHeartbeat();
   const room = await getRoomRow();
+
+  const falKey = (process.env.FAL_KEY || "").trim();
+  if (!falKey) {
+    const reason =
+      "FAL_KEY is missing. Set [fal].key in .config.toml, then restart PumpTV so bgrun reloads the worker config.";
+    if (
+      room.generationPauseKind !== "config" ||
+      room.generationPauseReason !== reason
+    ) {
+      await setGenerationPause({
+        kind: "config",
+        reason,
+        retryAtMs: Date.now() + 86_400_000,
+        failureCount: 0,
+      });
+    }
+    await setWorkerState("idle", null, room.generationMode || "full");
+    return { generated: false, sleepMs: 1_000 };
+  }
+
+  if (room.generationPauseKind === "config") {
+    await clearGenerationPause();
+  }
   if (!room.running) {
     await setWorkerState("idle", null);
     return { generated: false, sleepMs: 1_000 };
@@ -192,6 +217,9 @@ async function generationTick() {
     );
 
     const mode = lockedLatest ? lockedAdaptive.recommendedMode : "full";
+    console.log(
+      `[worker] generating EP ${episode + 1} · ${mode.toUpperCase()} · ${lockedLatest ? "continuation" : "opening"}`,
+    );
     await setWorkerState("generating", null, mode);
 
     let clip;
@@ -204,6 +232,9 @@ async function generationTick() {
     } catch (error) {
       const failures = Number(lockedRoom.generationFailureCount || 0) + 1;
       const recovery = classifyGenerationFailure(error, failures);
+      console.error(
+        `[worker] generation paused · ${recovery.kind} · ${recovery.reason}`,
+      );
       await setGenerationPause({ ...recovery, failureCount: failures });
       return {
         generated: false,
@@ -214,6 +245,9 @@ async function generationTick() {
       };
     }
 
+    console.log(
+      `[worker] published EP ${clip.episode + 1} · ${clip.totalGenerationMs ?? 0}ms`,
+    );
     const finishedAtMs = Date.now();
     if (MIN_GENERATION_INTERVAL_MS > 0) {
       await setGenerationPause({
@@ -244,7 +278,10 @@ async function generationTick() {
 }
 
 export async function runRoomWorker() {
-  console.log(`[worker] slop room worker ${owner}`);
+  console.log(`[worker] PumpTV room worker ${owner}`);
+  console.log(
+    `[worker] cwd=${process.cwd()} · FAL_KEY=${(process.env.FAL_KEY || "").trim() ? "present" : "missing"} · room=${process.env.PUMPTV_ROOM || "main"} · db=${process.env.PUMPTV_DB_PATH || ".data/pumptv.sqlite"}`,
+  );
 
   while (!stopping) {
     const result = await workerMeasure.measure("Room tick", () =>
