@@ -66,6 +66,35 @@ export type PromptRound = {
   proposals: PromptProposal[];
 };
 
+export type WorldCharacter = {
+  id: string;
+  name: string;
+  appearance: string;
+  wardrobe: string;
+  status: string;
+  position: string;
+};
+
+export type WorldProp = {
+  id: string;
+  name: string;
+  description: string;
+  status: string;
+  position: string;
+};
+
+export type WorldState = {
+  revision: number;
+  location: string;
+  locationDetails: string;
+  characters: WorldCharacter[];
+  props: WorldProp[];
+  openThreads: string[];
+  motifs: string[];
+  visualRules: string[];
+  lastEndingBeat: string;
+};
+
 export type PumpfunChatStatus = {
   enabled: boolean;
   mint: string | null;
@@ -96,5 +125,7 @@ export type StreamState = {
   timeline: Clip[];
   recentDirectives: Directive[];
   arena: PromptRound | null;
+  worldState: WorldState | null;
+  worldStateEpisode: number | null;
   queuedCount: number;
 };

@@ -9,7 +9,8 @@ import {
   nextEpisode,
   recentStory,
   releaseDirective,
-  saveClip,
+  getLatestWorldState,
+  saveClipWithWorldState,
 } from "./repository.ts";
 
 const CLIP_SECONDS = 5;
@@ -45,7 +46,10 @@ export async function generateNextClip(input: {
   const directive = claimed?.text || (episode === 0 ? OPENING : AUTOPILOT);
 
   try {
-    const story = await recentStory();
+    const [story, worldState] = await Promise.all([
+      recentStory(),
+      getLatestWorldState(),
+    ]);
     const anchorFrameUrl = input.previousClip
       ? await extractLastFrame(input.previousClip.videoUrl)
       : null;
@@ -55,11 +59,13 @@ export async function generateNextClip(input: {
       recentStory: story,
       episode,
       hasAnchor: Boolean(anchorFrameUrl),
+      worldState,
     });
     const prompt = renderH3Prompt({
       plan: showrunner.plan,
       episode,
       hasAnchor: Boolean(anchorFrameUrl),
+      worldState,
     });
 
     const endpoint = anchorFrameUrl
@@ -106,25 +112,28 @@ export async function generateNextClip(input: {
       ? Math.max(previousEndMs, Date.now() + 250)
       : Date.now() + 350;
 
-    const clip = await saveClip({
-      requestId: result.requestId,
-      videoUrl: data.video.url,
-      expandedPrompt: data.expanded_prompt ?? null,
-      h3Prompt: prompt,
-      inferenceSeconds: data.timings?.inference ?? null,
-      directive,
-      directiveId: claimed?.id ?? null,
-      episode,
-      anchorFrameUrl,
-      usedAnchorFrame: Boolean(anchorFrameUrl),
-      resolution: input.resolution,
-      startsAtMs,
-      durationSeconds: CLIP_SECONDS,
-      showrunnerModel: showrunner.model,
-      showrunnerPlanJson: JSON.stringify(showrunner.plan),
-      showrunnerInputTokens: showrunner.inputTokens,
-      showrunnerOutputTokens: showrunner.outputTokens,
-    });
+    const clip = await saveClipWithWorldState(
+      {
+        requestId: result.requestId,
+        videoUrl: data.video.url,
+        expandedPrompt: data.expanded_prompt ?? null,
+        h3Prompt: prompt,
+        inferenceSeconds: data.timings?.inference ?? null,
+        directive,
+        directiveId: claimed?.id ?? null,
+        episode,
+        anchorFrameUrl,
+        usedAnchorFrame: Boolean(anchorFrameUrl),
+        resolution: input.resolution,
+        startsAtMs,
+        durationSeconds: CLIP_SECONDS,
+        showrunnerModel: showrunner.model,
+        showrunnerPlanJson: JSON.stringify(showrunner.plan),
+        showrunnerInputTokens: showrunner.inputTokens,
+        showrunnerOutputTokens: showrunner.outputTokens,
+      },
+      showrunner.nextWorldState,
+    );
 
     if (claimed) await completeDirective(claimed.id);
     return clip;

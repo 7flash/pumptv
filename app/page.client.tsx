@@ -6,6 +6,7 @@ import type {
   PromptRound,
   RoomState,
   StreamState,
+  WorldState,
 } from "../src/shared/contracts.ts";
 
 let timeline: Clip[] = [];
@@ -17,6 +18,8 @@ let room: RoomState | null = null;
 let directives: Directive[] = [];
 let arena: PromptRound | null = null;
 let queuedCount = 0;
+let worldState: WorldState | null = null;
+let worldStateEpisode: number | null = null;
 let serverOffsetMs = 0;
 let input = "";
 let error: string | null = null;
@@ -153,6 +156,8 @@ function applyState(state: StreamState) {
   nextDirective = state.nextDirective;
   directives = state.recentDirectives;
   arena = state.arena;
+  worldState = state.worldState;
+  worldStateEpisode = state.worldStateEpisode;
   queuedCount = state.queuedCount;
   transport = "LIVE FEED";
   error = null;
@@ -355,6 +360,23 @@ function currentPromptText() {
   );
 }
 
+function canonEntityCount() {
+  if (!worldState) return 0;
+  return worldState.characters.length + worldState.props.length;
+}
+
+function canonCharacterLabel(character: WorldState["characters"][number]) {
+  const detail = [character.status, character.position]
+    .filter(Boolean)
+    .join(" · ");
+  return `${character.name}${detail ? ` — ${detail}` : ""}`;
+}
+
+function canonPropLabel(prop: WorldState["props"][number]) {
+  const detail = [prop.status, prop.position].filter(Boolean).join(" · ");
+  return `${prop.name}${detail ? ` — ${detail}` : ""}`;
+}
+
 function App() {
   const open = roundIsOpen();
   const candidates = arena?.proposals || [];
@@ -530,6 +552,82 @@ function App() {
         </section>
 
         <div className="messages">
+          <details className="canonBrain" open>
+            <summary>
+              <span>🧠 CANON BRAIN</span>
+              <b>
+                {worldState
+                  ? `REV ${worldState.revision} · EP ${(worldStateEpisode ?? 0) + 1}`
+                  : "SYNCING"}
+              </b>
+            </summary>
+            {worldState ? (
+              <div className="canonBrainBody">
+                <div className="canonLocation">
+                  <span>📍 CURRENT MAP TILE</span>
+                  <strong>{worldState.location}</strong>
+                  <p>{worldState.locationDetails}</p>
+                </div>
+                <div className="canonStats">
+                  <span>{worldState.characters.length} CHAR</span>
+                  <span>{worldState.props.length} PROPS</span>
+                  <span>{worldState.openThreads.length} OPEN LOOPS</span>
+                  <span>{canonEntityCount()} ENTITIES</span>
+                </div>
+                {worldState.characters.length ? (
+                  <div className="canonGroup">
+                    <span className="canonGroupTitle">CAST BAGHOLDERS</span>
+                    <div className="canonChips">
+                      {worldState.characters.slice(0, 5).map((character) => (
+                        <span
+                          className="canonChip characterChip"
+                          key={character.id}
+                          title={`${character.appearance} · ${character.wardrobe}`}
+                        >
+                          {canonCharacterLabel(character)}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                {worldState.props.length ? (
+                  <div className="canonGroup">
+                    <span className="canonGroupTitle">LORE OBJECTS</span>
+                    <div className="canonChips">
+                      {worldState.props.slice(0, 6).map((prop) => (
+                        <span
+                          className="canonChip propChip"
+                          key={prop.id}
+                          title={prop.description}
+                        >
+                          {canonPropLabel(prop)}
+                        </span>
+                      ))}
+                    </div>
+                  </div>
+                ) : null}
+                {worldState.openThreads.length ? (
+                  <div className="canonGroup">
+                    <span className="canonGroupTitle">UNRESOLVED ALPHA</span>
+                    <ol className="threadList">
+                      {worldState.openThreads
+                        .slice(0, 4)
+                        .map((thread, index) => (
+                          <li key={`${index}-${thread}`}>{thread}</li>
+                        ))}
+                    </ol>
+                  </div>
+                ) : null}
+                <div className="endingTape">
+                  <span>LAST FRAME MEMORY</span>
+                  <p>{worldState.lastEndingBeat}</p>
+                </div>
+              </div>
+            ) : (
+              <div className="canonBrainEmpty">WORLD MODEL IS BOOTING…</div>
+            )}
+          </details>
+
           <section className="arena">
             <div className="arenaHeader">
               <div>

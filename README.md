@@ -1,6 +1,6 @@
 # SLOP TV
 
-An endless shared AI-generated livestream where the audience decides what happens next. v0.7 combines the **jsx-ai showrunner** with a much clearer brainrot / memecoin live-terminal UI. Chat chooses intent, the showrunner turns it into a structured five-second shot plan with an explicit continuity handoff, and deterministic code renders the final H3 prompt. The viewer always exposes NOW PLAYING, LOCKED NEXT, and the live ranked NEXT PROMPT QUEUE.
+An endless shared AI-generated livestream where the audience decides what happens next. v0.8 combines the **jsx-ai showrunner** with a much clearer brainrot / memecoin live-terminal UI. Chat chooses intent, the showrunner turns it into a structured five-second shot plan with an explicit continuity handoff, and deterministic code renders the final H3 prompt. The viewer always exposes NOW PLAYING, LOCKED NEXT, and the live ranked NEXT PROMPT QUEUE.
 
 ## Stack
 
@@ -76,7 +76,7 @@ Viewer/Pump.fun text is only placed in a user-role message and is explicitly tre
 Every clip persists `showrunnerModel`, the structured plan JSON, showrunner token usage, the exact H3 prompt, and fal's expanded prompt. This makes prompt behavior replayable/debuggable and gives us data for later showrunner evals.
 
 
-## v0.7 viewer hierarchy / brainrot UI
+## v0.8 viewer hierarchy / brainrot UI
 
 The visual direction is an original dark launchpad / memecoin terminal: near-black surfaces, mint-green live accents, yellow locked-winner state, hot-pink voting state, monospace market-terminal metadata, a deliberately stupid `$SLOP` ticker, and chunky ranked prompt cards. The meme energy is cosmetic; the story controls are intentionally unambiguous.
 
@@ -346,3 +346,37 @@ src/
 - `fal`
 
 The important latency to watch in production is the distribution from **ballot lock → generated clip persisted**. That measurement should drive the generation-lead setting rather than a fixed guess forever.
+
+## v0.8: persistent CANON BRAIN
+
+The showrunner no longer relies only on the previous frame and a short recent-history string. Every successfully generated episode commits an immutable `worldStateSnapshots` row in the same SQLite transaction as its clip. The snapshot tracks the current location, recurring characters, wardrobe/status/position, persistent props, unresolved plot threads, motifs, visual invariants, and the exact ending beat that the next scene inherits.
+
+`jsx-ai` receives the complete prior world state as durable canon and returns both the five-second `ShotPlan` and a conservative complete world-state snapshot for the end of that shot. The H3 prompt receives the prior canonical state plus the exact last-frame image anchor. Only after H3 succeeds are the clip and new world state committed together. This prevents a failed generation from mutating lore.
+
+The browser gets the world-state snapshot for the episode actually playing, not the newest prebuffered episode. The **CANON BRAIN** panel therefore never spoils future generated state and makes continuity assumptions visible to viewers.
+
+```text
+current persisted world state
+          │
+          ├── exact previous final frame
+          │
+          ▼
+     jsx-ai showrunner
+          │
+     ┌────┴────────────┐
+     │                 │
+  ShotPlan      next WorldState
+     │                 │
+     ▼                 │
+ deterministic H3      │
+ prompt + frame        │
+     │                 │
+     ▼                 │
+   H3 Max              │
+     │                 │
+     └──── success ────┘
+              │
+              ▼
+ SQLite atomic clip + world snapshot
+```
+

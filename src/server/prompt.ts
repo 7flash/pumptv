@@ -1,3 +1,6 @@
+import type { WorldState } from "../shared/contracts.ts";
+import { worldStateForH3 } from "./world-state.ts";
+
 export const OPENING =
   "Open on a rain-soaked neon convenience store at 2:13 AM. A nervous raccoon in a tiny delivery jacket discovers a mysterious glowing VHS tape behind the counter. Play it completely straight, cinematic live action.";
 
@@ -24,6 +27,7 @@ export function renderH3Prompt(input: {
   plan: ShotPlan;
   episode: number;
   hasAnchor: boolean;
+  worldState: WorldState;
 }) {
   const { plan } = input;
   return `Shot ${input.episode + 1} of one endless, continuous, interactive livestream.
@@ -31,6 +35,9 @@ export function renderH3Prompt(input: {
 CONTINUITY:
 ${input.hasAnchor ? "The supplied image is the exact first frame. Continue from it immediately; no reset, jump, title card, establishing reboot, or unexplained wardrobe/location change." : "This is the opening shot. Establish the world and protagonist clearly so later shots can continue them."}
 ${sanitizeLine(plan.continuity, 700)}
+
+PERSISTENT CANON — DO NOT SILENTLY MUTATE:
+${worldStateForH3(input.worldState)}
 
 SCENE INTENT:
 ${sanitizeLine(plan.premise, 500)}

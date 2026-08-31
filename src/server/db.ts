@@ -69,6 +69,12 @@ const openedDb = measureSync(
           source: z.enum(["web", "pumpfun"]).default("web"),
           sourceId: z.string().nullable().default(null),
         }),
+        worldStateSnapshots: z.object({
+          episode: z.number(),
+          clipId: z.number(),
+          stateJson: z.string(),
+          showrunnerModel: z.string().nullable().default(null),
+        }),
         clips: z.object({
           requestId: z.string(),
           videoUrl: z.string(),
@@ -123,5 +129,12 @@ measureSync("Create proposal voter index", () =>
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS proposal_votes_round_voter_unique
      ON proposalVotes(roundId, voterKey)`,
+  ),
+);
+
+measureSync("Create world state episode index", () =>
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS world_state_snapshots_episode_unique
+     ON worldStateSnapshots(episode)`,
   ),
 );

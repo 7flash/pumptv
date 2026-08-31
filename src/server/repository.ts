@@ -6,11 +6,13 @@ import type {
   RoomState,
   StreamState,
   WorkerState,
+  WorldState,
 } from "../shared/contracts.ts";
 import { getPromptArena } from "./arbitration.ts";
 import { db } from "./db.ts";
 import { ROOM_NAME } from "./lease.ts";
 import { dbMeasure } from "./observability.ts";
+import { EMPTY_WORLD_STATE, parseWorldStateJson } from "./world-state.ts";
 
 const PUMPFUN_MINT = (process.env.SLOP_PUMPFUN_MINT || "").trim();
 const PUMPFUN_PREFIX = process.env.SLOP_PUMPFUN_PREFIX ?? "!next";
@@ -300,6 +302,28 @@ export async function recentStory(limit = 6) {
   });
 }
 
+export async function getLatestWorldState(): Promise<WorldState> {
+  const row = await dbMeasure.measureSync("Load latest world state", () =>
+    db.worldStateSnapshots.select().orderBy("episode", "DESC").first(),
+  );
+  return row
+    ? parseWorldStateJson((row as any).stateJson) || EMPTY_WORLD_STATE
+    : EMPTY_WORLD_STATE;
+}
+
+export async function getWorldStateForEpisode(
+  episode: number,
+): Promise<WorldState | null> {
+  const row = await dbMeasure.measureSync("Load episode world state", () =>
+    db.worldStateSnapshots
+      .select()
+      .where({ episode })
+      .orderBy("id", "DESC")
+      .first(),
+  );
+  return row ? parseWorldStateJson((row as any).stateJson) : null;
+}
+
 export async function nextEpisode() {
   const row = await dbMeasure.measureSync("Load latest episode", () =>
     db.clips.select("episode").orderBy("episode", "DESC").first(),
@@ -307,11 +331,38 @@ export async function nextEpisode() {
   return row ? Number((row as any).episode) + 1 : 0;
 }
 
-export async function saveClip(input: Omit<Clip, "id">) {
-  const row = await dbMeasure.measureSync("Persist generated clip", () =>
-    db.clips.insert(input),
+export async function saveClipWithWorldState(
+  input: Omit<Clip, "id">,
+  worldState: WorldState,
+) {
+  const row = await dbMeasure.measureSync.assert(
+    "Persist generated scene + world state",
+    () => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const clipRow = db.clips.insert(input);
+        if (!clipRow) throw new Error("Failed to persist generated clip");
+
+        const snapshot = db.worldStateSnapshots.insert({
+          episode: input.episode,
+          clipId: Number((clipRow as any).id),
+          stateJson: JSON.stringify(worldState),
+          showrunnerModel: input.showrunnerModel ?? null,
+        });
+        if (!snapshot)
+          throw new Error("Failed to persist world state snapshot");
+
+        db.exec("COMMIT");
+        return clipRow;
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {}
+        throw error;
+      }
+    },
   );
-  if (!row) throw new Error("Failed to persist generated clip");
+
   return toClip(row);
 }
 
@@ -376,6 +427,16 @@ export async function getStreamState(): Promise<StreamState> {
       ? directiveWithVotesById(nextClip.directiveId)
       : null
     : nextPendingDirectiveWithVotes();
+  // Show canon only for reality the viewer has reached. Never leak a prebuffered future snapshot.
+  const lastStartedClip =
+    currentClip ||
+    [...timeline].reverse().find((clip) => clip.startsAtMs <= serverNowMs) ||
+    null;
+  const worldStateEpisode = lastStartedClip?.episode ?? null;
+  const worldState =
+    worldStateEpisode == null
+      ? null
+      : await getWorldStateForEpisode(worldStateEpisode);
 
   return {
     serverNowMs,
@@ -390,6 +451,8 @@ export async function getStreamState(): Promise<StreamState> {
     timeline,
     recentDirectives: (directives || []).reverse().map(toDirective),
     arena,
+    worldState,
+    worldStateEpisode,
     queuedCount: Number(queuedCount || 0),
   };
 }
