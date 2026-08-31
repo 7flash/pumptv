@@ -12,7 +12,7 @@ function sanitizeLine(value: string, max = 600) {
     .slice(0, max);
 }
 
-const WorldCharacterSchema = z.object({
+export const WorldCharacterSchema = z.object({
   id: z.string(),
   name: z.string(),
   appearance: z.string(),
@@ -21,7 +21,7 @@ const WorldCharacterSchema = z.object({
   position: z.string(),
 });
 
-const WorldPropSchema = z.object({
+export const WorldPropSchema = z.object({
   id: z.string(),
   name: z.string(),
   description: z.string(),
@@ -104,6 +104,19 @@ export function normalizeWorldState(
     lastEndingBeat:
       sanitizeLine(next.lastEndingBeat, 500) || previous.lastEndingBeat,
   };
+}
+
+export function normalizeReconciledWorldState(
+  value: unknown,
+  planned: WorldState,
+): WorldState {
+  const parsed = WorldStateSchema.safeParse(value);
+  if (!parsed.success) return planned;
+  const normalized = normalizeWorldState(parsed.data, {
+    ...planned,
+    revision: Math.max(0, planned.revision - 1),
+  });
+  return { ...normalized, revision: planned.revision };
 }
 
 export function parseWorldStateJson(

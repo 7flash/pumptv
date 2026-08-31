@@ -9,7 +9,7 @@ import { sanitizeLine } from "./prompt.ts";
 
 const PROMPT_WINDOW_MS = Number(process.env.SLOP_PROMPT_WINDOW_MS || 4_500);
 export const GENERATION_LEAD_MS = Number(
-  process.env.SLOP_GENERATION_LEAD_MS || 3_000,
+  process.env.SLOP_GENERATION_LEAD_MS || 4_500,
 );
 const MAX_PROPOSALS = Number(process.env.SLOP_MAX_PROPOSALS_PER_ROUND || 40);
 

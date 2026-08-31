@@ -7,6 +7,7 @@ import type {
   StreamState,
   WorkerState,
   WorldState,
+  WorldStateAudit,
 } from "../shared/contracts.ts";
 import { getPromptArena } from "./arbitration.ts";
 import { db } from "./db.ts";
@@ -30,6 +31,9 @@ function toClip(row: any): Clip {
     directiveId: row.directiveId ?? null,
     episode: Number(row.episode),
     anchorFrameUrl: row.anchorFrameUrl ?? null,
+    startFrameUrl: row.startFrameUrl ?? row.anchorFrameUrl ?? null,
+    middleFrameUrl: row.middleFrameUrl ?? null,
+    endFrameUrl: row.endFrameUrl ?? null,
     usedAnchorFrame: Boolean(row.usedAnchorFrame),
     resolution: row.resolution,
     startsAtMs: Number(row.startsAtMs || 0),
@@ -269,11 +273,34 @@ export async function recoverGeneratingDirectives() {
 }
 
 export async function recentStory(limit = 6) {
-  const rows = await dbMeasure.measureSync("Load recent canon", () =>
-    db.clips.select().orderBy("episode", "DESC").limit(limit).all(),
+  const rows = await dbMeasure.measureSync("Load recent reconciled canon", () =>
+    db.raw<any>(
+      `SELECT c.*, w.reconciliationJson
+       FROM clips c
+       LEFT JOIN worldStateSnapshots w ON w.clipId = c.id
+       ORDER BY c.episode DESC
+       LIMIT ?`,
+      limit,
+    ),
   );
 
   return (rows || []).reverse().map((row: any) => {
+    let realitySummary: string | null = null;
+    try {
+      const audit = row.reconciliationJson
+        ? JSON.parse(row.reconciliationJson)
+        : null;
+      if (audit?.summary) {
+        const drift =
+          Array.isArray(audit.drift) && audit.drift.length
+            ? `; corrected drift: ${audit.drift.slice(0, 3).join("; ")}`
+            : "";
+        realitySummary = `Rendered reality (${audit.status || "unknown"}): ${audit.summary}${drift}`;
+      }
+    } catch {
+      // Ignore malformed legacy reconciliation metadata.
+    }
+
     if (row.showrunnerPlanJson) {
       try {
         const plan = JSON.parse(row.showrunnerPlanJson) as {
@@ -285,9 +312,10 @@ export async function recentStory(limit = 6) {
         return [
           `Directive: ${row.directive}`,
           plan.premise ? `Premise: ${plan.premise}` : null,
-          plan.action ? `Action: ${plan.action}` : null,
-          plan.transition ? `Handoff: ${plan.transition}` : null,
-          plan.endingBeat ? `Ending: ${plan.endingBeat}` : null,
+          plan.action ? `Planned action: ${plan.action}` : null,
+          plan.transition ? `Planned handoff: ${plan.transition}` : null,
+          realitySummary,
+          plan.endingBeat ? `Planned ending: ${plan.endingBeat}` : null,
         ]
           .filter(Boolean)
           .join(" | ");
@@ -296,10 +324,46 @@ export async function recentStory(limit = 6) {
       }
     }
 
-    return row.h3Prompt
-      ? `Directive: ${row.directive} | Generated shot: ${row.h3Prompt}`
-      : String(row.directive);
+    return realitySummary
+      ? `Directive: ${row.directive} | ${realitySummary}`
+      : row.h3Prompt
+        ? `Directive: ${row.directive} | Generated shot: ${row.h3Prompt}`
+        : String(row.directive);
   });
+}
+
+function parseWorldStateAudit(row: any): WorldStateAudit {
+  let persisted: any = null;
+  try {
+    persisted = row.reconciliationJson
+      ? JSON.parse(row.reconciliationJson)
+      : null;
+  } catch {
+    persisted = null;
+  }
+
+  const status = persisted?.status;
+  return {
+    episode: Number(row.episode),
+    status:
+      status === "verified" ||
+      status === "corrected" ||
+      status === "fallback" ||
+      status === "skipped"
+        ? status
+        : "skipped",
+    model: row.reconcilerModel ?? persisted?.model ?? null,
+    summary: typeof persisted?.summary === "string" ? persisted.summary : null,
+    drift: Array.isArray(persisted?.drift)
+      ? persisted.drift.map(String).slice(0, 8)
+      : [],
+    sampledFrameUrls: Array.isArray(persisted?.sampledFrameUrls)
+      ? persisted.sampledFrameUrls.map(String).slice(0, 3)
+      : [],
+    inputTokens: row.reconcilerInputTokens ?? null,
+    outputTokens: row.reconcilerOutputTokens ?? null,
+    cost: row.reconcilerCost ?? null,
+  };
 }
 
 export async function getLatestWorldState(): Promise<WorldState> {
@@ -311,9 +375,12 @@ export async function getLatestWorldState(): Promise<WorldState> {
     : EMPTY_WORLD_STATE;
 }
 
-export async function getWorldStateForEpisode(
+export async function getWorldStateSnapshotForEpisode(
   episode: number,
-): Promise<WorldState | null> {
+): Promise<{
+  worldState: WorldState;
+  audit: WorldStateAudit;
+} | null> {
   const row = await dbMeasure.measureSync("Load episode world state", () =>
     db.worldStateSnapshots
       .select()
@@ -321,7 +388,16 @@ export async function getWorldStateForEpisode(
       .orderBy("id", "DESC")
       .first(),
   );
-  return row ? parseWorldStateJson((row as any).stateJson) : null;
+  if (!row) return null;
+  const worldState = parseWorldStateJson((row as any).stateJson);
+  if (!worldState) return null;
+  return { worldState, audit: parseWorldStateAudit(row as any) };
+}
+
+export async function getWorldStateForEpisode(
+  episode: number,
+): Promise<WorldState | null> {
+  return (await getWorldStateSnapshotForEpisode(episode))?.worldState ?? null;
 }
 
 export async function nextEpisode() {
@@ -334,20 +410,41 @@ export async function nextEpisode() {
 export async function saveClipWithWorldState(
   input: Omit<Clip, "id">,
   worldState: WorldState,
+  snapshotMeta?: {
+    plannedWorldState?: WorldState | null;
+    audit?: Omit<WorldStateAudit, "episode"> | null;
+  },
 ) {
   const row = await dbMeasure.measureSync.assert(
-    "Persist generated scene + world state",
+    "Persist generated scene + reconciled world state",
     () => {
       db.exec("BEGIN IMMEDIATE");
       try {
         const clipRow = db.clips.insert(input);
         if (!clipRow) throw new Error("Failed to persist generated clip");
 
+        const audit = snapshotMeta?.audit ?? null;
         const snapshot = db.worldStateSnapshots.insert({
           episode: input.episode,
           clipId: Number((clipRow as any).id),
           stateJson: JSON.stringify(worldState),
+          plannedStateJson: snapshotMeta?.plannedWorldState
+            ? JSON.stringify(snapshotMeta.plannedWorldState)
+            : null,
           showrunnerModel: input.showrunnerModel ?? null,
+          reconciliationJson: audit
+            ? JSON.stringify({
+                status: audit.status,
+                model: audit.model,
+                summary: audit.summary,
+                drift: audit.drift,
+                sampledFrameUrls: audit.sampledFrameUrls,
+              })
+            : null,
+          reconcilerModel: audit?.model ?? null,
+          reconcilerInputTokens: audit?.inputTokens ?? null,
+          reconcilerOutputTokens: audit?.outputTokens ?? null,
+          reconcilerCost: audit?.cost ?? null,
         });
         if (!snapshot)
           throw new Error("Failed to persist world state snapshot");
@@ -433,10 +530,12 @@ export async function getStreamState(): Promise<StreamState> {
     [...timeline].reverse().find((clip) => clip.startsAtMs <= serverNowMs) ||
     null;
   const worldStateEpisode = lastStartedClip?.episode ?? null;
-  const worldState =
+  const worldSnapshot =
     worldStateEpisode == null
       ? null
-      : await getWorldStateForEpisode(worldStateEpisode);
+      : await getWorldStateSnapshotForEpisode(worldStateEpisode);
+  const worldState = worldSnapshot?.worldState ?? null;
+  const worldStateAudit = worldSnapshot?.audit ?? null;
 
   return {
     serverNowMs,
@@ -453,6 +552,7 @@ export async function getStreamState(): Promise<StreamState> {
     arena,
     worldState,
     worldStateEpisode,
+    worldStateAudit,
     queuedCount: Number(queuedCount || 0),
   };
 }

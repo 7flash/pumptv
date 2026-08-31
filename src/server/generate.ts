@@ -3,6 +3,8 @@ import type { Clip, Resolution } from "../shared/contracts.ts";
 import { falMeasure } from "./observability.ts";
 import { AUTOPILOT, OPENING, renderH3Prompt } from "./prompt.ts";
 import { planNextShot } from "./showrunner.tsx";
+import { reconcileRenderedClip } from "./visual-reconciler.tsx";
+import { extractVideoFrame, sampleClipFrames } from "./video-frames.ts";
 import {
   claimQueuedDirective,
   completeDirective,
@@ -20,19 +22,10 @@ function configureFal() {
   fal.config({ credentials: process.env.FAL_KEY });
 }
 
-async function extractLastFrame(videoUrl: string) {
-  const result = await falMeasure.measure("Extract continuity frame", () =>
-    fal.subscribe("fal-ai/ffmpeg-api/extract-frame", {
-      input: { video_url: videoUrl, frame_type: "last" },
-      logs: false,
-    }),
-  );
-  if (!result) throw new Error("Could not extract continuity frame");
-
-  const data = result.data as { images?: Array<{ url?: string }> };
-  const url = data.images?.[0]?.url;
-  if (!url) throw new Error("Frame extractor returned no image");
-  return url;
+async function continuityFrame(previousClip: Clip | null) {
+  if (!previousClip) return null;
+  if (previousClip.endFrameUrl) return previousClip.endFrameUrl;
+  return extractVideoFrame(previousClip.videoUrl, "last");
 }
 
 export async function generateNextClip(input: {
@@ -50,9 +43,7 @@ export async function generateNextClip(input: {
       recentStory(),
       getLatestWorldState(),
     ]);
-    const anchorFrameUrl = input.previousClip
-      ? await extractLastFrame(input.previousClip.videoUrl)
-      : null;
+    const anchorFrameUrl = await continuityFrame(input.previousClip);
 
     const showrunner = await planNextShot({
       directive,
@@ -104,6 +95,20 @@ export async function generateNextClip(input: {
     };
     if (!data.video?.url) throw new Error("fal returned no video URL");
 
+    // Reality is sampled after render. Failure here must not throw away an already-paid-for video.
+    const frames = await sampleClipFrames({
+      videoUrl: data.video.url,
+      knownStartUrl: anchorFrameUrl,
+    });
+    const reconciliation = await reconcileRenderedClip({
+      episode,
+      directive,
+      plan: showrunner.plan,
+      priorWorldState: worldState,
+      plannedWorldState: showrunner.nextWorldState,
+      frames,
+    });
+
     const previousEndMs = input.previousClip
       ? input.previousClip.startsAtMs +
         input.previousClip.durationSeconds * 1000
@@ -123,6 +128,9 @@ export async function generateNextClip(input: {
         directiveId: claimed?.id ?? null,
         episode,
         anchorFrameUrl,
+        startFrameUrl: frames.start,
+        middleFrameUrl: frames.middle,
+        endFrameUrl: frames.end,
         usedAnchorFrame: Boolean(anchorFrameUrl),
         resolution: input.resolution,
         startsAtMs,
@@ -132,7 +140,11 @@ export async function generateNextClip(input: {
         showrunnerInputTokens: showrunner.inputTokens,
         showrunnerOutputTokens: showrunner.outputTokens,
       },
-      showrunner.nextWorldState,
+      reconciliation.worldState,
+      {
+        plannedWorldState: showrunner.nextWorldState,
+        audit: reconciliation.audit,
+      },
     );
 
     if (claimed) await completeDirective(claimed.id);

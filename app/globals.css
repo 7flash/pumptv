@@ -408,6 +408,28 @@ footer { display: flex; justify-content: space-between; gap: 8px; padding: 8px 1
   font: 900 6px/1 "Courier New", monospace;
   letter-spacing: .06em;
 }
+.realityCheck {
+  display: grid;
+  gap: 5px;
+  border: 1px solid rgba(255,255,255,.12);
+  padding: 7px;
+  background: #090d0a;
+  box-shadow: inset 2px 0 0 #687169;
+}
+.realityCheck > div { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+.realityCheck span { color: #687169; font: 1000 6px/1 "Courier New", monospace; letter-spacing: .1em; }
+.realityCheck strong { color: #d6ddd5; font: 1000 7px/1 "Courier New", monospace; text-align: right; }
+.realityCheck p { margin: 0; color: #8c978d; font: 7px/1.35 "Courier New", monospace; }
+.realityCheck ul { display: grid; gap: 3px; margin: 0; padding-left: 16px; }
+.realityCheck li { color: #c9b5c5; font: 7px/1.3 "Courier New", monospace; }
+.realityCheck.verified { border-color: rgba(120,247,168,.28); box-shadow: inset 2px 0 0 var(--mint); }
+.realityCheck.verified strong { color: var(--mint); }
+.realityCheck.corrected { border-color: rgba(255,79,216,.32); box-shadow: inset 2px 0 0 var(--pink); }
+.realityCheck.corrected strong { color: var(--pink); }
+.realityCheck.fallback { border-color: rgba(255,215,80,.3); box-shadow: inset 2px 0 0 var(--yellow); }
+.realityCheck.fallback strong { color: var(--yellow); }
+.realityCheck.skipped strong, .realityCheck.pending strong { color: #869087; }
+
 .canonGroup { display: grid; gap: 5px; }
 .canonChips { display: flex; flex-wrap: wrap; gap: 5px; }
 .canonChip {

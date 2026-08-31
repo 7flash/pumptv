@@ -6,6 +6,8 @@ export type PumpChatState =
   "disabled" | "standby" | "connecting" | "live" | "error";
 export type ProposalStatus = "open" | "selected" | "lost";
 export type PromptRoundStatus = "open" | "closed";
+export type ReconciliationStatus =
+  "verified" | "corrected" | "fallback" | "skipped";
 
 export type Clip = {
   id: number;
@@ -18,6 +20,9 @@ export type Clip = {
   directiveId: number | null;
   episode: number;
   anchorFrameUrl: string | null;
+  startFrameUrl: string | null;
+  middleFrameUrl: string | null;
+  endFrameUrl: string | null;
   usedAnchorFrame: boolean;
   resolution: Resolution;
   startsAtMs: number;
@@ -95,6 +100,18 @@ export type WorldState = {
   lastEndingBeat: string;
 };
 
+export type WorldStateAudit = {
+  episode: number;
+  status: ReconciliationStatus;
+  model: string | null;
+  summary: string | null;
+  drift: string[];
+  sampledFrameUrls: string[];
+  inputTokens: number | null;
+  outputTokens: number | null;
+  cost: number | null;
+};
+
 export type PumpfunChatStatus = {
   enabled: boolean;
   mint: string | null;
@@ -127,5 +144,6 @@ export type StreamState = {
   arena: PromptRound | null;
   worldState: WorldState | null;
   worldStateEpisode: number | null;
+  worldStateAudit: WorldStateAudit | null;
   queuedCount: number;
 };

@@ -7,6 +7,7 @@ import type {
   RoomState,
   StreamState,
   WorldState,
+  WorldStateAudit,
 } from "../src/shared/contracts.ts";
 
 let timeline: Clip[] = [];
@@ -20,6 +21,7 @@ let arena: PromptRound | null = null;
 let queuedCount = 0;
 let worldState: WorldState | null = null;
 let worldStateEpisode: number | null = null;
+let worldStateAudit: WorldStateAudit | null = null;
 let serverOffsetMs = 0;
 let input = "";
 let error: string | null = null;
@@ -158,6 +160,7 @@ function applyState(state: StreamState) {
   arena = state.arena;
   worldState = state.worldState;
   worldStateEpisode = state.worldStateEpisode;
+  worldStateAudit = state.worldStateAudit;
   queuedCount = state.queuedCount;
   transport = "LIVE FEED";
   error = null;
@@ -377,6 +380,15 @@ function canonPropLabel(prop: WorldState["props"][number]) {
   return `${prop.name}${detail ? ` — ${detail}` : ""}`;
 }
 
+function realityCheckLabel() {
+  if (!worldStateAudit) return "VISION PENDING";
+  if (worldStateAudit.status === "verified") return "👁 VISION VERIFIED";
+  if (worldStateAudit.status === "corrected")
+    return `👁 CANON PATCHED · ${worldStateAudit.drift.length} DRIFT`;
+  if (worldStateAudit.status === "skipped") return "👁 VISION OFF";
+  return "👁 VISION FALLBACK";
+}
+
 function App() {
   const open = roundIsOpen();
   const candidates = arena?.proposals || [];
@@ -573,6 +585,26 @@ function App() {
                   <span>{worldState.props.length} PROPS</span>
                   <span>{worldState.openThreads.length} OPEN LOOPS</span>
                   <span>{canonEntityCount()} ENTITIES</span>
+                </div>
+                <div
+                  className={`realityCheck ${worldStateAudit?.status || "pending"}`}
+                >
+                  <div>
+                    <span>RENDERED REALITY CHECK</span>
+                    <strong>{realityCheckLabel()}</strong>
+                  </div>
+                  {worldStateAudit?.summary ? (
+                    <p>{worldStateAudit.summary}</p>
+                  ) : (
+                    <p>Waiting for sampled-frame reconciliation.</p>
+                  )}
+                  {worldStateAudit?.drift.length ? (
+                    <ul>
+                      {worldStateAudit.drift.slice(0, 3).map((item, index) => (
+                        <li key={`${index}-${item}`}>{item}</li>
+                      ))}
+                    </ul>
+                  ) : null}
                 </div>
                 {worldState.characters.length ? (
                   <div className="canonGroup">

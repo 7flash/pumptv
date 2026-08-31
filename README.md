@@ -1,15 +1,16 @@
 # SLOP TV
 
-An endless shared AI-generated livestream where the audience decides what happens next. v0.8 combines the **jsx-ai showrunner** with a much clearer brainrot / memecoin live-terminal UI. Chat chooses intent, the showrunner turns it into a structured five-second shot plan with an explicit continuity handoff, and deterministic code renders the final H3 prompt. The viewer always exposes NOW PLAYING, LOCKED NEXT, and the live ranked NEXT PROMPT QUEUE.
+An endless shared AI-generated livestream where the audience decides what happens next. v0.9 closes the continuity loop: **jsx-ai** plans the shot, H3 renders it, then sampled frames are visually reconciled back into durable canon before the following scene is planned. The brainrot / memecoin live-terminal UI still makes NOW PLAYING, LOCKED NEXT, the ranked NEXT PROMPT QUEUE, and who suggested each prompt unambiguous.
 
 ## Stack
 
 - **TradJS** server + `tradjs/client` frontend
 - **sqlite-zod-orm** for rooms, ballots, proposals, votes, winning directives, clips, and leases
-- **measure-fn** for HTTP / DB / arbitration / worker / Pump.fun / showrunner / fal boundaries
+- **measure-fn** for HTTP / DB / arbitration / worker / Pump.fun / showrunner / reconciliation / fal boundaries
 - **jsx-ai** for composable, provider-agnostic showrunner prompting and structured tool output
 - **fal + MiniMax H3 Max** for video
-- **fal FFmpeg Extract Frame** for server-side last-frame continuity
+- **fal FFmpeg Extract Frame** for server-side start/middle/end frame sampling and continuity
+- **fal OpenRouter Vision** for post-render reality reconciliation
 - a small read-only Pump.fun Socket.IO adapter over `ws`
 
 ## Run
@@ -173,7 +174,7 @@ Defaults:
 ```bash
 SLOP_TARGET_BUFFER_MS=6500
 SLOP_PROMPT_WINDOW_MS=4500
-SLOP_GENERATION_LEAD_MS=3000
+SLOP_GENERATION_LEAD_MS=4500
 ```
 
 The ballot can stay open for up to 4.5 seconds. The authoritative worker also knows how much video remains buffered. If only the generation lead remains, it locks the ballot early and starts H3 rather than intentionally causing a stream underrun.
@@ -328,8 +329,10 @@ src/
     pumpfun.ts                # !next / !vote adapter
     pumpfun-socket.ts
     worker.ts                 # buffer-aware ballot deadline + generation
-    generate.ts               # fal orchestration
+    generate.ts               # fal orchestration + reconciliation pipeline
     showrunner.tsx             # jsx-ai LLM shot planner
+    visual-reconciler.tsx      # jsx-ai-authored vision audit prompt + canon correction
+    video-frames.ts            # sampled frame extraction + end-frame reuse
     prompt.ts                  # sanitization + deterministic H3 renderer
     state-stream.ts
     observability.ts
@@ -343,6 +346,7 @@ src/
 - `worker`
 - `pumpfun`
 - `showrunner`
+- `reconcile`
 - `fal`
 
 The important latency to watch in production is the distribution from **ballot lock → generated clip persisted**. That measurement should drive the generation-lead setting rather than a fixed guess forever.
@@ -379,4 +383,75 @@ current persisted world state
               ▼
  SQLite atomic clip + world snapshot
 ```
+
+## v0.9: rendered-reality reconciliation
+
+The showrunner's planned world state is now treated as a **hypothesis** until the video has actually rendered. After H3 returns a clip, the worker samples the beginning, middle, and end of the rendered video (reusing the known I2V anchor as the start frame when available). fal's Extract Frame endpoint supports `first`, `middle`, and `last` extraction, and the sampled image URLs are sent together to fal's OpenRouter Vision endpoint for one multimodal reality check.
+
+The reconciliation prompt itself is still authored with **jsx-ai**. `visual-reconciler.tsx` renders a JSX prompt into system/user text, then attaches the actual image URLs through fal's multimodal Vision API. The reconciler is deliberately conservative:
+
+- visible frames override planned facts when they materially disagree;
+- off-camera characters/props are preserved rather than silently deleted;
+- removals must be explicit;
+- unresolved plot threads stay unresolved unless the rendered clip visibly resolves them;
+- stable character/prop IDs survive visual drift;
+- the final `lastEndingBeat` describes the **actual last sampled frame**, not the intended ending.
+
+```text
+winning prompt
+     │
+     ▼
+jsx-ai showrunner
+     │
+     ├── ShotPlan
+     └── planned WorldState
+             │
+             ▼
+           H3 Max
+             │
+       rendered video
+             │
+      ┌──────┼──────┐
+      ▼      ▼      ▼
+    START  MIDDLE   END
+      └──────┬──────┘
+             ▼
+ jsx-ai-authored reality prompt
+             +
+     fal OpenRouter Vision
+             │
+       ┌─────┴─────┐
+       ▼           ▼
+  VERIFIED      CORRECTED
+       └─────┬─────┘
+             ▼
+      reconciled canon
+             │
+             ▼
+ next jsx-ai showrunner turn
+```
+
+The final clip and reconciled snapshot are committed atomically. The database also retains `plannedStateJson`, reconciliation summary/drift, model, sampled frame URLs, token usage, and reported vision cost so bad continuity can be traced to either planning or rendering. Recent-story context includes the reality-check summary, so a later showrunner turn does not blindly repeat something H3 failed to render.
+
+The clip row stores `startFrameUrl`, `middleFrameUrl`, and `endFrameUrl`. The next I2V generation reuses the previous clip's stored `endFrameUrl` directly; legacy clips fall back to extracting their final frame once.
+
+The viewer's **CANON BRAIN** shows one of:
+
+```text
+👁 VISION VERIFIED
+👁 CANON PATCHED · N DRIFT
+👁 VISION FALLBACK
+👁 VISION OFF
+```
+
+This UI is still spoiler-safe: it exposes only the reconciliation snapshot for the clip whose scheduled playback time has actually arrived.
+
+Configuration:
+
+```bash
+SLOP_RECONCILE_VISION=1
+SLOP_RECONCILER_MODEL=google/gemini-2.5-flash
+```
+
+The visual reconciler uses the existing `FAL_KEY`; it does not require another provider API key because the multimodal request is routed through fal. Set `SLOP_RECONCILE_VISION=0` to skip the vision pass and use the showrunner's planned canon directly.
 
