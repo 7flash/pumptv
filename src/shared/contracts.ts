@@ -39,6 +39,7 @@ export type Directive = {
   authorAddress: string | null;
   sourceRoom: string | null;
   proposalId: number | null;
+  voteCount: number | null;
 };
 
 export type PromptProposal = {
@@ -88,7 +89,10 @@ export type StreamState = {
   serverNowMs: number;
   room: RoomState;
   currentClip: Clip | null;
+  nextClip: Clip | null;
   latestClip: Clip | null;
+  currentDirective: Directive | null;
+  nextDirective: Directive | null;
   timeline: Clip[];
   recentDirectives: Directive[];
   arena: PromptRound | null;

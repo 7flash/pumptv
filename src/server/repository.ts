@@ -51,7 +51,57 @@ function toDirective(row: any): Directive {
     authorAddress: row.authorAddress ?? null,
     sourceRoom: row.sourceRoom ?? null,
     proposalId: row.proposalId ?? null,
+    voteCount: row.voteCount == null ? null : Number(row.voteCount),
   };
+}
+
+function directiveWithVotesById(id: number) {
+  return dbMeasure.measureSync(
+    "Load attributed directive",
+    () =>
+      db.raw<any>(
+        `SELECT d.*,
+              CASE WHEN d.proposalId IS NULL THEN NULL
+                   ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
+              END AS voteCount
+       FROM directives d
+       WHERE d.id = ?
+       LIMIT 1`,
+        id,
+      )[0] || null,
+  );
+}
+
+function nextPendingDirectiveWithVotes() {
+  return dbMeasure.measureSync(
+    "Load next pending directive",
+    () =>
+      db.raw<any>(
+        `SELECT d.*,
+              CASE WHEN d.proposalId IS NULL THEN NULL
+                   ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
+              END AS voteCount
+       FROM directives d
+       WHERE d.status IN ('generating', 'queued')
+       ORDER BY CASE d.status WHEN 'generating' THEN 0 ELSE 1 END, d.id ASC
+       LIMIT 1`,
+      )[0] || null,
+  );
+}
+
+function recentDirectivesWithVotes(limit: number) {
+  return dbMeasure.measureSync("Load recent directives", () =>
+    db.raw<any>(
+      `SELECT d.*,
+              CASE WHEN d.proposalId IS NULL THEN NULL
+                   ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
+              END AS voteCount
+       FROM directives d
+       ORDER BY d.id DESC
+       LIMIT ?`,
+      limit,
+    ),
+  );
 }
 
 function toRoom(row: any, bufferedUntilMs: number | null = null): RoomState {
@@ -227,12 +277,14 @@ export async function recentStory(limit = 6) {
         const plan = JSON.parse(row.showrunnerPlanJson) as {
           premise?: string;
           action?: string;
+          transition?: string;
           endingBeat?: string;
         };
         return [
           `Directive: ${row.directive}`,
           plan.premise ? `Premise: ${plan.premise}` : null,
           plan.action ? `Action: ${plan.action}` : null,
+          plan.transition ? `Handoff: ${plan.transition}` : null,
           plan.endingBeat ? `Ending: ${plan.endingBeat}` : null,
         ]
           .filter(Boolean)
@@ -295,9 +347,7 @@ export async function getStreamState(): Promise<StreamState> {
     [
       getRoomRow(),
       getTimeline(),
-      dbMeasure.measureSync("Load recent directives", () =>
-        db.directives.select().orderBy("id", "DESC").limit(12).all(),
-      ),
+      recentDirectivesWithVotes(12),
       dbMeasure.measureSync("Count queued directives", () =>
         db.directives.select().where({ status: "queued" }).count(),
       ),
@@ -312,15 +362,31 @@ export async function getStreamState(): Promise<StreamState> {
         clip.startsAtMs <= serverNowMs &&
         serverNowMs < clip.startsAtMs + clip.durationSeconds * 1000,
     ) || null;
+  const nextClip =
+    timeline.find((clip) => clip.startsAtMs > serverNowMs) || null;
   const bufferedUntilMs = latestClip
     ? latestClip.startsAtMs + latestClip.durationSeconds * 1000
     : null;
+
+  const currentDirectiveRow = currentClip?.directiveId
+    ? directiveWithVotesById(currentClip.directiveId)
+    : null;
+  const nextDirectiveRow = nextClip
+    ? nextClip.directiveId
+      ? directiveWithVotesById(nextClip.directiveId)
+      : null
+    : nextPendingDirectiveWithVotes();
 
   return {
     serverNowMs,
     room: toRoom(roomRow, bufferedUntilMs),
     currentClip,
+    nextClip,
     latestClip,
+    currentDirective: currentDirectiveRow
+      ? toDirective(currentDirectiveRow)
+      : null,
+    nextDirective: nextDirectiveRow ? toDirective(nextDirectiveRow) : null,
     timeline,
     recentDirectives: (directives || []).reverse().map(toDirective),
     arena,

@@ -11,6 +11,7 @@ export function sanitizeLine(value: string, max = 600) {
 export type ShotPlan = {
   premise: string;
   action: string;
+  transition: string;
   continuity: string;
   camera: string;
   visualDetails: string;
@@ -34,6 +35,9 @@ ${sanitizeLine(plan.continuity, 700)}
 SCENE INTENT:
 ${sanitizeLine(plan.premise, 500)}
 
+SEAMLESS HANDOFF — FIRST 1–2 SECONDS:
+${sanitizeLine(plan.transition, 700)}
+
 ACTION — NEXT 5 SECONDS:
 ${sanitizeLine(plan.action, 900)}
 
@@ -50,5 +54,5 @@ ${plan.dialogue ? `Dialogue: ${sanitizeLine(plan.dialogue, 400)}` : "No forced d
 ENDING BEAT:
 ${sanitizeLine(plan.endingBeat, 600)}
 
-Preserve established characters, wardrobe, props, architecture, lighting logic, geography, and prior events as canon. Favor one readable causal action. Do not repeat completed beats. No credits, subtitles, logos, montage resets, scene-ending fades, or disconnected cutaways. End on an active visual state another five-second shot can continue directly.`;
+Preserve established characters, wardrobe, props, architecture, lighting logic, geography, and prior events as canon. The first moments must visibly inherit motion, eyelines, pose, screen direction and environmental state from the previous final frame before the new audience idea takes over. If the new idea is unrelated, introduce it through a causal arrival, reveal, transformation, reaction, object interaction, sound cue, or camera discovery inside the existing scene rather than teleporting or resetting. Favor one readable causal action. Do not repeat completed beats. No credits, subtitles, logos, montage resets, scene-ending fades, or disconnected cutaways. End on an active visual state another five-second shot can continue directly.`;
 }

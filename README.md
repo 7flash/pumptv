@@ -1,6 +1,6 @@
 # SLOP TV
 
-An endless shared AI-generated livestream where the audience decides what happens next. v0.6 adds a **jsx-ai showrunner** between the winning scene ballot and MiniMax H3 Max: chat chooses intent, the showrunner turns it into a structured five-second shot plan, and deterministic code renders the final H3 prompt.
+An endless shared AI-generated livestream where the audience decides what happens next. v0.7 combines the **jsx-ai showrunner** with a much clearer brainrot / memecoin live-terminal UI. Chat chooses intent, the showrunner turns it into a structured five-second shot plan with an explicit continuity handoff, and deterministic code renders the final H3 prompt. The viewer always exposes NOW PLAYING, LOCKED NEXT, and the live ranked NEXT PROMPT QUEUE.
 
 ## Stack
 
@@ -45,7 +45,7 @@ jsx-ai ShowrunnerPrompt.tsx
         │
         ▼
 emit_shot_plan tool call
-  premise / action / continuity
+  premise / action / transition / continuity
   camera / visuals / audio
   dialogue / endingBeat
         │
@@ -74,6 +74,41 @@ The showrunner must call one `emit_shot_plan` tool. Its arguments are validated 
 Viewer/Pump.fun text is only placed in a user-role message and is explicitly treated as untrusted story intent. It never enters the system instruction block.
 
 Every clip persists `showrunnerModel`, the structured plan JSON, showrunner token usage, the exact H3 prompt, and fal's expanded prompt. This makes prompt behavior replayable/debuggable and gives us data for later showrunner evals.
+
+
+## v0.7 viewer hierarchy / brainrot UI
+
+The visual direction is an original dark launchpad / memecoin terminal: near-black surfaces, mint-green live accents, yellow locked-winner state, hot-pink voting state, monospace market-terminal metadata, a deliberately stupid `$SLOP` ticker, and chunky ranked prompt cards. The meme energy is cosmetic; the story controls are intentionally unambiguous.
+
+The screen has three distinct prompt states:
+
+```text
+NOW PLAYING
+  current prompt
+  suggested by @user · PUMP.FUN/WEB · proposal # · winning vote count
+
+LOCKED NEXT
+  committed/generated next prompt
+  suggester/source/votes
+  rendering or plays-in countdown
+
+NEXT PROMPT QUEUE
+  ranked live proposals
+  proposal id · source · author · vote count · vote-share bar
+  your current vote highlighted
+```
+
+Web submissions receive a stable anonymous display handle derived from the local voter ID (`anon-xxxxxx`) so attribution remains visible without requiring accounts. Pump.fun proposals display their Pump.fun username/address metadata from chat.
+
+`StreamState` includes `currentDirective`, `nextDirective`, and `nextClip`, and directive reads join proposal vote counts so the frontend does not have to guess attribution from recent history.
+
+## Seamless prompt-to-prompt transitions
+
+The showrunner does not jump directly from one winning sentence to the next. `ShotPlan` includes a required `transition` field and the first 1–2 seconds of every continuation must bridge from the previous final frame before fulfilling the new suggestion.
+
+The showrunner is instructed to preserve pose, eyelines, screen direction, motion, props, lighting, spatial relationships, and immediate cause/effect. If chat proposes something unrelated, it must be introduced through a causal reveal/arrival/transformation/reaction/object interaction/camera discovery inside the existing scene rather than a teleport or universe reset.
+
+The generated H3 prompt has a dedicated `SEAMLESS HANDOFF — FIRST 1–2 SECONDS` section, while the previous clip's exact last frame remains the image-to-video anchor. This gives continuity two layers: visual anchoring plus explicit scenario-bridge planning.
 
 ## Pump.fun commands
 

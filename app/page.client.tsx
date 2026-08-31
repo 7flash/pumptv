@@ -10,6 +10,9 @@ import type {
 
 let timeline: Clip[] = [];
 let current: Clip | null = null;
+let nextClip: Clip | null = null;
+let currentDirective: Directive | null = null;
+let nextDirective: Directive | null = null;
 let room: RoomState | null = null;
 let directives: Directive[] = [];
 let arena: PromptRound | null = null;
@@ -51,6 +54,10 @@ function activeClipAt(nowMs: number) {
   );
 }
 
+function upcomingClipAt(nowMs: number) {
+  return timeline.find((clip) => clip.startsAtMs > nowMs) || null;
+}
+
 function syncVideoClock() {
   if (!current) return;
   const video = document.querySelector(
@@ -70,34 +77,69 @@ function syncVideoClock() {
   void video.play().catch(() => {});
 }
 
-function syncRoundClock() {
-  const node = document.querySelector(
-    "[data-round-countdown]",
-  ) as HTMLElement | null;
-  if (!node || !arena) return;
-  if (arena.status !== "open") {
-    node.textContent = "LOCKED";
-    return;
+function syncTemporalUi() {
+  if (arena) {
+    const roundNode = document.querySelector(
+      "[data-round-countdown]",
+    ) as HTMLElement | null;
+    if (roundNode) {
+      if (arena.status !== "open") {
+        roundNode.textContent = "LOCKED";
+      } else {
+        const remaining = Math.max(0, arena.closesAtMs - liveNowMs());
+        roundNode.textContent =
+          remaining > 0 ? `${(remaining / 1000).toFixed(1)}s` : "LOCKING…";
+      }
+    }
   }
-  const remaining = Math.max(0, arena.closesAtMs - liveNowMs());
-  node.textContent =
-    remaining > 0 ? `${(remaining / 1000).toFixed(1)}s` : "LOCKING…";
+
+  const sceneProgress = document.querySelector(
+    "[data-current-progress]",
+  ) as HTMLProgressElement | null;
+  if (sceneProgress && current) {
+    sceneProgress.max = current.durationSeconds;
+    sceneProgress.value = Math.min(
+      current.durationSeconds,
+      Math.max(0, (liveNowMs() - current.startsAtMs) / 1000),
+    );
+  }
+
+  const nextNodes = document.querySelectorAll("[data-next-countdown]");
+  if (nextNodes.length) {
+    const upcoming = nextClip || upcomingClipAt(liveNowMs());
+    let label = "VOTING NOW";
+    if (upcoming) {
+      const remaining = Math.max(0, upcoming.startsAtMs - liveNowMs());
+      label =
+        remaining > 0 ? `PLAYS IN ${(remaining / 1000).toFixed(1)}s` : "READY";
+    } else if (nextDirective?.status === "generating") {
+      label = "RENDERING NOW";
+    } else if (nextDirective) {
+      label = "LOCKED · WAITING FOR GPU";
+    }
+    nextNodes.forEach((node) => {
+      node.textContent = label;
+    });
+  }
 }
 
 function syncActiveClip(forceRedraw = false) {
-  const next = activeClipAt(liveNowMs());
-  const changed = next?.id !== current?.id;
-  current = next;
+  const now = liveNowMs();
+  const active = activeClipAt(now);
+  const upcoming = upcomingClipAt(now);
+  const changed = active?.id !== current?.id || upcoming?.id !== nextClip?.id;
+  current = active;
+  nextClip = upcoming;
 
   if (changed || forceRedraw) {
     redraw();
     queueMicrotask(() => {
       syncVideoClock();
-      syncRoundClock();
+      syncTemporalUi();
     });
   } else {
     syncVideoClock();
-    syncRoundClock();
+    syncTemporalUi();
   }
 }
 
@@ -105,6 +147,10 @@ function applyState(state: StreamState) {
   serverOffsetMs = state.serverNowMs - Date.now();
   room = state.room;
   timeline = state.timeline;
+  current = state.currentClip;
+  nextClip = state.nextClip;
+  currentDirective = state.currentDirective;
+  nextDirective = state.nextDirective;
   directives = state.recentDirectives;
   arena = state.arena;
   queuedCount = state.queuedCount;
@@ -151,7 +197,7 @@ async function boot() {
     redraw();
   };
 
-  clockTimer = setInterval(() => syncActiveClip(false), 250);
+  clockTimer = setInterval(() => syncActiveClip(false), 200);
 }
 
 function findSubmittedProposal(round: PromptRound, text: string) {
@@ -212,46 +258,75 @@ function toggleSound() {
 
 function streamStatus() {
   if (!room) return transport;
-  if (!room.running) return "PAUSED · generator stopped";
-  if (room.workerState === "error") return "DEGRADED · retrying";
+  if (!room.running) return "PAUSED";
+  if (room.workerState === "error") return "DEGRADED";
   if (current) return "LIVE";
-  if (timeline.length) return "BUFFERING · generator catching up";
-  return room.workerState === "generating"
-    ? "GENERATING OPENING"
-    : "WAITING FOR WORKER";
+  if (timeline.length) return "BUFFERING";
+  return room.workerState === "generating" ? "GENERATING" : "BOOTING";
 }
 
 function bufferLabel() {
-  if (!room?.bufferedUntilMs) return "0.0s BUFFER";
+  if (!room?.bufferedUntilMs) return "0.0s BUF";
   const seconds = Math.max(0, room.bufferedUntilMs - liveNowMs()) / 1000;
-  return `${seconds.toFixed(1)}s BUFFER`;
+  return `${seconds.toFixed(1)}s BUF`;
+}
+
+function shortAddress(value: string | null) {
+  if (!value) return null;
+  if (value.length <= 12) return value;
+  return `${value.slice(0, 5)}…${value.slice(-4)}`;
+}
+
+function authorName(directive: Directive | null) {
+  if (!directive) return "SLOP AI";
+  if (directive.author)
+    return directive.author.startsWith("@")
+      ? directive.author
+      : `@${directive.author}`;
+  return (
+    shortAddress(directive.authorAddress) ||
+    (directive.source === "pumpfun" ? "PUMP ANON" : "WEB ANON")
+  );
+}
+
+function sourceName(directive: Directive | null) {
+  if (!directive) return "AUTOPILOT";
+  return directive.source === "pumpfun" ? "PUMP.FUN CHAT" : "WEB CHAT";
+}
+
+function attribution(directive: Directive | null) {
+  const votes =
+    directive?.voteCount == null
+      ? ""
+      : ` · ${directive.voteCount} ${directive.voteCount === 1 ? "VOTE" : "VOTES"}`;
+  const proposal = directive?.proposalId ? ` · #${directive.proposalId}` : "";
+  return `${authorName(directive)} · ${sourceName(directive)}${proposal}${votes}`;
 }
 
 function directiveLabel(directive: Directive) {
-  const source =
-    directive.source === "pumpfun"
-      ? `PUMP.FUN${directive.author ? ` · @${directive.author}` : ""}`
-      : "WEB";
-
-  if (directive.status === "queued") return `${source} · WINNER QUEUED`;
-  if (directive.status === "generating") {
-    return `${source} · WINNER GENERATING${directive.usedEpisode !== null ? ` · EP ${directive.usedEpisode + 1}` : ""}`;
-  }
-  return `${source} · WINNER USED${directive.usedEpisode !== null ? ` · EP ${directive.usedEpisode + 1}` : ""}`;
+  const state =
+    directive.status === "queued"
+      ? "LOCKED NEXT"
+      : directive.status === "generating"
+        ? "RENDERING"
+        : "PLAYED";
+  return `${state} · ${attribution(directive)}`;
 }
 
 function pumpfunLabel() {
-  if (!room?.pumpfun.enabled) return "PUMP.FUN OFF";
+  if (!room?.pumpfun.enabled) return "PUMP CHAT OFF";
   const propose = room.pumpfun.prefix || "ALL CHAT";
   const vote = room.pumpfun.votePrefix || "VOTES OFF";
-  return `PUMP.FUN ${room.pumpfun.state.toUpperCase()} · ${propose} · ${vote}`;
+  return `PUMP ${room.pumpfun.state.toUpperCase()} · ${propose} · ${vote}`;
 }
 
 function proposalSource(proposal: PromptProposal) {
-  if (proposal.source === "pumpfun") {
-    return `PUMP${proposal.author ? ` · @${proposal.author}` : ""}`;
-  }
-  return "WEB";
+  const who = proposal.author
+    ? proposal.author.startsWith("@")
+      ? proposal.author
+      : `@${proposal.author}`
+    : shortAddress(proposal.authorAddress) || "ANON";
+  return proposal.source === "pumpfun" ? `PUMP · ${who}` : `WEB · ${who}`;
 }
 
 function roundIsOpen() {
@@ -260,14 +335,51 @@ function roundIsOpen() {
   );
 }
 
-function candidateClass(proposal: PromptProposal) {
+function candidateClass(proposal: PromptProposal, rank: number) {
   const selected = arena ? localVotes.get(arena.id) === proposal.id : false;
-  return `candidate${selected ? " myVote" : ""}${proposal.status === "selected" ? " winner" : ""}`;
+  return `candidate${selected ? " myVote" : ""}${proposal.status === "selected" ? " winner" : ""}${rank === 0 ? " leader" : ""}`;
+}
+
+function nextPromptText() {
+  return (
+    nextDirective?.text ||
+    nextClip?.directive ||
+    "Chat is still cooking the next mutation…"
+  );
+}
+
+function currentPromptText() {
+  return (
+    current?.directive ||
+    "The GPU cauldron is manufacturing the opening reality…"
+  );
 }
 
 function App() {
   const open = roundIsOpen();
-  const candidates = arena?.proposals.slice(0, 8) || [];
+  const candidates = arena?.proposals || [];
+  const totalVotes = candidates.reduce((sum, item) => sum + item.voteCount, 0);
+  const currentDirectiveId = current?.directiveId ?? null;
+  const nextDirectiveId = nextClip?.directiveId ?? null;
+  const activeDirective = currentDirectiveId
+    ? currentDirective?.id === currentDirectiveId
+      ? currentDirective
+      : directives.find((item) => item.id === currentDirectiveId) || null
+    : null;
+  const upcomingDirective = nextDirectiveId
+    ? nextDirective?.id === nextDirectiveId
+      ? nextDirective
+      : directives.find((item) => item.id === nextDirectiveId) || nextDirective
+    : nextDirective;
+  const nextLocked = Boolean(upcomingDirective || nextClip);
+  const currentByline = current?.directiveId
+    ? attribution(activeDirective)
+    : "SLOP AI · OPENING / AUTOPILOT";
+  const nextByline = upcomingDirective
+    ? attribution(upcomingDirective)
+    : nextClip?.directiveId
+      ? "LOCKED FROM CHAT"
+      : "SLOP AI · AUTOPILOT";
 
   return (
     <>
@@ -285,143 +397,251 @@ function App() {
           />
         ) : (
           <div className="void">
-            <div className="spinner" />
-            <p>{streamStatus()}</p>
+            <div className="coinLoader">
+              <span>$SLOP</span>
+            </div>
+            <strong>GENERATING REALITY</strong>
+            <p>{streamStatus()} · do not refresh your brain</p>
           </div>
         )}
 
+        <div className="videoWash" />
         <div className="grain" />
+        <div className="scanlines" />
+
+        <div className="tickerTape" aria-hidden="true">
+          <div>
+            <span>🟢 $SLOP PLOT CAP: ∞</span>
+            <span>💬 CHAT IS THE DEV</span>
+            <span>🧠 BRAINROT ENGINE: MAX</span>
+            <span>🎥 5 SEC CANDLES ONLY</span>
+            <span>🪙 NO ROADMAP · ONLY LORE</span>
+            <span>🚀 NEXT PROMPT ALWAYS LOADING</span>
+            <span>🟢 $SLOP PLOT CAP: ∞</span>
+            <span>💬 CHAT IS THE DEV</span>
+          </div>
+        </div>
+
         <header className="topbar">
-          <div className="brand">
-            <span className="liveDot" />
-            SLOP TV
+          <div className="brandLockup">
+            <div className="coinMark">
+              <span>S</span>
+            </div>
+            <div>
+              <div className="brand">
+                <span className="liveDot" />
+                SLOP TV
+              </div>
+              <div className="brandSub">$SLOP · infinite story market</div>
+            </div>
           </div>
           <div className="meta">
-            <span>{streamStatus()}</span>
+            <span className={`liveState ${streamStatus().toLowerCase()}`}>
+              {streamStatus()}
+            </span>
             <span>EP {current ? current.episode + 1 : "—"}</span>
             <span>{room?.resolution || "—"}</span>
             <span>{bufferLabel()}</span>
             <button className="soundToggle" onClick={toggleSound}>
-              {soundEnabled ? "SOUND ON" : "ENABLE SOUND"}
+              {soundEnabled ? "🔊 SOUND ON" : "🔇 UNMUTE"}
             </button>
           </div>
         </header>
 
-        {arena ? (
-          <div className="voteOverlay">
-            <span>NEXT SCENE · EP {arena.targetEpisode + 1}</span>
-            <strong data-round-countdown>
-              {arena.status === "open" ? "…" : "LOCKED"}
-            </strong>
-            <em>{arena.proposals.length} ideas</em>
-          </div>
-        ) : null}
+        <div className="sceneHud">
+          <article className="nowCard">
+            <div className="cardEyebrow">
+              <span className="statusChip liveChip">● NOW PLAYING</span>
+              <span>EP {current ? current.episode + 1 : "—"}</span>
+            </div>
+            <h2>{currentPromptText()}</h2>
+            <div className="promptAttribution">
+              <span>SUGGESTED BY</span>
+              <strong>{currentByline}</strong>
+            </div>
+            <progress
+              className="sceneProgress"
+              data-current-progress
+              max={current?.durationSeconds || 5}
+              value={
+                current
+                  ? Math.max(0, (liveNowMs() - current.startsAtMs) / 1000)
+                  : 0
+              }
+            />
+          </article>
 
-        <div className="lowerThird">
-          <p className="nowPlaying">
-            {current?.directive || "The room worker is manufacturing reality…"}
-          </p>
-          {room?.lastError ? <p className="error">{room.lastError}</p> : null}
-          {room?.pumpfun.lastError ? (
-            <p className="error">Pump.fun: {room.pumpfun.lastError}</p>
-          ) : null}
-          {error ? <p className="error">{error}</p> : null}
+          <article className={`nextCard ${nextLocked ? "locked" : "open"}`}>
+            <div className="cardEyebrow">
+              <span
+                className={`statusChip ${nextLocked ? "nextChip" : "voteChip"}`}
+              >
+                {nextLocked ? "🔒 LOCKED NEXT" : "🗳️ NEXT PROMPT"}
+              </span>
+              <strong data-next-countdown>
+                {nextLocked ? "READY" : "VOTING NOW"}
+              </strong>
+            </div>
+            <p>
+              {upcomingDirective?.text ||
+                nextClip?.directive ||
+                nextPromptText()}
+            </p>
+            <div className="nextMeta">{nextByline}</div>
+          </article>
         </div>
+
+        {room?.lastError ? (
+          <p className="error stageError">{room.lastError}</p>
+        ) : null}
+        {room?.pumpfun.lastError ? (
+          <p className="error stageError pumpError">
+            Pump.fun: {room.pumpfun.lastError}
+          </p>
+        ) : null}
+        {error ? <p className="error stageError clientError">{error}</p> : null}
       </section>
 
       <aside className="chatPanel">
         <div className="chatHeader">
           <div>
-            <h1>VOTE THE NEXT SCENE</h1>
-            <p>
-              Each ballot creates one canonical winner. Losing ideas expire
-              instead of becoming backlog.
-            </p>
+            <div className="panelKicker">LIVE PLOT TERMINAL</div>
+            <h1>WHAT HAPPENS NEXT?</h1>
+            <p>Drop brainrot. One identity = one vote. Winner becomes canon.</p>
           </div>
           <div className={`workerBadge ${room?.workerState || "idle"}`}>
             {room?.workerState || transport}
           </div>
         </div>
 
-        <div className="messages">
-          <div className="systemMessage">
-            <span>SHARED BALLOT · {pumpfunLabel()}</span>
-            Pump.fun: <b>!next idea</b> proposes and auto-votes; <b>!vote 42</b>{" "}
-            moves your wallet's one vote. Exact duplicate ideas merge into one
-            candidate.
+        <section
+          className={`lockedNextPanel ${nextLocked ? "hasNext" : "waiting"}`}
+        >
+          <div className="lockedTopline">
+            <span>
+              {nextLocked ? "🔒 NEXT PROMPT LOCKED" : "🟢 NEXT PROMPT IS LIVE"}
+            </span>
+            <b data-next-countdown>{nextLocked ? "READY" : "VOTING NOW"}</b>
           </div>
+          <strong>
+            {upcomingDirective?.text || nextClip?.directive || nextPromptText()}
+          </strong>
+          <div className="lockedByline">{nextByline}</div>
+        </section>
 
+        <div className="messages">
           <section className="arena">
             <div className="arenaHeader">
               <div>
                 <span>
                   {arena
-                    ? `BALLOT #${arena.id} · TARGET EP ${arena.targetEpisode + 1}`
-                    : "BALLOT BOOTING"}
+                    ? `NEXT PROMPT QUEUE · ROUND #${arena.id}`
+                    : "NEXT PROMPT QUEUE"}
                 </span>
                 <strong>
                   {open
                     ? "VOTING OPEN"
                     : arena
-                      ? "BALLOT LOCKED"
-                      : "WAITING FOR OPENING"}
+                      ? "QUEUE LOCKED"
+                      : "BOOTING BALLOT"}
                 </strong>
               </div>
-              {arena ? (
-                <b>
-                  {arena.proposals.reduce(
-                    (sum, item) => sum + item.voteCount,
-                    0,
-                  )}{" "}
-                  votes
+              <div className="roundNumbers">
+                <b data-round-countdown>
+                  {arena?.status === "open" ? "…" : "LOCKED"}
                 </b>
-              ) : null}
+                <em>
+                  {totalVotes} {totalVotes === 1 ? "VOTE" : "VOTES"}
+                </em>
+              </div>
+            </div>
+
+            <div className="queueLegend">
+              <span>RANK</span>
+              <span>PROMPT</span>
+              <span>VOTES</span>
             </div>
 
             <div className="candidates">
               {candidates.length ? (
-                candidates.map((proposal) => (
+                candidates.map((proposal, rank) => (
                   <button
                     type="button"
-                    className={candidateClass(proposal)}
+                    className={candidateClass(proposal, rank)}
                     key={proposal.id}
                     disabled={!open || proposal.status !== "open"}
                     onClick={() => voteProposal(proposal.id)}
                   >
-                    <span className="candidateMeta">
-                      <b>#{proposal.id}</b>
-                      <em>{proposalSource(proposal)}</em>
-                      <strong>
-                        {proposal.voteCount}{" "}
-                        {proposal.voteCount === 1 ? "VOTE" : "VOTES"}
-                      </strong>
+                    <span className="rankBadge">
+                      {String(rank + 1).padStart(2, "0")}
                     </span>
-                    <span className="candidateText">{proposal.text}</span>
+                    <span className="candidateBody">
+                      <span className="candidateMeta">
+                        <em>
+                          #{proposal.id} · {proposalSource(proposal)}
+                        </em>
+                        {rank === 0 && proposal.voteCount > 0 ? (
+                          <i>LEADING</i>
+                        ) : null}
+                        {arena && localVotes.get(arena.id) === proposal.id ? (
+                          <i>YOUR VOTE</i>
+                        ) : null}
+                      </span>
+                      <span className="candidateText">{proposal.text}</span>
+                      <progress
+                        className="voteMeter"
+                        value={proposal.voteCount}
+                        max={Math.max(1, totalVotes)}
+                      />
+                    </span>
+                    <span className="voteStack">
+                      <strong>{proposal.voteCount}</strong>
+                      <small>
+                        {proposal.voteCount === 1 ? "VOTE" : "VOTES"}
+                      </small>
+                    </span>
                   </button>
                 ))
               ) : (
                 <div className="emptyBallot">
+                  <b>QUEUE EMPTY</b>
                   {open
-                    ? "No proposals yet. First idea gets the board."
-                    : "The next ballot opens after the opening clip is buffered."}
+                    ? "Be first. Submit the next mutation below."
+                    : "The next ballot opens as soon as playback has safe generation headroom."}
                 </div>
               )}
             </div>
           </section>
 
-          <div className="canonDivider">RECENT WINNERS</div>
-          {directives.map((directive) => (
-            <div className={`message ${directive.status}`} key={directive.id}>
-              <span>
-                {directiveLabel(directive)}
-                {directive.proposalId ? ` · #${directive.proposalId}` : ""}
-              </span>
-              {directive.text}
+          <details className="canonLog">
+            <summary>
+              RECENT CANON / WINNERS <span>{directives.length}</span>
+            </summary>
+            <div className="canonItems">
+              {directives.map((directive) => (
+                <div
+                  className={`message ${directive.status}`}
+                  key={directive.id}
+                >
+                  <span>{directiveLabel(directive)}</span>
+                  {directive.text}
+                </div>
+              ))}
             </div>
-          ))}
+          </details>
+
+          <div className="systemMessage">
+            <span>{pumpfunLabel()}</span>
+            Pump.fun: <b>!next your idea</b> proposes + votes. <b>!vote 42</b>{" "}
+            moves your vote. Duplicate ideas merge instead of clogging the lore.
+          </div>
         </div>
 
         <form className="composer" onSubmit={submitProposal as any}>
+          <div className="composerTitle">
+            <span>CREATE NEXT PROMPT</span>
+            <em>{open ? "LIVE" : "LOCKED"}</em>
+          </div>
           <textarea
             value={input}
             disabled={!open}
@@ -430,8 +650,8 @@ function App() {
             }}
             placeholder={
               open
-                ? "the raccoon realizes the VHS tape is predicting chat messages five seconds early…"
-                : "ballot locked — next round opens automatically…"
+                ? "make the raccoon ape into a cursed vending machine coin and the machine starts screaming tomorrow's chat…"
+                : "round locked — the winner is becoming reality…"
             }
             maxLength={500}
             rows={3}
@@ -446,24 +666,22 @@ function App() {
           />
           <div className="composerBottom">
             <div className="qualityReadout">
-              {room?.resolution || "—"} · ONE VOTE / VIEWER
+              {room?.resolution || "—"} · 1 WALLET / 1 VOTE
             </div>
             <div className="queueCount">
               {queuedCount
-                ? `${queuedCount} winner queued`
-                : `${arena?.proposals.length || 0} candidates`}
+                ? `${queuedCount} WINNER LOCKED`
+                : `${candidates.length} IN QUEUE`}
             </div>
             <button type="submit" disabled={!open}>
-              PROPOSE + VOTE ↗
+              SEND IT ↗
             </button>
           </div>
         </form>
 
         <footer>
-          <span>TradJS + sqlite-zod-orm + measure-fn</span>
-          <span>
-            {transport} · {pumpfunLabel()} · H3 Max on fal
-          </span>
+          <span>tradjs · jsx-ai · sqlite-zod-orm</span>
+          <span>{transport} · H3 MAX</span>
         </footer>
       </aside>
     </>

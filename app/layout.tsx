@@ -8,7 +8,7 @@ export default function RootLayout({ children }: { children: any }) {
           name="description"
           content="An infinite interactive AI-generated live stream."
         />
-        <title>SLOP TV</title>
+        <title>$SLOP TV — Infinite Brainrot</title>
       </head>
       <body>{children}</body>
     </html>
