@@ -1,5 +1,5 @@
-import { fileURLToPath } from "node:url";
 import { getProcess, handleRun, isProcessRunning } from "bgrun";
+import { PROJECT_ROOT } from "./project-paths.ts";
 
 export type ManagedWorkerState = "unknown" | "starting" | "running" | "error";
 
@@ -13,7 +13,6 @@ export type ManagedWorkerStatus = {
 
 const WORKER_NAME = "pumptv-worker";
 const WORKER_COMMAND = "bun src/worker.ts";
-const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 const CONFIG_PATH = ".config.toml";
 const CHECK_INTERVAL_MS = 2_000;
 

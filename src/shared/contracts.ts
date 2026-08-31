@@ -163,7 +163,6 @@ export type PumpfunChatStatus = {
   enabled: boolean;
   mint: string | null;
   prefix: string | null;
-  votePrefix: string | null;
   state: PumpChatState;
   lastError: string | null;
 };
@@ -201,10 +200,5 @@ export type StreamState = {
   currentDirective: Directive | null;
   nextDirective: Directive | null;
   timeline: Clip[];
-  recentDirectives: Directive[];
-  arena: PromptRound | null;
-  worldState: WorldState | null;
-  worldStateEpisode: number | null;
-  worldStateAudit: WorldStateAudit | null;
   queuedCount: number;
 };

@@ -1,13 +1,16 @@
 import { mkdirSync } from "node:fs";
 import { dirname } from "node:path";
+import { resolveProjectPath } from "./project-paths.ts";
 import { Database, z } from "sqlite-zod-orm";
 import { dbMeasure } from "./observability.ts";
 
-export const dbPath = process.env.PUMPTV_DB_PATH || ".data/pumptv.sqlite";
+export const dbPath = resolveProjectPath(
+  process.env.PUMPTV_DB_PATH || ".data/pumptv.sqlite",
+);
 mkdirSync(dirname(dbPath), { recursive: true });
 
 const defaultResolution =
-  process.env.PUMPTV_RESOLUTION === "480P" ? "480P" : "768P";
+  process.env.PUMPTV_RESOLUTION === "768P" ? "768P" : "480P";
 
 const openedDb = dbMeasure.measureSync(
   "Open PumpTV database",

@@ -1,26 +1,26 @@
 import { hostname } from "node:os";
-import type { GenerationMode } from "../shared/contracts.ts";
-import { commitPromptRound, ensurePromptRound } from "./arbitration.ts";
-import { BUFFER_CLIP_MS, evaluateBuffer } from "./adaptive-buffer.ts";
 import { generateNextClip } from "./generate.ts";
 import { classifyGenerationFailure } from "./generation-recovery.ts";
 import { acquireRoomLease, releaseRoomLease, renewRoomLease } from "./lease.ts";
-import { arbitrationMeasure, workerMeasure } from "./observability.ts";
+import { workerMeasure } from "./observability.ts";
+import { dbPath } from "./db.ts";
 import {
+  clearGenerationPause,
   getLatestClip,
-  getRecentGenerationTimings,
   getRoomRow,
   hasQueuedDirective,
-  clearGenerationPause,
   nextEpisode,
   recoverGeneratingDirectives,
-  setWorkerState,
   setGenerationPause,
+  setWorkerState,
   touchWorkerHeartbeat,
 } from "./repository.ts";
 
 const LEASE_TTL_MS = Number(process.env.PUMPTV_LEASE_TTL_MS || 30_000);
-const IDLE_POLL_MS = Number(process.env.PUMPTV_IDLE_POLL_MS || 250);
+const IDLE_POLL_MS = Math.max(
+  150,
+  Number(process.env.PUMPTV_IDLE_POLL_MS || 500),
+);
 const ERROR_BACKOFF_MS = Number(process.env.PUMPTV_ERROR_BACKOFF_MS || 2_000);
 const MIN_GENERATION_INTERVAL_MS = Math.max(
   0,
@@ -31,57 +31,13 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const owner = `${hostname()}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`;
 let stopping = false;
 
-function clipEndMs(clip: Awaited<ReturnType<typeof getLatestClip>>) {
-  return clip ? clip.startsAtMs + clip.durationSeconds * 1000 : null;
-}
-
-async function bufferSnapshot(
-  latest: Awaited<ReturnType<typeof getLatestClip>>,
-  activeMode?: GenerationMode,
-) {
-  const timings = await getRecentGenerationTimings();
-  const now = Date.now();
-  const endMs = clipEndMs(latest) || now;
-  return evaluateBuffer({
-    bufferMs: Math.max(0, endMs - now),
-    samples: timings,
-    activeMode,
-    hasClip: Boolean(latest),
-  });
-}
-
-async function waitForPromptWindow(
-  latest: Awaited<ReturnType<typeof getLatestClip>>,
-  generationLeadMs: number,
-) {
-  if (!latest) return 0;
-  if (await hasQueuedDirective()) return 0;
-
-  const episode = await nextEpisode();
-  const endMs = clipEndMs(latest);
-  const round = await arbitrationMeasure.measure("Ensure scene ballot", () =>
-    ensurePromptRound(episode, endMs, generationLeadMs),
-  );
-  if (!round) return 0;
-
-  const now = Date.now();
-  const bufferMs = Math.max(0, (endMs || now) - now);
-  if (now >= round.closesAtMs) return 0;
-
-  // Dynamic lead is based on recent end-to-end generation time. Keep voting open
-  // only while measured headroom says the next render can still land safely.
-  if (bufferMs <= generationLeadMs) return 0;
-  return Math.max(25, Math.min(500, round.closesAtMs - now));
-}
-
 async function generationTick() {
   await touchWorkerHeartbeat();
   const room = await getRoomRow();
 
   const falKey = (process.env.FAL_KEY || "").trim();
   if (!falKey) {
-    const reason =
-      "FAL_KEY is missing. Set [fal].key in .config.toml, then restart PumpTV so bgrun reloads the worker config.";
+    const reason = "FAL_KEY is missing.";
     if (
       room.generationPauseKind !== "config" ||
       room.generationPauseReason !== reason
@@ -93,15 +49,13 @@ async function generationTick() {
         failureCount: 0,
       });
     }
-    await setWorkerState("idle", null, room.generationMode || "full");
+    await setWorkerState("idle", null, "full");
     return { generated: false, sleepMs: 1_000 };
   }
 
-  if (room.generationPauseKind === "config") {
-    await clearGenerationPause();
-  }
+  if (room.generationPauseKind === "config") await clearGenerationPause();
   if (!room.running) {
-    await setWorkerState("idle", null);
+    await setWorkerState("idle", null, "full");
     return { generated: false, sleepMs: 1_000 };
   }
 
@@ -109,41 +63,24 @@ async function generationTick() {
   const retryAtMs =
     room.generationRetryAtMs == null ? 0 : Number(room.generationRetryAtMs);
   if (room.generationPauseKind && retryAtMs > now) {
-    await setWorkerState("idle", null, room.generationMode || "full");
+    await setWorkerState("idle", null, "full");
     return {
       generated: false,
       sleepMs: Math.max(100, Math.min(1_000, retryAtMs - now)),
     };
   }
-  if (room.generationPauseKind === "cooldown" && retryAtMs <= now) {
+  if (room.generationPauseKind && retryAtMs <= now)
     await clearGenerationPause();
-  }
 
   const latest = await getLatestClip();
-  const adaptive = await bufferSnapshot(latest, room.generationMode || "full");
-  const bufferedUntilMs = clipEndMs(latest) || 0;
+  const opening = !latest;
 
-  if (latest && adaptive.bufferMs >= adaptive.targetBufferMs) {
-    // The prompt market remains live while the worker sits on a healthy 2–3 clip reserve.
-    await ensurePromptRound(
-      await nextEpisode(),
-      bufferedUntilMs,
-      adaptive.adaptiveLeadMs,
-    );
-    return {
-      generated: false,
-      sleepMs: Math.max(
-        100,
-        Math.min(500, adaptive.bufferMs - adaptive.targetBufferMs),
-      ),
-    };
+  // PumpTV creates one opening episode automatically. After that, every episode
+  // must correspond to a real accepted Pump.fun chat prompt. No autopilot filler.
+  if (!opening && !(await hasQueuedDirective())) {
+    await setWorkerState("idle", null, "full");
+    return { generated: false, sleepMs: IDLE_POLL_MS };
   }
-
-  const ballotSleep = await waitForPromptWindow(
-    latest,
-    adaptive.adaptiveLeadMs,
-  );
-  if (ballotSleep > 0) return { generated: false, sleepMs: ballotSleep };
 
   if (!acquireRoomLease(owner, LEASE_TTL_MS)) {
     return { generated: false, sleepMs: IDLE_POLL_MS };
@@ -161,73 +98,25 @@ async function generationTick() {
 
     const lockedRoom = await getRoomRow();
     const lockedLatest = await getLatestClip();
-    const lockedBufferUntil = clipEndMs(lockedLatest) || 0;
-    const lockedAdaptive = await bufferSnapshot(
-      lockedLatest,
-      lockedRoom.generationMode || "full",
-    );
-
-    if (
-      !lockedRoom.running ||
-      (lockedLatest && lockedAdaptive.bufferMs >= lockedAdaptive.targetBufferMs)
-    ) {
+    const lockedOpening = !lockedLatest;
+    if (!lockedRoom.running) return { generated: false, sleepMs: IDLE_POLL_MS };
+    if (!lockedOpening && !(await hasQueuedDirective())) {
+      await setWorkerState("idle", null, "full");
       return { generated: false, sleepMs: IDLE_POLL_MS };
     }
 
     const episode = await nextEpisode();
-    const queued = await hasQueuedDirective();
-
-    if (lockedLatest && !queued) {
-      const round = await ensurePromptRound(
-        episode,
-        lockedBufferUntil,
-        lockedAdaptive.adaptiveLeadMs,
-      );
-      const now = Date.now();
-      const bufferMs = Math.max(0, lockedBufferUntil - now);
-      if (
-        round &&
-        now < round.closesAtMs &&
-        bufferMs > lockedAdaptive.adaptiveLeadMs
-      ) {
-        return {
-          generated: false,
-          sleepMs: Math.max(25, Math.min(500, round.closesAtMs - now)),
-        };
-      }
-
-      await arbitrationMeasure.measure(
-        { label: "Select scene winner", episode },
-        () => commitPromptRound(episode),
-      );
-    }
-
-    // Pipeline the market: while episode N is rendering, viewers vote on N+1.
-    // The projected end includes the clip we are about to append to the timeline.
-    const projectedStartMs = lockedLatest
-      ? Math.max(lockedBufferUntil, Date.now() + 75)
-      : Date.now() + 900;
-    const projectedBufferUntil = projectedStartMs + BUFFER_CLIP_MS;
-    await arbitrationMeasure.measure("Open pipelined scene ballot", () =>
-      ensurePromptRound(
-        episode + 1,
-        projectedBufferUntil,
-        lockedAdaptive.adaptiveLeadMs,
-      ),
-    );
-
-    const mode = lockedLatest ? lockedAdaptive.recommendedMode : "full";
     console.log(
-      `[worker] generating EP ${episode + 1} · ${mode.toUpperCase()} · ${lockedLatest ? "continuation" : "opening"}`,
+      `[worker] generating EP ${episode + 1} · ${lockedRoom.resolution} · ${lockedOpening ? "opening" : "pump.fun prompt"}`,
     );
-    await setWorkerState("generating", null, mode);
+    await setWorkerState("generating", null, "full");
 
     let clip;
     try {
       clip = await generateNextClip({
         previousClip: lockedLatest,
         resolution: lockedRoom.resolution,
-        mode,
+        mode: "full",
       });
     } catch (error) {
       const failures = Number(lockedRoom.generationFailureCount || 0) + 1;
@@ -249,28 +138,20 @@ async function generationTick() {
       `[worker] published EP ${clip.episode + 1} · ${clip.totalGenerationMs ?? 0}ms`,
     );
     const finishedAtMs = Date.now();
+
     if (MIN_GENERATION_INTERVAL_MS > 0) {
       await setGenerationPause({
         kind: "cooldown",
-        reason: `Intentional generation spacing is active (${Math.round(MIN_GENERATION_INTERVAL_MS / 100) / 10}s between renders). Replays remain available during the gap.`,
+        reason: `Generation spacing: ${MIN_GENERATION_INTERVAL_MS}ms`,
         retryAtMs: finishedAtMs + MIN_GENERATION_INTERVAL_MS,
         failureCount: 0,
       });
     } else {
       await clearGenerationPause(finishedAtMs);
-      await setWorkerState("idle", null, mode);
+      await setWorkerState("idle", null, "full");
     }
 
-    const postAdaptive = await bufferSnapshot(clip, mode);
-    await arbitrationMeasure.measure("Sync next scene ballot", () =>
-      ensurePromptRound(
-        clip.episode + 1,
-        clip.startsAtMs + clip.durationSeconds * 1000,
-        postAdaptive.adaptiveLeadMs,
-      ),
-    );
-
-    return { generated: true, sleepMs: 40 };
+    return { generated: true, sleepMs: 80 };
   } finally {
     clearInterval(heartbeat);
     releaseRoomLease(owner);
@@ -280,8 +161,9 @@ async function generationTick() {
 export async function runRoomWorker() {
   console.log(`[worker] PumpTV room worker ${owner}`);
   console.log(
-    `[worker] cwd=${process.cwd()} · FAL_KEY=${(process.env.FAL_KEY || "").trim() ? "present" : "missing"} · room=${process.env.PUMPTV_ROOM || "main"} · db=${process.env.PUMPTV_DB_PATH || ".data/pumptv.sqlite"}`,
+    `[worker] cwd=${process.cwd()} · FAL_KEY=${(process.env.FAL_KEY || "").trim() ? "present" : "missing"} · room=${process.env.PUMPTV_ROOM || "main"}`,
   );
+  console.log(`[worker] db=${dbPath}`);
 
   while (!stopping) {
     const result = await workerMeasure.measure("Room tick", () =>

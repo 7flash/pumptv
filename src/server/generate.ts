@@ -1,17 +1,16 @@
 import { fal } from "@fal-ai/client";
 import type { Clip, GenerationMode, Resolution } from "../shared/contracts.ts";
 import { falMeasure } from "./observability.ts";
-import { AUTOPILOT, OPENING, renderH3Prompt } from "./prompt.ts";
+import { OPENING, renderH3Prompt } from "./prompt.ts";
 import { planNextShot } from "./showrunner.tsx";
-import { reconcileRenderedClip } from "./visual-reconciler.tsx";
 import { extractVideoFrame, sampleClipFrames } from "./video-frames.ts";
 import {
   claimQueuedDirective,
   completeDirective,
+  getLatestWorldState,
   nextEpisode,
   recentStory,
   releaseDirective,
-  getLatestWorldState,
   saveClipWithWorldState,
 } from "./repository.ts";
 
@@ -42,8 +41,13 @@ export async function generateNextClip(input: {
   const generationStartedAt = performance.now();
   const mode = input.mode || "full";
   const episode = await nextEpisode();
-  const claimed = await claimQueuedDirective(episode);
-  const directive = claimed?.text || (episode === 0 ? OPENING : AUTOPILOT);
+  const claimed = episode === 0 ? null : await claimQueuedDirective(episode);
+
+  if (episode > 0 && !claimed) {
+    throw new Error("No Pump.fun prompt is queued for the next episode.");
+  }
+
+  const directive = claimed?.text || OPENING;
 
   try {
     const [story, worldState] = await Promise.all([
@@ -107,30 +111,15 @@ export async function generateNextClip(input: {
     };
     if (!data.video?.url) throw new Error("fal returned no video URL");
 
-    // Under pressure we only extract what continuity strictly needs. FULL mode
-    // samples all three frames so the vision reconciler can audit rendered reality.
+    // Vision/canon auditing is intentionally disabled for now. We only sample
+    // the first/end frames needed for thumbnails and seamless I2V continuity.
     const frameStartedAt = performance.now();
     const frames = await sampleClipFrames({
       videoUrl: data.video.url,
       knownStartUrl: anchorFrameUrl,
-      mode: mode === "full" ? "full" : "continuity",
+      mode: "continuity",
     });
     const frameSampleMs = elapsed(frameStartedAt);
-
-    const visionStartedAt = performance.now();
-    const reconciliation = await reconcileRenderedClip({
-      episode,
-      directive,
-      plan: showrunner.plan,
-      priorWorldState: worldState,
-      plannedWorldState: showrunner.nextWorldState,
-      frames,
-      skipReason:
-        mode === "full"
-          ? null
-          : `${mode.toUpperCase()} buffer recovery mode: visual reconciliation deferred; planned canon accepted for this episode.`,
-    });
-    const visionMs = elapsed(visionStartedAt);
 
     const previousEndMs = input.previousClip
       ? input.previousClip.startsAtMs +
@@ -138,7 +127,7 @@ export async function generateNextClip(input: {
       : 0;
     const startsAtMs = input.previousClip
       ? Math.max(previousEndMs, Date.now() + 75)
-      : Date.now() + 900;
+      : Date.now() + 650;
     const totalGenerationMs = elapsed(generationStartedAt);
 
     const clip = await saveClipWithWorldState(
@@ -153,7 +142,7 @@ export async function generateNextClip(input: {
         episode,
         anchorFrameUrl,
         startFrameUrl: frames.start,
-        middleFrameUrl: frames.middle,
+        middleFrameUrl: null,
         endFrameUrl: frames.end,
         usedAnchorFrame: Boolean(anchorFrameUrl),
         resolution: input.resolution,
@@ -167,13 +156,24 @@ export async function generateNextClip(input: {
         showrunnerMs,
         h3Ms,
         frameSampleMs,
-        visionMs,
+        visionMs: 0,
         totalGenerationMs,
       },
-      reconciliation.worldState,
+      showrunner.nextWorldState,
       {
         plannedWorldState: showrunner.nextWorldState,
-        audit: reconciliation.audit,
+        audit: {
+          status: "skipped",
+          model: null,
+          summary: null,
+          drift: [],
+          sampledFrameUrls: [frames.start, frames.end].filter(
+            (value): value is string => Boolean(value),
+          ),
+          inputTokens: null,
+          outputTokens: null,
+          cost: null,
+        },
       },
     );
 

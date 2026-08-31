@@ -4,9 +4,6 @@ import { worldStateForH3 } from "./world-state.ts";
 export const OPENING =
   "Open on a rain-soaked neon convenience store at 2:13 AM. A nervous raccoon in a tiny delivery jacket discovers a mysterious glowing VHS tape behind the counter. Play it completely straight, cinematic live action.";
 
-export const AUTOPILOT =
-  "Continue the story naturally. Escalate one existing thread without changing the cast or world for no reason.";
-
 export function sanitizeLine(value: string, max = 600) {
   return value.replace(/\s+/g, " ").trim().slice(0, max);
 }

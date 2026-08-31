@@ -1,11 +1,9 @@
-# PumpTV runtime config. bgrun auto-loads this file from the repo root.
-# Keep real secrets only in your local copy; .config.toml is gitignored.
+# PumpTV runtime config. bgrun reads this file from the repo root.
 
 [fal]
-key = "" # REQUIRED: blank pauses generation
+key = ""
 
-# Passed directly into jsx-ai's native Codex mode.
-# Authentication comes from the local Codex login/session; no model API key lives here.
+# Passed directly into jsx-ai native Codex mode.
 [codex]
 model = "gpt-5.6"
 model_reasoning_effort = "medium"
@@ -15,42 +13,25 @@ approval_policy = "never"
 [pumptv]
 db_path = ".data/pumptv.sqlite"
 room = "main"
-resolution = "768P"
+resolution = "480P"
 admin_token = ""
 
-# Post-render visual reality check. This uses the FAL key above, not a model-provider key.
-reconcile_vision = 1
-reconciler_model = "google/gemini-2.5-flash"
-
-min_clips_ahead = 2
-target_clips_ahead = 3
-buffer_safety_margin_ms = 1000
-lease_ttl_ms = 30000
-
-timeline_window = 64
+# One opening episode is generated automatically. After that, PumpTV waits for
+# real Pump.fun prompts; there is no autopilot generation.
 min_generation_interval_ms = 0
-funds_retry_base_ms = 30000
-funds_retry_max_ms = 900000
-provider_retry_base_ms = 3000
-provider_retry_max_ms = 60000
+lease_ttl_ms = 30000
+timeline_window = 96
+idle_poll_ms = 500
+error_backoff_ms = 2000
 
-prompt_window_ms = 4500
-generation_lead_ms = 4500
-max_proposals_per_round = 40
-
-# Pump.fun chat ingress. Leave mint blank to disable.
+# Pump.fun is the only prompt source. Leave mint blank to disable ingress.
 pumpfun_mint = ""
 pumpfun_prefix = "!next"
-pumpfun_vote_prefix = "!vote"
 pumpfun_lease_ttl_ms = 30000
 pumpfun_lease_poll_ms = 1000
 pumpfun_max_prompt_length = 500
 pumpfun_user_cooldown_ms = 0
 
-idle_poll_ms = 250
-error_backoff_ms = 2000
-
 [measure]
-# Keep the hot-path DB polling quiet. Set to 0 when debugging traces.
 silent = 1
 timestamps = 1

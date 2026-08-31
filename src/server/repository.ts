@@ -11,7 +11,6 @@ import type {
   WorldState,
   WorldStateAudit,
 } from "../shared/contracts.ts";
-import { getPromptArena } from "./arbitration.ts";
 import { evaluateBuffer } from "./adaptive-buffer.ts";
 import { db } from "./db.ts";
 import { ROOM_NAME } from "./lease.ts";
@@ -21,7 +20,6 @@ import { getViewerCount } from "./presence.ts";
 
 const PUMPFUN_MINT = (process.env.PUMPTV_PUMPFUN_MINT || "").trim();
 const PUMPFUN_PREFIX = process.env.PUMPTV_PUMPFUN_PREFIX ?? "!next";
-const PUMPFUN_VOTE_PREFIX = process.env.PUMPTV_PUMPFUN_VOTE_PREFIX ?? "!vote";
 
 function toClip(row: any): Clip {
   return {
@@ -105,25 +103,10 @@ function nextPendingDirectiveWithVotes() {
                    ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
               END AS voteCount
        FROM directives d
-       WHERE d.status IN ('generating', 'queued')
+       WHERE d.status IN ('generating', 'queued') AND d.source = 'pumpfun'
        ORDER BY CASE d.status WHEN 'generating' THEN 0 ELSE 1 END, d.id ASC
        LIMIT 1`,
       )[0] || null,
-  );
-}
-
-function recentDirectivesWithVotes(limit: number) {
-  return dbMeasure.measureSync("Load recent directives", () =>
-    db.raw<any>(
-      `SELECT d.*,
-              CASE WHEN d.proposalId IS NULL THEN NULL
-                   ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
-              END AS voteCount
-       FROM directives d
-       ORDER BY d.id DESC
-       LIMIT ?`,
-      limit,
-    ),
   );
 }
 
@@ -155,7 +138,6 @@ function toRoom(
       enabled: Boolean(PUMPFUN_MINT),
       mint: PUMPFUN_MINT || null,
       prefix: PUMPFUN_PREFIX || null,
-      votePrefix: PUMPFUN_VOTE_PREFIX || null,
       state: PUMPFUN_MINT ? row.pumpChatState || "standby" : "disabled",
       lastError: row.pumpChatError ?? null,
     },
@@ -181,7 +163,7 @@ function toRoom(
 }
 
 export function normalizeResolution(value: unknown): Resolution {
-  return value === "480P" ? "480P" : "768P";
+  return value === "768P" ? "768P" : "480P";
 }
 
 export async function getRoomRow() {
@@ -195,6 +177,22 @@ export async function getRoomRow() {
     );
   }
   if (!row) throw new Error("Room row is missing");
+
+  // Current config is authoritative. A persisted room from an older run must not
+  // keep PumpTV at 768P after the repo config moves to 480P.
+  const configuredResolution = normalizeResolution(
+    process.env.PUMPTV_RESOLUTION,
+  );
+  if ((row as any).resolution !== configuredResolution) {
+    await dbMeasure.measureSync("Sync room resolution", () =>
+      db.rooms
+        .select()
+        .where({ id: (row as any).id })
+        .updateAll({ resolution: configuredResolution }),
+    );
+    row = { ...(row as any), resolution: configuredResolution } as any;
+  }
+
   return row as any;
 }
 
@@ -307,11 +305,44 @@ export async function setPumpChatState(
   );
 }
 
+export async function enqueuePumpfunDirective(input: {
+  text: string;
+  sourceId: string;
+  author: string | null;
+  authorAddress: string | null;
+  sourceRoom: string | null;
+}) {
+  return dbMeasure.measureSync("Queue Pump.fun directive", () => {
+    try {
+      const row = db.directives.insert({
+        text: input.text,
+        status: "queued",
+        usedEpisode: null,
+        source: "pumpfun",
+        sourceId: input.sourceId,
+        author: input.author,
+        authorAddress: input.authorAddress,
+        sourceRoom: input.sourceRoom,
+        proposalId: null,
+      });
+      return row ? toDirective(row) : null;
+    } catch (error) {
+      const existing =
+        db.raw<any>(
+          `SELECT * FROM directives WHERE source = 'pumpfun' AND sourceId = ? LIMIT 1`,
+          input.sourceId,
+        )[0] || null;
+      if (existing) return toDirective(existing);
+      throw error;
+    }
+  });
+}
+
 export async function claimQueuedDirective(episode: number) {
   const queued = await dbMeasure.measureSync("Get queued directive", () =>
     db.directives
       .select()
-      .where({ status: "queued" })
+      .where({ status: "queued", source: "pumpfun" })
       .orderBy("id", "ASC")
       .first(),
   );
@@ -332,7 +363,7 @@ export async function hasQueuedDirective() {
   const row = await dbMeasure.measureSync("Check queued directive", () =>
     db.directives
       .select("id")
-      .where({ status: "queued" })
+      .where({ status: "queued", source: "pumpfun" })
       .orderBy("id", "ASC")
       .first(),
   );
@@ -640,17 +671,17 @@ export async function getTimeline(
 
 export async function getStreamState(): Promise<StreamState> {
   const serverNowMs = Date.now();
-  const [roomRow, timeline, directives, queuedCount, arena, timings] =
-    await Promise.all([
-      getRoomRow(),
-      getTimeline(),
-      recentDirectivesWithVotes(12),
-      dbMeasure.measureSync("Count queued directives", () =>
-        db.directives.select().where({ status: "queued" }).count(),
-      ),
-      getPromptArena(),
-      getRecentGenerationTimings(),
-    ]);
+  const [roomRow, timeline, queuedCount, timings] = await Promise.all([
+    getRoomRow(),
+    getTimeline(),
+    dbMeasure.measureSync("Count queued Pump.fun prompts", () =>
+      db.directives
+        .select()
+        .where({ status: "queued", source: "pumpfun" })
+        .count(),
+    ),
+    getRecentGenerationTimings(),
+  ]);
 
   const latestClip = timeline.length ? timeline[timeline.length - 1] : null;
   const currentClip =
@@ -682,18 +713,6 @@ export async function getStreamState(): Promise<StreamState> {
       ? directiveWithVotesById(nextClip.directiveId)
       : null
     : nextPendingDirectiveWithVotes();
-  // Show canon only for reality the viewer has reached. Never leak a prebuffered future snapshot.
-  const lastStartedClip =
-    currentClip ||
-    [...timeline].reverse().find((clip) => clip.startsAtMs <= serverNowMs) ||
-    null;
-  const worldStateEpisode = lastStartedClip?.episode ?? null;
-  const worldSnapshot =
-    worldStateEpisode == null
-      ? null
-      : await getWorldStateSnapshotForEpisode(worldStateEpisode);
-  const worldState = worldSnapshot?.worldState ?? null;
-  const worldStateAudit = worldSnapshot?.audit ?? null;
 
   return {
     serverNowMs,
@@ -706,11 +725,6 @@ export async function getStreamState(): Promise<StreamState> {
       : null,
     nextDirective: nextDirectiveRow ? toDirective(nextDirectiveRow) : null,
     timeline,
-    recentDirectives: (directives || []).reverse().map(toDirective),
-    arena,
-    worldState,
-    worldStateEpisode,
-    worldStateAudit,
     queuedCount: Number(queuedCount || 0),
   };
 }

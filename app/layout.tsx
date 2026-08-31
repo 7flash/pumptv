@@ -6,9 +6,9 @@ export default function RootLayout({ children }: { children: any }) {
         <meta name="viewport" content="width=device-width, initial-scale=1" />
         <meta
           name="description"
-          content="An infinite interactive AI-generated live stream."
+          content="A live AI video stream driven by Pump.fun chat."
         />
-        <title>PumpTV — Infinite Brainrot</title>
+        <title>PumpTV</title>
       </head>
       <body>{children}</body>
     </html>

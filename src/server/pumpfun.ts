@@ -1,9 +1,4 @@
 import { hostname } from "node:os";
-import {
-  castProposalVote,
-  ensurePromptRound,
-  submitPromptProposal,
-} from "./arbitration.ts";
 import { sanitizeLine } from "./prompt.ts";
 import {
   acquirePumpChatLease,
@@ -12,12 +7,15 @@ import {
   setPumpChatLeaseState,
 } from "./pumpfun-lease.ts";
 import { runPumpfunSocket, type PumpfunMessage } from "./pumpfun-socket.ts";
-import { getLatestClip, getRoomRow, setPumpChatState } from "./repository.ts";
-import { arbitrationMeasure, pumpMeasure } from "./observability.ts";
+import {
+  enqueuePumpfunDirective,
+  getRoomRow,
+  setPumpChatState,
+} from "./repository.ts";
+import { pumpMeasure } from "./observability.ts";
 
 const MINT = (process.env.PUMPTV_PUMPFUN_MINT || "").trim();
 const PREFIX = process.env.PUMPTV_PUMPFUN_PREFIX ?? "!next";
-const VOTE_PREFIX = process.env.PUMPTV_PUMPFUN_VOTE_PREFIX ?? "!vote";
 const LEASE_TTL_MS = Number(process.env.PUMPTV_PUMPFUN_LEASE_TTL_MS || 30_000);
 const POLL_MS = Number(process.env.PUMPTV_PUMPFUN_LEASE_POLL_MS || 1_000);
 const MAX_TEXT = Number(process.env.PUMPTV_PUMPFUN_MAX_PROMPT_LENGTH || 500);
@@ -31,33 +29,18 @@ const lastAcceptedByUser = new Map<string, number>();
 let stopping = false;
 let activeAbort: AbortController | null = null;
 
-type PumpCommand =
-  { kind: "proposal"; text: string } | { kind: "vote"; proposalId: number };
-
-function extractCommand(message: PumpfunMessage): PumpCommand | null {
+function promptFromMessage(message: PumpfunMessage) {
   const line = sanitizeLine(
     String(message.message || ""),
-    MAX_TEXT + PREFIX.length + 64,
+    MAX_TEXT + PREFIX.length + 32,
   );
   if (!line) return null;
 
-  if (VOTE_PREFIX && line.toLowerCase().startsWith(VOTE_PREFIX.toLowerCase())) {
-    const rawId = line
-      .slice(VOTE_PREFIX.length)
-      .trim()
-      .split(/\s+/, 1)[0]
-      .replace(/^#/, "");
-    const proposalId = Number.parseInt(rawId || "", 10);
-    return Number.isSafeInteger(proposalId) && proposalId > 0
-      ? { kind: "vote", proposalId }
-      : null;
-  }
-
-  if (!PREFIX) return { kind: "proposal", text: sanitizeLine(line, MAX_TEXT) };
+  if (!PREFIX) return sanitizeLine(line, MAX_TEXT) || null;
   if (!line.toLowerCase().startsWith(PREFIX.toLowerCase())) return null;
 
   const text = sanitizeLine(line.slice(PREFIX.length).trim(), MAX_TEXT);
-  return text ? { kind: "proposal", text } : null;
+  return text || null;
 }
 
 function durableSourceId(message: PumpfunMessage) {
@@ -91,65 +74,32 @@ function cooldownAllows(message: PumpfunMessage) {
   return true;
 }
 
-async function currentRound() {
-  const latest = await getLatestClip();
-  if (!latest) return null;
-  const bufferUntilMs = latest.startsAtMs + latest.durationSeconds * 1000;
-  return arbitrationMeasure.measure("Ensure Pump.fun scene ballot", () =>
-    ensurePromptRound(latest.episode + 1, bufferUntilMs),
-  );
-}
-
 async function ingestMessage(message: PumpfunMessage) {
-  const command = extractCommand(message);
-  if (!command || !cooldownAllows(message)) return;
-
-  const round = await currentRound();
-  if (!round || Date.now() >= round.closesAtMs) return;
+  const text = promptFromMessage(message);
+  if (!text || !cooldownAllows(message)) return;
 
   const sourceId = durableSourceId(message);
-  const voterKey = `pumpfun:${userIdentity(message)}`;
-
-  if (command.kind === "vote") {
-    // IDs are shown in the stream overlay. A vote can only target the current
-    // round, so stale chat commands cannot affect a future scene accidentally.
-    await pumpMeasure.measure(
-      {
-        label: "Ingest Pump.fun vote",
-        room: MINT,
-        proposalId: command.proposalId,
-      },
-      () =>
-        castProposalVote({
-          roundId: round.id,
-          proposalId: command.proposalId,
-          voterKey,
-          source: "pumpfun",
-          sourceId,
-        }),
-    );
-    return;
-  }
-
-  await pumpMeasure.measure(
+  const directive = await pumpMeasure.measure(
     {
-      label: "Ingest Pump.fun proposal",
+      label: "Queue Pump.fun prompt",
       room: MINT,
       messageId: message.id || null,
     },
     () =>
-      submitPromptProposal({
-        roundId: round.id,
-        text: command.text,
-        source: "pumpfun",
+      enqueuePumpfunDirective({
+        text,
         sourceId,
         author: sanitizeLine(String(message.username || ""), 80) || null,
         authorAddress:
           sanitizeLine(String(message.userAddress || ""), 120) || null,
         sourceRoom: sanitizeLine(String(message.roomId || MINT), 160) || MINT,
-        voterKey,
       }),
   );
+
+  if (directive) {
+    const who = directive.author || directive.authorAddress || "anonymous";
+    console.log(`[pumpfun] queued @${who} → ${directive.text.slice(0, 120)}`);
+  }
 }
 
 async function runLeasedSession() {
@@ -169,9 +119,8 @@ async function runLeasedSession() {
       signal: abort.signal,
       onMessage(message) {
         void ingestMessage(message).catch((error) => {
-          // Invalid/stale votes and closed ballot races are expected in live chat.
           console.warn(
-            "[pumpfun] ignored chat command",
+            "[pumpfun] ignored chat prompt",
             error instanceof Error ? error.message : error,
           );
         });
@@ -202,7 +151,7 @@ export async function runPumpfunChatIngestor() {
   }
 
   console.log(
-    `[pumpfun] adapter ${owner} watching ${MINT} · proposals ${PREFIX ? JSON.stringify(PREFIX) : "ALL CHAT"} · votes ${JSON.stringify(VOTE_PREFIX)}`,
+    `[pumpfun] adapter ${owner} watching ${MINT} · prompts ${PREFIX ? JSON.stringify(PREFIX) : "ALL CHAT"}`,
   );
 
   while (!stopping) {
