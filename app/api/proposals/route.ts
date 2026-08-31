@@ -6,18 +6,10 @@ import { httpMeasure } from "../../../src/server/observability.ts";
 import { sanitizeLine } from "../../../src/server/prompt.ts";
 import { getLatestClip } from "../../../src/server/repository.ts";
 
-function webIdentity(value: unknown) {
+function voterKey(value: unknown) {
   const id = sanitizeLine(String(value || ""), 120);
   if (!id) throw new Error("Missing voter id");
-  return {
-    voterKey: `web:${id}`,
-    author: `anon-${
-      id
-        .replace(/[^a-zA-Z0-9]/g, "")
-        .slice(0, 6)
-        .toLowerCase() || "viewer"
-    }`,
-  };
+  return `web:${id}`;
 }
 
 export async function POST(request: Request) {
@@ -37,14 +29,12 @@ export async function POST(request: Request) {
       latest.episode + 1,
       latest.startsAtMs + latest.durationSeconds * 1000,
     );
-    const identity = webIdentity(body.voterId);
 
     return submitPromptProposal({
       roundId: round.id,
       text,
       source: "web",
-      author: identity.author,
-      voterKey: identity.voterKey,
+      voterKey: voterKey(body.voterId),
     });
   });
 

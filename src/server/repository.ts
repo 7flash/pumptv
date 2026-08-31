@@ -1,19 +1,20 @@
 import type {
   Clip,
   Directive,
-  DirectiveSource,
   PumpChatState,
   Resolution,
   RoomState,
   StreamState,
   WorkerState,
 } from "../shared/contracts.ts";
+import { getPromptArena } from "./arbitration.ts";
 import { db } from "./db.ts";
 import { ROOM_NAME } from "./lease.ts";
 import { dbMeasure } from "./observability.ts";
 
 const PUMPFUN_MINT = (process.env.SLOP_PUMPFUN_MINT || "").trim();
 const PUMPFUN_PREFIX = process.env.SLOP_PUMPFUN_PREFIX ?? "!next";
+const PUMPFUN_VOTE_PREFIX = process.env.SLOP_PUMPFUN_VOTE_PREFIX ?? "!vote";
 
 function toClip(row: any): Clip {
   return {
@@ -44,6 +45,7 @@ function toDirective(row: any): Directive {
     author: row.author ?? null,
     authorAddress: row.authorAddress ?? null,
     sourceRoom: row.sourceRoom ?? null,
+    proposalId: row.proposalId ?? null,
   };
 }
 
@@ -59,6 +61,7 @@ function toRoom(row: any, bufferedUntilMs: number | null = null): RoomState {
       enabled: Boolean(PUMPFUN_MINT),
       mint: PUMPFUN_MINT || null,
       prefix: PUMPFUN_PREFIX || null,
+      votePrefix: PUMPFUN_VOTE_PREFIX || null,
       state: PUMPFUN_MINT ? row.pumpChatState || "standby" : "disabled",
       lastError: row.pumpChatError ?? null,
     },
@@ -70,12 +73,12 @@ export function normalizeResolution(value: unknown): Resolution {
 }
 
 export async function getRoomRow() {
-  let row = await dbMeasure.measure("Load room", () =>
+  let row = await dbMeasure.measureSync("Load room", () =>
     db.rooms.select().where({ name: ROOM_NAME }).orderBy("id", "ASC").first(),
   );
 
   if (!row) {
-    row = await dbMeasure.measure("Create room", () =>
+    row = await dbMeasure.measureSync("Create room", () =>
       db.rooms.insert({ name: ROOM_NAME }),
     );
   }
@@ -93,7 +96,7 @@ export async function updateRoomSettings(input: {
   if (input.resolution) patch.resolution = input.resolution;
   if (!Object.keys(patch).length) return room;
 
-  await dbMeasure.measure("Update room settings", () =>
+  await dbMeasure.measureSync("Update room settings", () =>
     db.rooms
       .select()
       .where({ id: room.id })
@@ -107,7 +110,7 @@ export async function setWorkerState(
   error: string | null = null,
 ) {
   const room = await getRoomRow();
-  return dbMeasure.measure("Set worker state", () =>
+  return dbMeasure.measureSync("Set worker state", () =>
     db.rooms
       .select()
       .where({ id: room.id })
@@ -125,7 +128,7 @@ export async function setPumpChatState(
   error: string | null = null,
 ) {
   const room = await getRoomRow();
-  return dbMeasure.measure("Set Pump.fun chat state", () =>
+  return dbMeasure.measureSync("Set Pump.fun chat state", () =>
     db.rooms
       .select()
       .where({ id: room.id })
@@ -138,57 +141,8 @@ export async function setPumpChatState(
   );
 }
 
-export async function enqueueDirective(text: string) {
-  return dbMeasure.measure("Enqueue web directive", () =>
-    db.directives.insert({ text, source: "web" }),
-  );
-}
-
-export async function enqueueExternalDirective(input: {
-  text: string;
-  source: Exclude<DirectiveSource, "web">;
-  sourceId: string;
-  author?: string | null;
-  authorAddress?: string | null;
-  sourceRoom?: string | null;
-}) {
-  const existing = await dbMeasure.measure("Find external directive", () =>
-    db.directives
-      .select()
-      .where({ source: input.source, sourceId: input.sourceId })
-      .orderBy("id", "ASC")
-      .first(),
-  );
-  if (existing) return toDirective(existing);
-
-  const row = await dbMeasure.measure("Enqueue external directive", () =>
-    db.directives.insert({
-      text: input.text,
-      source: input.source,
-      sourceId: input.sourceId,
-      author: input.author ?? null,
-      authorAddress: input.authorAddress ?? null,
-      sourceRoom: input.sourceRoom ?? null,
-    }),
-  );
-  if (row) return toDirective(row);
-
-  // Another adapter process may have received the same external message before
-  // its chat lease handoff completed. The unique index makes this idempotent.
-  const raced = await dbMeasure.measure(
-    "Reload duplicate external directive",
-    () =>
-      db.directives
-        .select()
-        .where({ source: input.source, sourceId: input.sourceId })
-        .orderBy("id", "ASC")
-        .first(),
-  );
-  return raced ? toDirective(raced) : null;
-}
-
 export async function claimQueuedDirective(episode: number) {
-  const queued = await dbMeasure.measure("Get queued directive", () =>
+  const queued = await dbMeasure.measureSync("Get queued directive", () =>
     db.directives
       .select()
       .where({ status: "queued" })
@@ -197,7 +151,7 @@ export async function claimQueuedDirective(episode: number) {
   );
   if (!queued) return null;
 
-  const claimed = await dbMeasure.measure("Claim directive", () =>
+  const claimed = await dbMeasure.measureSync("Claim directive", () =>
     db.directives
       .select()
       .where({ id: (queued as any).id })
@@ -208,14 +162,25 @@ export async function claimQueuedDirective(episode: number) {
   return toDirective({ ...queued, status: "generating", usedEpisode: episode });
 }
 
+export async function hasQueuedDirective() {
+  const row = await dbMeasure.measureSync("Check queued directive", () =>
+    db.directives
+      .select("id")
+      .where({ status: "queued" })
+      .orderBy("id", "ASC")
+      .first(),
+  );
+  return Boolean(row);
+}
+
 export async function completeDirective(id: number) {
-  return dbMeasure.measure("Complete directive", () =>
+  return dbMeasure.measureSync("Complete directive", () =>
     db.directives.select().where({ id }).updateAll({ status: "used" }),
   );
 }
 
 export async function releaseDirective(id: number) {
-  return dbMeasure.measure("Release directive", () =>
+  return dbMeasure.measureSync("Release directive", () =>
     db.directives
       .select()
       .where({ id })
@@ -224,17 +189,18 @@ export async function releaseDirective(id: number) {
 }
 
 export async function recoverGeneratingDirectives() {
-  const rows = await dbMeasure.measure("Load abandoned directives", () =>
+  const rows = await dbMeasure.measureSync("Load abandoned directives", () =>
     db.directives.select().where({ status: "generating" }).all(),
   );
 
   for (const row of rows || []) {
     const directive = row as any;
-    const clip = await dbMeasure.measure("Check recovered directive clip", () =>
-      db.clips.select("id").where({ directiveId: directive.id }).first(),
+    const clip = await dbMeasure.measureSync(
+      "Check recovered directive clip",
+      () => db.clips.select("id").where({ directiveId: directive.id }).first(),
     );
 
-    await dbMeasure.measure("Recover abandoned directive", () =>
+    await dbMeasure.measureSync("Recover abandoned directive", () =>
       db.directives
         .select()
         .where({ id: directive.id })
@@ -246,21 +212,21 @@ export async function recoverGeneratingDirectives() {
 }
 
 export async function recentStory(limit = 6) {
-  const rows = await dbMeasure.measure("Load recent canon", () =>
+  const rows = await dbMeasure.measureSync("Load recent canon", () =>
     db.clips.select("directive").orderBy("episode", "DESC").limit(limit).all(),
   );
   return (rows || []).reverse().map((row: any) => row.directive as string);
 }
 
 export async function nextEpisode() {
-  const row = await dbMeasure.measure("Load latest episode", () =>
+  const row = await dbMeasure.measureSync("Load latest episode", () =>
     db.clips.select("episode").orderBy("episode", "DESC").first(),
   );
   return row ? Number((row as any).episode) + 1 : 0;
 }
 
 export async function saveClip(input: Omit<Clip, "id">) {
-  const row = await dbMeasure.measure("Persist generated clip", () =>
+  const row = await dbMeasure.measureSync("Persist generated clip", () =>
     db.clips.insert(input),
   );
   if (!row) throw new Error("Failed to persist generated clip");
@@ -268,7 +234,7 @@ export async function saveClip(input: Omit<Clip, "id">) {
 }
 
 export async function getLatestClip(): Promise<Clip | null> {
-  const row = await dbMeasure.measure("Load latest clip", () =>
+  const row = await dbMeasure.measureSync("Load latest clip", () =>
     db.clips.select().orderBy("episode", "DESC").first(),
   );
   if (!row) return null;
@@ -277,34 +243,37 @@ export async function getLatestClip(): Promise<Clip | null> {
   if (clip.startsAtMs > 0) return clip;
 
   const startsAtMs = Date.now() + 400;
-  await dbMeasure.measure("Repair legacy clip schedule", () =>
+  await dbMeasure.measureSync("Repair legacy clip schedule", () =>
     db.clips.select().where({ id: clip.id }).updateAll({ startsAtMs }),
   );
   return { ...clip, startsAtMs };
 }
 
 export async function getTimeline(limit = 16): Promise<Clip[]> {
-  const rows = await dbMeasure.measure("Load timeline window", () =>
+  const rows = await dbMeasure.measureSync("Load timeline window", () =>
     db.clips.select().orderBy("episode", "DESC").limit(limit).all(),
   );
   return (rows || [])
     .reverse()
     .map(toClip)
-    .filter((clip) => clip.startsAtMs > 0);
+    .filter((clip: Clip) => clip.startsAtMs > 0);
 }
 
 export async function getStreamState(): Promise<StreamState> {
   const serverNowMs = Date.now();
-  const [roomRow, timeline, directives, queuedCount] = await Promise.all([
-    getRoomRow(),
-    getTimeline(),
-    dbMeasure.measure("Load recent directives", () =>
-      db.directives.select().orderBy("id", "DESC").limit(20).all(),
-    ),
-    dbMeasure.measure("Count queued directives", () =>
-      db.directives.select().where({ status: "queued" }).count(),
-    ),
-  ]);
+  const [roomRow, timeline, directives, queuedCount, arena] = await Promise.all(
+    [
+      getRoomRow(),
+      getTimeline(),
+      dbMeasure.measureSync("Load recent directives", () =>
+        db.directives.select().orderBy("id", "DESC").limit(12).all(),
+      ),
+      dbMeasure.measureSync("Count queued directives", () =>
+        db.directives.select().where({ status: "queued" }).count(),
+      ),
+      getPromptArena(),
+    ],
+  );
 
   const latestClip = timeline.length ? timeline[timeline.length - 1] : null;
   const currentClip =
@@ -324,6 +293,7 @@ export async function getStreamState(): Promise<StreamState> {
     latestClip,
     timeline,
     recentDirectives: (directives || []).reverse().map(toDirective),
+    arena,
     queuedCount: Number(queuedCount || 0),
   };
 }

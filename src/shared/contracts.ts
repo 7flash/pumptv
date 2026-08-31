@@ -4,6 +4,8 @@ export type DirectiveSource = "web" | "pumpfun";
 export type WorkerState = "idle" | "generating" | "error";
 export type PumpChatState =
   "disabled" | "standby" | "connecting" | "live" | "error";
+export type ProposalStatus = "open" | "selected" | "lost";
+export type PromptRoundStatus = "open" | "closed";
 
 export type Clip = {
   id: number;
@@ -31,12 +33,38 @@ export type Directive = {
   author: string | null;
   authorAddress: string | null;
   sourceRoom: string | null;
+  proposalId: number | null;
+};
+
+export type PromptProposal = {
+  id: number;
+  roundId: number;
+  text: string;
+  status: ProposalStatus;
+  source: DirectiveSource;
+  sourceId: string | null;
+  author: string | null;
+  authorAddress: string | null;
+  sourceRoom: string | null;
+  voteCount: number;
+};
+
+export type PromptRound = {
+  id: number;
+  targetEpisode: number;
+  status: PromptRoundStatus;
+  openedAtMs: number;
+  closesAtMs: number;
+  closedAtMs: number | null;
+  winnerProposalId: number | null;
+  proposals: PromptProposal[];
 };
 
 export type PumpfunChatStatus = {
   enabled: boolean;
   mint: string | null;
   prefix: string | null;
+  votePrefix: string | null;
   state: PumpChatState;
   lastError: string | null;
 };
@@ -58,5 +86,6 @@ export type StreamState = {
   latestClip: Clip | null;
   timeline: Clip[];
   recentDirectives: Directive[];
+  arena: PromptRound | null;
   queuedCount: number;
 };

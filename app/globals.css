@@ -83,3 +83,58 @@ footer { display: flex; justify-content: space-between; gap: 8px; padding: 10px 
 .message.generating span { animation: pulse 1s ease-in-out infinite alternate; }
 @keyframes pulse { from { opacity: .45; } to { opacity: 1; } }
 .qualityReadout { color: #666; font-size: 9px; font-weight: 900; letter-spacing: .08em; }
+
+.voteOverlay {
+  position: absolute;
+  top: 72px;
+  right: 24px;
+  display: flex;
+  align-items: baseline;
+  gap: 9px;
+  padding: 8px 10px;
+  border: 1px solid rgba(231,255,69,.25);
+  border-radius: 9px;
+  background: rgba(0,0,0,.62);
+  backdrop-filter: blur(10px);
+  font-size: 9px;
+  letter-spacing: .1em;
+  text-transform: uppercase;
+}
+.voteOverlay span { color: #a1a19a; }
+.voteOverlay strong { color: #e7ff45; font-size: 12px; }
+.voteOverlay em { color: #6e6e68; font-style: normal; }
+.arena { display: grid; gap: 10px; }
+.arenaHeader { display: flex; align-items: end; justify-content: space-between; gap: 12px; }
+.arenaHeader div { display: grid; gap: 3px; }
+.arenaHeader span, .canonDivider { color: #66665f; font-size: 8px; font-weight: 900; letter-spacing: .14em; }
+.arenaHeader strong { color: #e7ff45; font-size: 11px; letter-spacing: .08em; }
+.arenaHeader > b { color: #8f8f89; font-size: 9px; }
+.candidates { display: grid; gap: 7px; }
+.candidate {
+  width: 100%;
+  border: 1px solid #292927;
+  border-radius: 9px;
+  padding: 10px 11px;
+  background: #131312;
+  color: #dddcd5;
+  text-align: left;
+  transition: border-color .12s ease, transform .12s ease, background .12s ease;
+}
+.candidate:not(:disabled):hover { transform: translateY(-1px); border-color: #55554f; }
+.candidate.myVote { border-color: rgba(231,255,69,.55); background: rgba(231,255,69,.055); }
+.candidate.winner { border-color: #e7ff45; background: rgba(231,255,69,.09); }
+.candidate:disabled { cursor: default; opacity: .68; }
+.candidateMeta { display: flex; align-items: center; gap: 7px; margin-bottom: 6px; }
+.candidateMeta b { color: #e7ff45; font-size: 10px; }
+.candidateMeta em { color: #777771; font-size: 8px; font-style: normal; font-weight: 900; letter-spacing: .08em; }
+.candidateMeta strong { margin-left: auto; color: #999991; font-size: 8px; letter-spacing: .08em; }
+.candidateText { display: block; font-size: 12px; line-height: 1.42; }
+.emptyBallot { padding: 14px 12px; border: 1px dashed #2a2a27; border-radius: 9px; color: #686862; font-size: 11px; line-height: 1.45; }
+.canonDivider { padding-top: 4px; }
+.composer textarea:disabled { opacity: .58; cursor: not-allowed; }
+.composerBottom button:disabled { opacity: .35; cursor: not-allowed; }
+.systemMessage b { color: #bcbcB5; }
+
+@media (max-width: 900px) {
+  .voteOverlay { top: 64px; right: 14px; }
+}

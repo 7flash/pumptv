@@ -1,358 +1,260 @@
 # SLOP TV
 
-One endless AI-generated livestream, one shared canon, many viewers steering what happens next — now including **Pump.fun live chat as a first-class prompt source**.
+An endless shared AI-generated livestream where the audience decides what happens next. v0.5 replaces the unbounded prompt FIFO with a **scene ballot**: web viewers and Pump.fun chat propose ideas, each identity gets one movable vote, one winner becomes canon, and every losing idea expires.
 
-This version uses the stack deliberately:
+## Stack
 
-- **TradJS** for SSR, file-system API routes, streaming `Response`s, and the `tradjs/client` frontend.
-- **sqlite-zod-orm** for the room record, durable multi-source prompt queue, generated clip timeline, and leases.
-- **measure-fn** for scoped HTTP / DB / fal / worker / Pump.fun traces.
-- **fal + MiniMax H3 Max** for video generation.
-- **fal FFmpeg Extract Frame** for server-side last-frame continuity.
-- A tiny **read-only Pump.fun Socket.IO adapter** over `ws`, isolated from the rest of the app.
+- **TradJS** server + `tradjs/client` frontend
+- **sqlite-zod-orm** for rooms, ballots, proposals, votes, winning directives, clips, and leases
+- **measure-fn** for HTTP / DB / arbitration / worker / Pump.fun / fal boundaries
+- **fal + MiniMax H3 Max** for video
+- **fal FFmpeg Extract Frame** for server-side last-frame continuity
+- a small read-only Pump.fun Socket.IO adapter over `ws`
 
-The generator is still authoritative. Pump.fun is only an ingress source: a chat message becomes a persisted directive and then waits in the exact same FIFO as prompts submitted from the TradJS frontend.
-
-## Run it
-
-This is Bun-first.
+## Run
 
 ```bash
 cp .env.example .env
-# add FAL_KEY
+# add FAL_KEY and optionally SLOP_PUMPFUN_MINT
 bun install
-```
-
-For local development, run web + worker together:
-
-```bash
 bun run dev:all
 ```
 
-Or run them separately, which is closer to production:
+Or run web and worker separately:
 
 ```bash
-# terminal 1
 bun run dev
-
-# terminal 2
 bun run worker
 ```
 
 Open `http://localhost:3000`.
 
-## Pump.fun chat setup
+## Pump.fun commands
 
-Take the token/mint from the Pump.fun live-chat URL:
-
-```text
-https://pump.fun/livechat/<MINT>
-```
-
-Then configure:
+Configure the token/mint:
 
 ```bash
-SLOP_PUMPFUN_MINT=3VkUe5T9uAuU6EqmEMqQcuTRqEcqU86NAfwbFZKxpump
+SLOP_PUMPFUN_MINT=<TOKEN_MINT>
 SLOP_PUMPFUN_PREFIX=!next
+SLOP_PUMPFUN_VOTE_PREFIX=!vote
 ```
 
-With that default prefix, this Pump.fun chat message:
+A chat message proposes a candidate **and automatically casts that wallet/username's vote for it**:
 
 ```text
-!next a chrome dolphin crashes through the casino ceiling
+!next the raccoon opens the VHS and a tiny weather system falls out
 ```
 
-becomes the next durable directive:
+The stream UI displays candidate IDs and live vote totals. A viewer can move their one vote during the same round:
 
 ```text
-a chrome dolphin crashes through the casino ceiling
+!vote 42
 ```
 
-If you want **every live Pump.fun chat message** to steer the stream, leave the prefix empty:
+`!vote #42` is accepted too.
+
+If `SLOP_PUMPFUN_PREFIX=` is empty, every non-vote chat message becomes a proposal. Exact duplicate proposal text is merged into one candidate instead of creating backlog.
+
+The Pump.fun adapter is read-only: no wallet credentials, posting, trading, or transaction signing.
+
+## Why ballots instead of FIFO
+
+The old architecture could accumulate hundreds of prompts while H3 generated one five-second scene at a time. v0.5 changes the state machine to:
+
+```text
+current generated buffer
+        │
+        ▼
+┌──────────────────────┐
+│ scene ballot OPEN    │
+│ !next / web proposal │
+│ one vote per identity│
+└──────────┬───────────┘
+           │ deadline or playback safety threshold
+           ▼
+┌──────────────────────┐
+│ atomically LOCK      │
+│ rank votes DESC      │
+│ tie: earliest idea   │
+└──────────┬───────────┘
+           │
+           ├── winner -> durable directive -> H3 Max -> canon
+           │
+           └── losers -> expired forever
+```
+
+There is normally only one committed directive waiting for generation: the winning ballot. A crashed generation releases that winner back to `queued` and retries it rather than reopening voting and potentially changing canon.
+
+## Playback-safe voting window
+
+Defaults:
 
 ```bash
-SLOP_PUMPFUN_PREFIX=
+SLOP_TARGET_BUFFER_MS=6500
+SLOP_PROMPT_WINDOW_MS=4500
+SLOP_GENERATION_LEAD_MS=3000
 ```
 
-Only new `message` events are ingested. Message-history payloads are intentionally ignored so restarting the worker does not replay old chat into the future.
+The ballot can stay open for up to 4.5 seconds. The authoritative worker also knows how much video remains buffered. If only the generation lead remains, it locks the ballot early and starts H3 rather than intentionally causing a stream underrun.
 
-Reading the current live chat does not require a Pump.fun auth token. This integration intentionally does **not** send messages, trade, sign transactions, or require wallet credentials.
-
-The Pump.fun live-chat transport is not a stable official public API contract, so the wire protocol is isolated in `src/server/pumpfun-socket.ts`. If Pump.fun changes its Socket.IO protocol later, the queue/generator architecture does not need to change.
-
-## Architecture
+This means the real ballot deadline is approximately:
 
 ```text
- Pump.fun live chat                         TradJS web chat
-        │                                        │
-        │ Socket.IO                              │ POST /api/directives
-        ▼                                        ▼
-┌───────────────────┐                    ┌──────────────────┐
-│ Pump.fun adapter  │                    │   TradJS route   │
-│ dedicated DB lease│                    └────────┬─────────┘
-└─────────┬─────────┘                             │
-          │ source=pumpfun                        │ source=web
-          │ message id / user / wallet            │
-          └──────────────────┬────────────────────┘
+min(
+  ballot_open_time + SLOP_PROMPT_WINDOW_MS,
+  end_of_generated_buffer - SLOP_GENERATION_LEAD_MS
+)
+```
+
+If fal latency changes, tune `SLOP_GENERATION_LEAD_MS` from measured production inference times.
+
+## Persistent arbitration model
+
+### `promptRounds`
+
+```text
+targetEpisode
+status              open | closed
+openedAtMs
+closesAtMs
+closedAtMs
+winnerProposalId
+```
+
+A partial SQLite unique index permits only one `status='open'` round.
+
+### `proposals`
+
+```text
+roundId
+text
+normalizedText
+status              open | selected | lost
+source              web | pumpfun
+sourceId
+author
+authorAddress
+sourceRoom
+```
+
+`(roundId, normalizedText)` is unique, so exact duplicate ideas merge.
+
+### `proposalVotes`
+
+```text
+roundId
+proposalId
+voterKey
+source
+sourceId
+```
+
+`(roundId, voterKey)` is unique. Casting another vote updates that row, so one wallet/viewer cannot stack votes across candidates in the same scene.
+
+Pump.fun voter identity prefers wallet/address, then username, then the durable message ID as a final fallback. Web clients get a random local voter ID stored in `localStorage`.
+
+**Prototype trust boundary:** localStorage identity is intentionally lightweight and can be reset/spoofed. Before a high-stakes public launch, put web voting behind a stronger session/rate-limit layer. Pump.fun wallet/address identity is still only as trustworthy as the live-chat event data being consumed.
+
+## Winning directive / crash safety
+
+The ballot lock happens inside `BEGIN IMMEDIATE`. In the same transaction the winner is marked `selected`, losers are marked `lost`, and one durable `directives` row is inserted with `proposalId`.
+
+Generation remains:
+
+```text
+queued -> generating -> used
+             |
+             └── crash/error -> queued -> retry same winner
+```
+
+No failed generation can silently pick a different chat winner.
+
+## Shared-room architecture
+
+```text
+ Pump.fun live chat                          TradJS viewer
+  !next / !vote                           propose / vote
+        │                                      │
+        ▼                                      ▼
+┌───────────────────┐                 ┌──────────────────┐
+│ leased Pump ingress│                │ TradJS API routes│
+└─────────┬─────────┘                 └────────┬─────────┘
+          └──────────────────┬─────────────────┘
                              ▼
-                     sqlite-zod-orm
-                  persistent shared FIFO
+                       sqlite-zod-orm
+                 promptRounds / proposals / votes
+                             │
+                    authoritative room worker
+                             │
+                      atomic ballot lock
+                             │
+                    one winning directive
+                             │
+            previous clip -> last-frame extract
                              │
                              ▼
-                    authoritative worker
-                  renewable generation lease
+                        H3 Max on fal
                              │
-             ┌───────────────┴───────────────┐
-             │                               │
-             ▼                               ▼
-    fal FFmpeg extract-frame          prompt + recent canon
-      previous video → last frame             │
-             │                               │
-             └───────────────┬───────────────┘
-                             ▼
-                      MiniMax H3 Max
+                      durable clip timeline
                              │
-                             ▼
-                     persist next clip
-                             │
-                             ▼
-                    shared live timeline
-                             │
-                      TradJS SSE fanout
+                       TradJS SSE fanout
                     ┌────────┼────────┐
                     ▼        ▼        ▼
                  viewer A viewer B viewer N
 ```
 
-Pump.fun ingestion and video generation use **separate leases**. That matters because the chat connection should stay open continuously while the generator lease is intentionally short-lived and only protects one clip-generation transaction.
+Generation and Pump.fun ingress keep separate renewable SQLite leases. Ballot state itself is durable, so web processes and the Pump.fun worker can contribute concurrently without owning generation.
+
+## API surface
+
+```text
+GET  /api/state       initial shared snapshot + ballot
+GET  /api/events      SSE snapshots
+POST /api/proposals   { text, voterId }
+POST /api/votes       { proposalId, voterId }
+PATCH /api/room       admin running/resolution
+```
+
+`POST /api/directives` remains a compatibility alias for `/api/proposals`; public callers can no longer bypass arbitration into the generation FIFO.
 
 ## Project shape
 
 ```text
 app/
-  layout.tsx
-  page.tsx
-  page.client.tsx             # tradjs/client: playback + web prompt entry
-  globals.css
+  page.client.tsx             # tradjs/client playback + ballot UI
   api/
-    directives/route.ts       # enqueue source=web directive
-    events/route.ts           # SSE room/timeline stream
-    room/route.ts             # admin room settings
-    state/route.ts            # initial snapshot / fallback
+    proposals/route.ts
+    votes/route.ts
+    directives/route.ts       # compatibility alias
+    events/route.ts
+    state/route.ts
+    room/route.ts
 
 src/
-  worker.ts                    # generation + Pump.fun ingestor entry
-  shared/
-    contracts.ts
+  worker.ts
+  shared/contracts.ts
   server/
-    db.ts                      # sqlite-zod-orm schemas + source idempotency index
-    repository.ts              # all durable app state
-    lease.ts                   # atomic generation lease
-    pumpfun-lease.ts           # atomic Pump.fun connection lease
-    pumpfun.ts                 # leased Pump.fun ingress + queue adapter
-    pumpfun-socket.ts          # tiny Socket.IO read protocol over ws
-    worker.ts                  # room generation loop + buffer policy
-    generate.ts                # frame extraction + H3 generation
-    prompt.ts                  # continuity/showrunner prompt
-    state-stream.ts            # one DB poller, SSE fanout to viewers
-    observability.ts           # measure-fn scopes
+    arbitration.ts            # rounds, proposal merge, one-vote rule, atomic winner
+    db.ts                     # sqlite-zod-orm schemas + durable indexes
+    repository.ts
+    lease.ts
+    pumpfun-lease.ts
+    pumpfun.ts                # !next / !vote adapter
+    pumpfun-socket.ts
+    worker.ts                 # buffer-aware ballot deadline + generation
+    generate.ts
+    prompt.ts
+    state-stream.ts
+    observability.ts
 ```
-
-Dependency direction:
-
-```text
-tradjs/client ───────────────> JSON/SSE only
-
-Pump.fun ─> pumpfun adapter ─┐
-                            ├─> repository ─> sqlite-zod-orm
-TradJS routes ───────────────┘       ▲
-                                    │
-authoritative worker ───────> generate ─────> fal
-          │
-          └─────────────────> SQLite generation lease
-```
-
-## Directive persistence
-
-Directives are now source-aware:
-
-```text
-id
-text
-status             queued | generating | used
-usedEpisode
-source             web | pumpfun
-sourceId           Pump.fun message id, nullable for web
- author            Pump.fun username
- authorAddress     Pump.fun wallet/address
- sourceRoom        Pump.fun mint/room
-```
-
-Pump.fun messages have a durable `(source, sourceId)` uniqueness constraint. If the chat socket reconnects, or one adapter process hands the lease to another, receiving the same Pump.fun message twice cannot enqueue it twice.
-
-The generation state machine remains crash-safe:
-
-```text
-queued -> generating -> used
-             |
-             └-- worker crashes --> recovered on next generation lease
-```
-
-The generator does not care where a directive came from. `claimQueuedDirective()` always claims the oldest queued row, which means web and Pump.fun prompts naturally share one canon.
-
-## Pump.fun adapter behavior
-
-The worker executable runs two independent loops:
-
-```ts
-await Promise.all([
-  runRoomWorker(),
-  runPumpfunChatIngestor(),
-]);
-```
-
-Only one process is allowed to own the Pump.fun connection at a time. The adapter acquires `pumpChatLeaseOwner`, renews it while connected, and disconnects if the lease is lost. Another worker can then take over after expiry.
-
-The socket adapter reconnects with bounded exponential backoff while the process still owns the chat lease. Losing the lease aborts the socket and reconnect loop immediately. Adapter state is persisted into the room as:
-
-```text
-disabled | standby | connecting | live | error
-```
-
-That status is exposed through `/api/state` and SSE, so the viewer UI can show whether Pump.fun ingress is actually live.
-
-### Prompt filtering
-
-`SLOP_PUMPFUN_PREFIX=!next` is recommended for a public stream because normal Pump.fun conversation can be much faster than five-second video generation.
-
-Set an empty prefix for the original “anything in chat becomes the future” behavior.
-
-There is also an optional per-user throttle:
-
-```bash
-SLOP_PUMPFUN_USER_COOLDOWN_MS=0
-```
-
-`0` means no throttling. Raising it to e.g. `2000` accepts at most one matching prompt from a wallet/username every two seconds. Deduplication by message ID still applies independently.
-
-## Persistence model
-
-### `rooms`
-
-The room contains global server state plus two independent leases:
-
-- `running`
-- `resolution`
-- `workerState`: `idle | generating | error`
-- `lastError`
-- `leaseOwner` / `leaseUntilMs` / `heartbeatAtMs`
-- `pumpChatState` / `pumpChatError`
-- `pumpChatLeaseOwner` / `pumpChatLeaseUntilMs` / `pumpChatHeartbeatAtMs`
-
-### `directives`
-
-Web and Pump.fun prompt sources share the same table and FIFO.
-
-### `clips`
-
-Each clip persists:
-
-- fal request ID / video URL
-- viewer/chat/autopilot directive + `directiveId`
-- episode number
-- extracted continuity-frame URL
-- resolution / inference timing
-- `startsAtMs`
-- `durationSeconds`
-
-`startsAtMs` turns generated clips into a real shared wall-clock timeline. Every browser computes which clip should be playing from server time, so late joiners enter the same moment instead of starting at episode 1.
-
-## Generation worker / lease behavior
-
-The generator maintains a small future buffer instead of generating as fast as fal allows.
-
-Default target:
-
-```text
-SLOP_TARGET_BUFFER_MS=6500
-```
-
-With five-second clips, this keeps roughly one clip ahead. When enough future video exists, the worker sleeps. When the buffer drops below target, it tries to acquire the generation lease and generate exactly one successor.
-
-The lease is acquired with `BEGIN IMMEDIATE` through `sqlite-zod-orm`'s raw SQL escape hatch and renewed while a long fal request is in flight. If a process dies, its lease expires and another worker can take over.
-
-## Continuity
-
-For episode 1:
-
-```text
-text prompt -> H3 Max text-to-video
-```
-
-For every later episode:
-
-```text
-previous video URL
-      |
-      v
-fal-ai/ffmpeg-api/extract-frame
-      frame_type: last
-      |
-      v
-last-frame image URL
-      |
-      v
-H3 Max image-to-video
-```
-
-## Live delivery
-
-`/api/events` is Server-Sent Events. Each TradJS web process runs **one** state polling loop and fans the resulting snapshot out to all connected viewers, rather than performing a separate SQLite poll per viewer.
-
-The client keeps a server-clock offset and advances clips locally at their shared wall-clock boundary.
-
-## Room admin
-
-Generation controls are server-side. The public viewer UI cannot pause the global room or change everyone else's quality.
-
-Set an admin token in production:
-
-```bash
-SLOP_ADMIN_TOKEN=change-me
-```
-
-Pause generation:
-
-```bash
-curl -X PATCH http://localhost:3000/api/room \
-  -H 'content-type: application/json' \
-  -H 'x-slop-admin-token: change-me' \
-  -d '{"running":false}'
-```
-
-Resume at 480P:
-
-```bash
-curl -X PATCH http://localhost:3000/api/room \
-  -H 'content-type: application/json' \
-  -H 'x-slop-admin-token: change-me' \
-  -d '{"running":true,"resolution":"480P"}'
-```
-
-When `SLOP_ADMIN_TOKEN` is empty, the PATCH route is intentionally open for local development.
 
 ## measure-fn scopes
 
-- `http` — TradJS API work
-- `db` — durable queue / timeline / room operations
-- `fal` — frame extraction + H3 generation
-- `worker` — room generation ticks
-- `pumpfun` — chat lease sessions + prompt ingestion
+- `http`
+- `db`
+- `arbitration`
+- `worker`
+- `pumpfun`
+- `fal`
 
-Raw SQL remains tiny and isolated to lease/idempotency boundaries; all application persistence still goes through the same `sqlite-zod-orm` database instance.
-
-## Production boundary
-
-This remains appropriate for one room on one shared SQLite volume. Multiple TradJS web processes are fine; multiple worker processes are protected by both the generation lease and Pump.fun ingress lease.
-
-For a very busy Pump.fun room, the next feature should be **prompt arbitration rather than an unbounded FIFO**: collect chat for each five-second window, rank/vote/merge the strongest requests, then persist one scene directive. The current source-aware schema is designed so that can be added without changing playback or generation.
+The important latency to watch in production is the distribution from **ballot lock → generated clip persisted**. That measurement should drive the generation-lead setting rather than a fixed guess forever.

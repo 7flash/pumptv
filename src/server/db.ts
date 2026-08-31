@@ -41,6 +41,33 @@ const openedDb = measureSync(
           author: z.string().nullable().default(null),
           authorAddress: z.string().nullable().default(null),
           sourceRoom: z.string().nullable().default(null),
+          proposalId: z.number().nullable().default(null),
+        }),
+        promptRounds: z.object({
+          targetEpisode: z.number(),
+          status: z.enum(["open", "closed"]).default("open"),
+          openedAtMs: z.number(),
+          closesAtMs: z.number(),
+          closedAtMs: z.number().nullable().default(null),
+          winnerProposalId: z.number().nullable().default(null),
+        }),
+        proposals: z.object({
+          roundId: z.number(),
+          text: z.string(),
+          normalizedText: z.string(),
+          status: z.enum(["open", "selected", "lost"]).default("open"),
+          source: z.enum(["web", "pumpfun"]).default("web"),
+          sourceId: z.string().nullable().default(null),
+          author: z.string().nullable().default(null),
+          authorAddress: z.string().nullable().default(null),
+          sourceRoom: z.string().nullable().default(null),
+        }),
+        proposalVotes: z.object({
+          roundId: z.number(),
+          proposalId: z.number(),
+          voterKey: z.string(),
+          source: z.enum(["web", "pumpfun"]).default("web"),
+          sourceId: z.string().nullable().default(null),
         }),
         clips: z.object({
           requestId: z.string(),
@@ -64,12 +91,32 @@ const openedDb = measureSync(
 if (!openedDb) throw new Error("Could not open SQLite database");
 export const db = openedDb;
 
-// Durable idempotency for external chat ingestion. Existing web directives have
-// sourceId=NULL and are intentionally unaffected by this partial unique index.
 measureSync("Create directive source index", () =>
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS directives_source_source_id_unique
      ON directives(source, sourceId)
      WHERE sourceId IS NOT NULL`,
+  ),
+);
+
+measureSync("Create one-open-round index", () =>
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS prompt_rounds_one_open_unique
+     ON promptRounds(status)
+     WHERE status = 'open'`,
+  ),
+);
+
+measureSync("Create proposal merge index", () =>
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS proposals_round_text_unique
+     ON proposals(roundId, normalizedText)`,
+  ),
+);
+
+measureSync("Create proposal voter index", () =>
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS proposal_votes_round_voter_unique
+     ON proposalVotes(roundId, voterKey)`,
   ),
 );
