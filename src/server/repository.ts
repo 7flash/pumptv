@@ -1,6 +1,8 @@
 import type {
   Clip,
   Directive,
+  DirectiveSource,
+  PumpChatState,
   Resolution,
   RoomState,
   StreamState,
@@ -9,6 +11,9 @@ import type {
 import { db } from "./db.ts";
 import { ROOM_NAME } from "./lease.ts";
 import { dbMeasure } from "./observability.ts";
+
+const PUMPFUN_MINT = (process.env.SLOP_PUMPFUN_MINT || "").trim();
+const PUMPFUN_PREFIX = process.env.SLOP_PUMPFUN_PREFIX ?? "!next";
 
 function toClip(row: any): Clip {
   return {
@@ -34,6 +39,11 @@ function toDirective(row: any): Directive {
     text: row.text,
     status: row.status,
     usedEpisode: row.usedEpisode ?? null,
+    source: row.source || "web",
+    sourceId: row.sourceId ?? null,
+    author: row.author ?? null,
+    authorAddress: row.authorAddress ?? null,
+    sourceRoom: row.sourceRoom ?? null,
   };
 }
 
@@ -45,6 +55,13 @@ function toRoom(row: any, bufferedUntilMs: number | null = null): RoomState {
     workerState: row.workerState,
     lastError: row.lastError ?? null,
     bufferedUntilMs,
+    pumpfun: {
+      enabled: Boolean(PUMPFUN_MINT),
+      mint: PUMPFUN_MINT || null,
+      prefix: PUMPFUN_PREFIX || null,
+      state: PUMPFUN_MINT ? row.pumpChatState || "standby" : "disabled",
+      lastError: row.pumpChatError ?? null,
+    },
   };
 }
 
@@ -103,10 +120,71 @@ export async function setWorkerState(
   );
 }
 
-export async function enqueueDirective(text: string) {
-  return dbMeasure.measure("Enqueue directive", () =>
-    db.directives.insert({ text }),
+export async function setPumpChatState(
+  state: PumpChatState,
+  error: string | null = null,
+) {
+  const room = await getRoomRow();
+  return dbMeasure.measure("Set Pump.fun chat state", () =>
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({
+        pumpChatState: state,
+        pumpChatError: error
+          ? error.replace(/\s+/g, " ").trim().slice(0, 600)
+          : null,
+      }),
   );
+}
+
+export async function enqueueDirective(text: string) {
+  return dbMeasure.measure("Enqueue web directive", () =>
+    db.directives.insert({ text, source: "web" }),
+  );
+}
+
+export async function enqueueExternalDirective(input: {
+  text: string;
+  source: Exclude<DirectiveSource, "web">;
+  sourceId: string;
+  author?: string | null;
+  authorAddress?: string | null;
+  sourceRoom?: string | null;
+}) {
+  const existing = await dbMeasure.measure("Find external directive", () =>
+    db.directives
+      .select()
+      .where({ source: input.source, sourceId: input.sourceId })
+      .orderBy("id", "ASC")
+      .first(),
+  );
+  if (existing) return toDirective(existing);
+
+  const row = await dbMeasure.measure("Enqueue external directive", () =>
+    db.directives.insert({
+      text: input.text,
+      source: input.source,
+      sourceId: input.sourceId,
+      author: input.author ?? null,
+      authorAddress: input.authorAddress ?? null,
+      sourceRoom: input.sourceRoom ?? null,
+    }),
+  );
+  if (row) return toDirective(row);
+
+  // Another adapter process may have received the same external message before
+  // its chat lease handoff completed. The unique index makes this idempotent.
+  const raced = await dbMeasure.measure(
+    "Reload duplicate external directive",
+    () =>
+      db.directives
+        .select()
+        .where({ source: input.source, sourceId: input.sourceId })
+        .orderBy("id", "ASC")
+        .first(),
+  );
+  return raced ? toDirective(raced) : null;
 }
 
 export async function claimQueuedDirective(episode: number) {
@@ -221,7 +299,7 @@ export async function getStreamState(): Promise<StreamState> {
     getRoomRow(),
     getTimeline(),
     dbMeasure.measure("Load recent directives", () =>
-      db.directives.select().orderBy("id", "DESC").limit(16).all(),
+      db.directives.select().orderBy("id", "DESC").limit(20).all(),
     ),
     dbMeasure.measure("Count queued directives", () =>
       db.directives.select().where({ status: "queued" }).count(),

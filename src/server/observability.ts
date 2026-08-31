@@ -9,3 +9,4 @@ export const httpMeasure = createMeasure("http");
 export const dbMeasure = createMeasure("db");
 export const falMeasure = createMeasure("fal");
 export const workerMeasure = createMeasure("worker");
+export const pumpMeasure = createMeasure("pumpfun");

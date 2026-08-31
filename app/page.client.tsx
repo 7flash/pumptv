@@ -164,11 +164,22 @@ function bufferLabel() {
 }
 
 function directiveLabel(directive: Directive) {
-  if (directive.status === "queued") return "QUEUED";
+  const source =
+    directive.source === "pumpfun"
+      ? `PUMP.FUN${directive.author ? ` · @${directive.author}` : ""}`
+      : "WEB";
+
+  if (directive.status === "queued") return `${source} · QUEUED`;
   if (directive.status === "generating") {
-    return `GENERATING${directive.usedEpisode !== null ? ` · EP ${directive.usedEpisode + 1}` : ""}`;
+    return `${source} · GENERATING${directive.usedEpisode !== null ? ` · EP ${directive.usedEpisode + 1}` : ""}`;
   }
-  return `USED${directive.usedEpisode !== null ? ` · EP ${directive.usedEpisode + 1}` : ""}`;
+  return `${source} · USED${directive.usedEpisode !== null ? ` · EP ${directive.usedEpisode + 1}` : ""}`;
+}
+
+function pumpfunLabel() {
+  if (!room?.pumpfun.enabled) return "PUMP.FUN OFF";
+  const mode = room.pumpfun.prefix ? room.pumpfun.prefix : "ALL CHAT";
+  return `PUMP.FUN ${room.pumpfun.state.toUpperCase()} · ${mode}`;
 }
 
 function App() {
@@ -215,6 +226,9 @@ function App() {
             {current?.directive || "The room worker is manufacturing reality…"}
           </p>
           {room?.lastError ? <p className="error">{room.lastError}</p> : null}
+          {room?.pumpfun.lastError ? (
+            <p className="error">Pump.fun: {room.pumpfun.lastError}</p>
+          ) : null}
           {error ? <p className="error">{error}</p> : null}
         </div>
       </section>
@@ -224,8 +238,8 @@ function App() {
           <div>
             <h1>WRITE THE NEXT SCENE</h1>
             <p>
-              Everyone watches one authoritative timeline. Your message enters
-              its persistent FIFO future.
+              Web prompts and Pump.fun live chat enter the same persistent FIFO
+              future.
             </p>
           </div>
           <div className={`workerBadge ${room?.workerState || "idle"}`}>
@@ -235,9 +249,10 @@ function App() {
 
         <div className="messages">
           <div className="systemMessage">
-            <span>SHARED ROOM</span>
-            One server worker owns generation through a renewable SQLite lease.
-            Viewers only watch and enqueue directives.
+            <span>SHARED ROOM · {pumpfunLabel()}</span>
+            One generator owns the canon. Pump.fun chat is a leased ingress
+            adapter, so reconnects and multiple workers cannot duplicate
+            prompts.
           </div>
           {directives.map((directive) => (
             <div className={`message ${directive.status}`} key={directive.id}>
@@ -276,7 +291,9 @@ function App() {
 
         <footer>
           <span>TradJS + sqlite-zod-orm + measure-fn</span>
-          <span>{transport} · H3 Max on fal</span>
+          <span>
+            {transport} · {pumpfunLabel()} · H3 Max on fal
+          </span>
         </footer>
       </aside>
     </>

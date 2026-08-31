@@ -1,6 +1,15 @@
+import {
+  runPumpfunChatIngestor,
+  stopPumpfunChatIngestor,
+} from "./server/pumpfun.ts";
 import { runRoomWorker, stopRoomWorker } from "./server/worker.ts";
 
-process.once("SIGINT", () => stopRoomWorker());
-process.once("SIGTERM", () => stopRoomWorker());
+function stop() {
+  stopPumpfunChatIngestor();
+  stopRoomWorker();
+}
 
-await runRoomWorker();
+process.once("SIGINT", stop);
+process.once("SIGTERM", stop);
+
+await Promise.all([runRoomWorker(), runPumpfunChatIngestor()]);

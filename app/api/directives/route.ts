@@ -19,6 +19,11 @@ export async function POST(request: Request) {
         text: row.text,
         status: row.status,
         usedEpisode: row.usedEpisode ?? null,
+        source: row.source || "web",
+        sourceId: row.sourceId ?? null,
+        author: row.author ?? null,
+        authorAddress: row.authorAddress ?? null,
+        sourceRoom: row.sourceRoom ?? null,
       };
     },
   );

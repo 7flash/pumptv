@@ -1,6 +1,9 @@
 export type Resolution = "480P" | "768P";
 export type DirectiveStatus = "queued" | "generating" | "used";
+export type DirectiveSource = "web" | "pumpfun";
 export type WorkerState = "idle" | "generating" | "error";
+export type PumpChatState =
+  "disabled" | "standby" | "connecting" | "live" | "error";
 
 export type Clip = {
   id: number;
@@ -23,6 +26,19 @@ export type Directive = {
   text: string;
   status: DirectiveStatus;
   usedEpisode: number | null;
+  source: DirectiveSource;
+  sourceId: string | null;
+  author: string | null;
+  authorAddress: string | null;
+  sourceRoom: string | null;
+};
+
+export type PumpfunChatStatus = {
+  enabled: boolean;
+  mint: string | null;
+  prefix: string | null;
+  state: PumpChatState;
+  lastError: string | null;
 };
 
 export type RoomState = {
@@ -32,6 +48,7 @@ export type RoomState = {
   workerState: WorkerState;
   lastError: string | null;
   bufferedUntilMs: number | null;
+  pumpfun: PumpfunChatStatus;
 };
 
 export type StreamState = {

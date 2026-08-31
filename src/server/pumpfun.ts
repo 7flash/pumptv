@@ -1,9 +1,4 @@
 import { hostname } from "node:os";
-import {
-  castProposalVote,
-  ensurePromptRound,
-  submitPromptProposal,
-} from "./arbitration.ts";
 import { sanitizeLine } from "./prompt.ts";
 import {
   acquirePumpChatLease,
@@ -12,12 +7,15 @@ import {
   setPumpChatLeaseState,
 } from "./pumpfun-lease.ts";
 import { runPumpfunSocket, type PumpfunMessage } from "./pumpfun-socket.ts";
-import { getLatestClip, getRoomRow, setPumpChatState } from "./repository.ts";
-import { arbitrationMeasure, pumpMeasure } from "./observability.ts";
+import {
+  enqueueExternalDirective,
+  getRoomRow,
+  setPumpChatState,
+} from "./repository.ts";
+import { pumpMeasure } from "./observability.ts";
 
 const MINT = (process.env.SLOP_PUMPFUN_MINT || "").trim();
 const PREFIX = process.env.SLOP_PUMPFUN_PREFIX ?? "!next";
-const VOTE_PREFIX = process.env.SLOP_PUMPFUN_VOTE_PREFIX ?? "!vote";
 const LEASE_TTL_MS = Number(process.env.SLOP_PUMPFUN_LEASE_TTL_MS || 30_000);
 const POLL_MS = Number(process.env.SLOP_PUMPFUN_LEASE_POLL_MS || 1_000);
 const MAX_TEXT = Number(process.env.SLOP_PUMPFUN_MAX_PROMPT_LENGTH || 500);
@@ -29,33 +27,16 @@ const lastAcceptedByUser = new Map<string, number>();
 let stopping = false;
 let activeAbort: AbortController | null = null;
 
-type PumpCommand =
-  { kind: "proposal"; text: string } | { kind: "vote"; proposalId: number };
-
-function extractCommand(message: PumpfunMessage): PumpCommand | null {
+function extractPrompt(message: PumpfunMessage) {
   const line = sanitizeLine(
     String(message.message || ""),
-    MAX_TEXT + PREFIX.length + 64,
+    MAX_TEXT + PREFIX.length + 32,
   );
   if (!line) return null;
 
-  if (VOTE_PREFIX && line.toLowerCase().startsWith(VOTE_PREFIX.toLowerCase())) {
-    const rawId = line
-      .slice(VOTE_PREFIX.length)
-      .trim()
-      .split(/\s+/, 1)[0]
-      .replace(/^#/, "");
-    const proposalId = Number.parseInt(rawId || "", 10);
-    return Number.isSafeInteger(proposalId) && proposalId > 0
-      ? { kind: "vote", proposalId }
-      : null;
-  }
-
-  if (!PREFIX) return { kind: "proposal", text: sanitizeLine(line, MAX_TEXT) };
+  if (!PREFIX) return sanitizeLine(line, MAX_TEXT);
   if (!line.toLowerCase().startsWith(PREFIX.toLowerCase())) return null;
-
-  const text = sanitizeLine(line.slice(PREFIX.length).trim(), MAX_TEXT);
-  return text ? { kind: "proposal", text } : null;
+  return sanitizeLine(line.slice(PREFIX.length).trim(), MAX_TEXT) || null;
 }
 
 function durableSourceId(message: PumpfunMessage) {
@@ -68,84 +49,37 @@ function durableSourceId(message: PumpfunMessage) {
   ].join(":");
 }
 
-function userIdentity(message: PumpfunMessage) {
-  return sanitizeLine(
-    String(
-      message.userAddress ||
-        message.username ||
-        `message:${durableSourceId(message)}`,
-    ),
-    180,
-  );
-}
-
-function cooldownAllows(message: PumpfunMessage) {
-  if (USER_COOLDOWN_MS <= 0) return true;
-  const key = userIdentity(message);
-  const now = Date.now();
-  const previous = lastAcceptedByUser.get(key) || 0;
-  if (now - previous < USER_COOLDOWN_MS) return false;
-  lastAcceptedByUser.set(key, now);
-  return true;
-}
-
-async function currentRound() {
-  const latest = await getLatestClip();
-  if (!latest) return null;
-  const bufferUntilMs = latest.startsAtMs + latest.durationSeconds * 1000;
-  return arbitrationMeasure.measure("Ensure Pump.fun scene ballot", () =>
-    ensurePromptRound(latest.episode + 1, bufferUntilMs),
-  );
+function userKey(message: PumpfunMessage) {
+  return String(message.userAddress || message.username || "anonymous");
 }
 
 async function ingestMessage(message: PumpfunMessage) {
-  const command = extractCommand(message);
-  if (!command || !cooldownAllows(message)) return;
+  const prompt = extractPrompt(message);
+  if (!prompt) return;
 
-  const round = await currentRound();
-  if (!round || Date.now() >= round.closesAtMs) return;
-
-  const sourceId = durableSourceId(message);
-  const voterKey = `pumpfun:${userIdentity(message)}`;
-
-  if (command.kind === "vote") {
-    // IDs are shown in the stream overlay. A vote can only target the current
-    // round, so stale chat commands cannot affect a future scene accidentally.
-    await pumpMeasure.measure(
-      {
-        label: "Ingest Pump.fun vote",
-        room: MINT,
-        proposalId: command.proposalId,
-      },
-      () =>
-        castProposalVote({
-          roundId: round.id,
-          proposalId: command.proposalId,
-          voterKey,
-          source: "pumpfun",
-          sourceId,
-        }),
-    );
-    return;
+  if (USER_COOLDOWN_MS > 0) {
+    const key = userKey(message);
+    const now = Date.now();
+    const previous = lastAcceptedByUser.get(key) || 0;
+    if (now - previous < USER_COOLDOWN_MS) return;
+    lastAcceptedByUser.set(key, now);
   }
 
   await pumpMeasure.measure(
     {
-      label: "Ingest Pump.fun proposal",
+      label: "Ingest Pump.fun prompt",
       room: MINT,
       messageId: message.id || null,
     },
     () =>
-      submitPromptProposal({
-        roundId: round.id,
-        text: command.text,
+      enqueueExternalDirective({
+        text: prompt,
         source: "pumpfun",
-        sourceId,
+        sourceId: durableSourceId(message),
         author: sanitizeLine(String(message.username || ""), 80) || null,
         authorAddress:
           sanitizeLine(String(message.userAddress || ""), 120) || null,
         sourceRoom: sanitizeLine(String(message.roomId || MINT), 160) || MINT,
-        voterKey,
       }),
   );
 }
@@ -167,11 +101,7 @@ async function runLeasedSession() {
       signal: abort.signal,
       onMessage(message) {
         void ingestMessage(message).catch((error) => {
-          // Invalid/stale votes and closed ballot races are expected in live chat.
-          console.warn(
-            "[pumpfun] ignored chat command",
-            error instanceof Error ? error.message : error,
-          );
+          console.error("[pumpfun] ingest error", error);
         });
       },
       onState(state, error) {
@@ -200,7 +130,7 @@ export async function runPumpfunChatIngestor() {
   }
 
   console.log(
-    `[pumpfun] adapter ${owner} watching ${MINT} · proposals ${PREFIX ? JSON.stringify(PREFIX) : "ALL CHAT"} · votes ${JSON.stringify(VOTE_PREFIX)}`,
+    `[pumpfun] adapter ${owner} watching ${MINT}${PREFIX ? ` with prefix ${JSON.stringify(PREFIX)}` : " (all chat messages)"}`,
   );
 
   while (!stopping) {
