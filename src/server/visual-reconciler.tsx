@@ -89,22 +89,16 @@ Inspect the actual frames, reconcile only what reality requires, and emit the co
 
 function messageText(value: unknown): string {
   if (typeof value === "string") return value;
-  if (Array.isArray(value))
-    return value.map(messageText).filter(Boolean).join("\n");
-  if (value && typeof value === "object" && "text" in value)
-    return String((value as any).text || "");
+  if (Array.isArray(value)) return value.map(messageText).filter(Boolean).join("\n");
+  if (value && typeof value === "object" && "text" in value) return String((value as any).text || "");
   return String(value || "");
 }
 
 function extractJsonObject(text: string) {
-  const trimmed = text
-    .trim()
-    .replace(/^```(?:json)?\s*/i, "")
-    .replace(/\s*```$/i, "");
+  const trimmed = text.trim().replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
   const first = trimmed.indexOf("{");
   const last = trimmed.lastIndexOf("}");
-  if (first < 0 || last <= first)
-    throw new Error("Vision reconciler returned no JSON object");
+  if (first < 0 || last <= first) throw new Error("Vision reconciler returned no JSON object");
   return JSON.parse(trimmed.slice(first, last + 1));
 }
 
@@ -121,9 +115,7 @@ function mergeById<T extends { id: string }>(
   const observedIds = new Set(observed.map((item) => norm(item.id)));
   return [
     ...observed.filter((item) => !removed.has(norm(item.id))),
-    ...planned.filter(
-      (item) => !observedIds.has(norm(item.id)) && !removed.has(norm(item.id)),
-    ),
+    ...planned.filter((item) => !observedIds.has(norm(item.id)) && !removed.has(norm(item.id))),
   ];
 }
 
@@ -145,37 +137,22 @@ function reconcileState(parsed: ParsedReconciliation, planned: WorldState) {
   const observed = normalizeReconciledWorldState(parsed.worldState, planned);
   const resolved = parsed.resolvedThreads.map(norm);
   const remainingPlannedThreads = planned.openThreads.filter(
-    (thread) =>
-      !resolved.some(
-        (done) =>
-          done === norm(thread) ||
-          norm(thread).includes(done) ||
-          done.includes(norm(thread)),
-      ),
+    (thread) => !resolved.some((done) => done === norm(thread) || norm(thread).includes(done) || done.includes(norm(thread))),
   );
 
   const merged: WorldState = {
     ...observed,
     revision: planned.revision,
-    characters: mergeById(
-      planned.characters,
-      observed.characters,
-      parsed.removedCharacterIds,
-    ),
+    characters: mergeById(planned.characters, observed.characters, parsed.removedCharacterIds),
     props: mergeById(planned.props, observed.props, parsed.removedPropIds),
-    openThreads: unionStrings(
-      remainingPlannedThreads,
-      observed.openThreads,
-    ).slice(0, 8),
+    openThreads: unionStrings(remainingPlannedThreads, observed.openThreads).slice(0, 8),
     motifs: unionStrings(planned.motifs, observed.motifs).slice(0, 8),
-    visualRules: unionStrings(planned.visualRules, observed.visualRules).slice(
-      0,
-      10,
-    ),
+    visualRules: unionStrings(planned.visualRules, observed.visualRules).slice(0, 10),
   };
 
   return normalizeReconciledWorldState(merged, planned);
 }
+
 
 export async function reconcileRenderedClip(input: {
   episode: number;
@@ -184,6 +161,7 @@ export async function reconcileRenderedClip(input: {
   priorWorldState: WorldState;
   plannedWorldState: WorldState;
   frames: ClipFrameSample;
+  skipReason?: string | null;
 }): Promise<VisualReconciliationResult> {
   const frameEntries = [
     ["START", input.frames.start],
@@ -201,15 +179,17 @@ export async function reconcileRenderedClip(input: {
     cost: null as number | null,
   };
 
+  if (input.skipReason) {
+    return {
+      worldState: input.plannedWorldState,
+      audit: { ...baseAudit, status: "skipped", model: null, summary: input.skipReason },
+    };
+  }
+
   if (!ENABLED) {
     return {
       worldState: input.plannedWorldState,
-      audit: {
-        ...baseAudit,
-        status: "skipped",
-        model: null,
-        summary: "Visual reconciliation disabled.",
-      },
+      audit: { ...baseAudit, status: "skipped", model: null, summary: "Visual reconciliation disabled." },
     };
   }
 
@@ -217,49 +197,34 @@ export async function reconcileRenderedClip(input: {
   if (!input.frames.middle && !input.frames.end) {
     return {
       worldState: input.plannedWorldState,
-      audit: {
-        ...baseAudit,
-        status: "fallback",
-        summary:
-          "No rendered middle/end frame was available for reality reconciliation.",
-      },
+      audit: { ...baseAudit, status: "fallback", summary: "No rendered middle/end frame was available for reality reconciliation." },
     };
   }
 
   try {
-    const tree = render(
-      <ReconciliationPrompt
-        directive={input.directive}
-        plan={input.plan}
-        priorWorldState={input.priorWorldState}
-        plannedWorldState={input.plannedWorldState}
-        frameLabels={frameEntries.map(([label]) => label)}
-      />,
-    );
-    const prompt = tree.messages
-      .map((message: any) => messageText(message.content))
-      .filter(Boolean)
-      .join("\n\n");
+    const tree = render(<ReconciliationPrompt
+      directive={input.directive}
+      plan={input.plan}
+      priorWorldState={input.priorWorldState}
+      plannedWorldState={input.plannedWorldState}
+      frameLabels={frameEntries.map(([label]) => label)}
+    />);
+    const prompt = tree.messages.map((message: any) => messageText(message.content)).filter(Boolean).join("\n\n");
 
     const result = await reconcileMeasure.measure(
-      {
-        label: "Reconcile rendered canon",
-        episode: input.episode,
-        model: MODEL,
-      },
-      () =>
-        fal.subscribe("openrouter/router/vision", {
-          input: {
-            image_urls: frameEntries.map(([, url]) => url),
-            prompt,
-            system_prompt: tree.system || undefined,
-            model: MODEL,
-            temperature: 0.1,
-            max_tokens: 1800,
-            reasoning: false,
-          },
-          logs: false,
-        }),
+      { label: "Reconcile rendered canon", episode: input.episode, model: MODEL },
+      () => fal.subscribe("openrouter/router/vision", {
+        input: {
+          image_urls: frameEntries.map(([, url]) => url),
+          prompt,
+          system_prompt: tree.system || undefined,
+          model: MODEL,
+          temperature: 0.1,
+          max_tokens: 1800,
+          reasoning: false,
+        },
+        logs: false,
+      }),
     );
     if (!result) throw new Error("Vision reconciler returned no result");
 
@@ -273,9 +238,7 @@ export async function reconcileRenderedClip(input: {
     };
     if (!data.output) throw new Error("Vision reconciler returned no output");
 
-    const parsed = ReconciliationSchema.parse(
-      extractJsonObject(data.output),
-    ) as ParsedReconciliation;
+    const parsed = ReconciliationSchema.parse(extractJsonObject(data.output)) as ParsedReconciliation;
     const worldState = reconcileState(parsed, input.plannedWorldState);
     const corrected = parsed.status === "corrected" || parsed.drift.length > 0;
 
@@ -285,10 +248,7 @@ export async function reconcileRenderedClip(input: {
         status: corrected ? "corrected" : "verified",
         model: MODEL,
         summary: parsed.summary.replace(/\s+/g, " ").trim().slice(0, 500),
-        drift: parsed.drift
-          .map((item) => item.replace(/\s+/g, " ").trim().slice(0, 320))
-          .filter(Boolean)
-          .slice(0, 8),
+        drift: parsed.drift.map((item) => item.replace(/\s+/g, " ").trim().slice(0, 320)).filter(Boolean).slice(0, 8),
         sampledFrameUrls: frameEntries.map(([, url]) => url),
         inputTokens: data.usage?.prompt_tokens ?? null,
         outputTokens: data.usage?.completion_tokens ?? null,
@@ -296,19 +256,13 @@ export async function reconcileRenderedClip(input: {
       },
     };
   } catch (error) {
-    console.error(
-      "[reconciler] using planned canon after vision failure",
-      error,
-    );
+    console.error("[reconciler] using planned canon after vision failure", error);
     return {
       worldState: input.plannedWorldState,
       audit: {
         ...baseAudit,
         status: "fallback",
-        summary:
-          error instanceof Error
-            ? error.message.slice(0, 500)
-            : "Visual reconciliation failed.",
+        summary: error instanceof Error ? error.message.slice(0, 500) : "Visual reconciliation failed.",
       },
     };
   }

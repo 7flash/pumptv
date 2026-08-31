@@ -1,9 +1,5 @@
 import { hostname } from "node:os";
-import {
-  castProposalVote,
-  ensurePromptRound,
-  submitPromptProposal,
-} from "./arbitration.ts";
+import { castProposalVote, ensurePromptRound, submitPromptProposal } from "./arbitration.ts";
 import { sanitizeLine } from "./prompt.ts";
 import {
   acquirePumpChatLease,
@@ -12,7 +8,11 @@ import {
   setPumpChatLeaseState,
 } from "./pumpfun-lease.ts";
 import { runPumpfunSocket, type PumpfunMessage } from "./pumpfun-socket.ts";
-import { getLatestClip, getRoomRow, setPumpChatState } from "./repository.ts";
+import {
+  getLatestClip,
+  getRoomRow,
+  setPumpChatState,
+} from "./repository.ts";
 import { arbitrationMeasure, pumpMeasure } from "./observability.ts";
 
 const MINT = (process.env.SLOP_PUMPFUN_MINT || "").trim();
@@ -30,21 +30,15 @@ let stopping = false;
 let activeAbort: AbortController | null = null;
 
 type PumpCommand =
-  { kind: "proposal"; text: string } | { kind: "vote"; proposalId: number };
+  | { kind: "proposal"; text: string }
+  | { kind: "vote"; proposalId: number };
 
 function extractCommand(message: PumpfunMessage): PumpCommand | null {
-  const line = sanitizeLine(
-    String(message.message || ""),
-    MAX_TEXT + PREFIX.length + 64,
-  );
+  const line = sanitizeLine(String(message.message || ""), MAX_TEXT + PREFIX.length + 64);
   if (!line) return null;
 
   if (VOTE_PREFIX && line.toLowerCase().startsWith(VOTE_PREFIX.toLowerCase())) {
-    const rawId = line
-      .slice(VOTE_PREFIX.length)
-      .trim()
-      .split(/\s+/, 1)[0]
-      .replace(/^#/, "");
+    const rawId = line.slice(VOTE_PREFIX.length).trim().split(/\s+/, 1)[0].replace(/^#/, "");
     const proposalId = Number.parseInt(rawId || "", 10);
     return Number.isSafeInteger(proposalId) && proposalId > 0
       ? { kind: "vote", proposalId }
@@ -70,11 +64,7 @@ function durableSourceId(message: PumpfunMessage) {
 
 function userIdentity(message: PumpfunMessage) {
   return sanitizeLine(
-    String(
-      message.userAddress ||
-        message.username ||
-        `message:${durableSourceId(message)}`,
-    ),
+    String(message.userAddress || message.username || `message:${durableSourceId(message)}`),
     180,
   );
 }
@@ -112,11 +102,7 @@ async function ingestMessage(message: PumpfunMessage) {
     // IDs are shown in the stream overlay. A vote can only target the current
     // round, so stale chat commands cannot affect a future scene accidentally.
     await pumpMeasure.measure(
-      {
-        label: "Ingest Pump.fun vote",
-        room: MINT,
-        proposalId: command.proposalId,
-      },
+      { label: "Ingest Pump.fun vote", room: MINT, proposalId: command.proposalId },
       () =>
         castProposalVote({
           roundId: round.id,
@@ -142,8 +128,7 @@ async function ingestMessage(message: PumpfunMessage) {
         source: "pumpfun",
         sourceId,
         author: sanitizeLine(String(message.username || ""), 80) || null,
-        authorAddress:
-          sanitizeLine(String(message.userAddress || ""), 120) || null,
+        authorAddress: sanitizeLine(String(message.userAddress || ""), 120) || null,
         sourceRoom: sanitizeLine(String(message.roomId || MINT), 160) || MINT,
         voterKey,
       }),
@@ -168,10 +153,7 @@ async function runLeasedSession() {
       onMessage(message) {
         void ingestMessage(message).catch((error) => {
           // Invalid/stale votes and closed ballot races are expected in live chat.
-          console.warn(
-            "[pumpfun] ignored chat command",
-            error instanceof Error ? error.message : error,
-          );
+          console.warn("[pumpfun] ignored chat command", error instanceof Error ? error.message : error);
         });
       },
       onState(state, error) {
@@ -193,9 +175,7 @@ export async function runPumpfunChatIngestor() {
 
   if (!MINT) {
     await setPumpChatState("disabled", null);
-    console.log(
-      "[pumpfun] disabled; set SLOP_PUMPFUN_MINT to ingest live chat",
-    );
+    console.log("[pumpfun] disabled; set SLOP_PUMPFUN_MINT to ingest live chat");
     return;
   }
 
@@ -204,9 +184,7 @@ export async function runPumpfunChatIngestor() {
   );
 
   while (!stopping) {
-    const owned = await pumpMeasure.measure("Pump.fun lease session", () =>
-      runLeasedSession(),
-    );
+    const owned = await pumpMeasure.measure("Pump.fun lease session", () => runLeasedSession());
     if (!owned) await sleep(POLL_MS);
     else if (!stopping) await sleep(500);
   }

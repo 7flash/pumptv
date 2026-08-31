@@ -1,12 +1,12 @@
 # SLOP TV
 
-An endless shared AI-generated livestream where the audience decides what happens next. v0.9 closes the continuity loop: **jsx-ai** plans the shot, H3 renders it, then sampled frames are visually reconciled back into durable canon before the following scene is planned. The brainrot / memecoin live-terminal UI still makes NOW PLAYING, LOCKED NEXT, the ranked NEXT PROMPT QUEUE, and who suggested each prompt unambiguous.
+An endless shared AI-generated livestream where the audience decides what happens next. v0.10 adds a **rolling adaptive playback reserve**: voting for scene N+1 overlaps scene N rendering, measured generation latency controls ballot safety margins, and the pipeline automatically degrades from FULL → FAST → EMERGENCY before playback runs dry. The continuity stack from v0.9 remains: jsx-ai plans, H3 renders, and FULL mode visually reconciles rendered reality back into durable canon.
 
 ## Stack
 
 - **TradJS** server + `tradjs/client` frontend
 - **sqlite-zod-orm** for rooms, ballots, proposals, votes, winning directives, clips, and leases
-- **measure-fn** for HTTP / DB / arbitration / worker / Pump.fun / showrunner / reconciliation / fal boundaries
+- **measure-fn** for HTTP / DB / arbitration / worker / Pump.fun / showrunner / reconciliation / fal boundaries, with per-clip wall-clock phase telemetry persisted for adaptive buffering
 - **jsx-ai** for composable, provider-agnostic showrunner prompting and structured tool output
 - **fal + MiniMax H3 Max** for video
 - **fal FFmpeg Extract Frame** for server-side start/middle/end frame sampling and continuity
@@ -167,28 +167,63 @@ current generated buffer
 
 There is normally only one committed directive waiting for generation: the winning ballot. A crashed generation releases that winner back to `queued` and retries it rather than reopening voting and potentially changing canon.
 
-## Playback-safe voting window
+## v0.10 rolling adaptive buffer
+
+The room now aims to keep **2–3 five-second clips banked ahead of playback**. Generation and voting are pipelined rather than serialized:
+
+```text
+PLAYING N-1
+    │
+    ├────────────── H3 renders N
+    │                    │
+    └── viewers vote on N+1 at the same time
+                         │
+                         ▼
+                  N lands in buffer
+                         │
+                  winner for N+1 locks
+                         │
+                         ▼
+                    H3 renders N+1
+```
 
 Defaults:
 
 ```bash
-SLOP_TARGET_BUFFER_MS=6500
+SLOP_MIN_CLIPS_AHEAD=2
+SLOP_TARGET_CLIPS_AHEAD=3
+SLOP_BUFFER_SAFETY_MARGIN_MS=1000
 SLOP_PROMPT_WINDOW_MS=4500
-SLOP_GENERATION_LEAD_MS=4500
+SLOP_GENERATION_LEAD_MS=4500   # cold-start fallback until telemetry exists
 ```
 
-The ballot can stay open for up to 4.5 seconds. The authoritative worker also knows how much video remains buffered. If only the generation lead remains, it locks the ballot early and starts H3 rather than intentionally causing a stream underrun.
+Every clip persists wall-clock `showrunnerMs`, `h3Ms`, `frameSampleMs`, `visionMs`, and `totalGenerationMs`. The worker computes recent p50/p90 timing and derives an adaptive generation lead from p90 total latency plus the safety margin. `SLOP_GENERATION_LEAD_MS` is now only the cold-start fallback before enough real samples exist.
 
-This means the real ballot deadline is approximately:
+The recovery ladder is automatic:
 
 ```text
-min(
-  ballot_open_time + SLOP_PROMPT_WINDOW_MS,
-  end_of_generated_buffer - SLOP_GENERATION_LEAD_MS
-)
+FULL
+  jsx-ai showrunner
+  H3 Max
+  start + middle + end frame sampling
+  multimodal vision reconciliation
+
+FAST
+  shorter jsx-ai showrunner request
+  H3 Max
+  continuity/end-frame sampling only
+  skip optional vision reconciliation
+
+EMERGENCY
+  deterministic continuity planner
+  H3 Max
+  continuity/end-frame sampling only
+  skip optional vision reconciliation
 ```
 
-If fal latency changes, tune `SLOP_GENERATION_LEAD_MS` from measured production inference times.
+H3 and the previous clip's final-frame anchor are never removed from the pipeline. Recovery only sheds optional latency. The UI exposes the current mode, banked clip count, buffer health, adaptive lead, p90 generation latency, and median H3 wall time so operators and viewers can see whether the stream is cruising or recovering.
+
+The ballot deadline remains bounded by `SLOP_PROMPT_WINDOW_MS`, but the safe-close threshold is now dynamically derived from observed generation speed. This lets a fast deployment give chat more time and a slow deployment lock earlier without manual tuning.
 
 ## Persistent arbitration model
 
@@ -321,6 +356,7 @@ src/
   worker.ts
   shared/contracts.ts
   server/
+    adaptive-buffer.ts       # p50/p90 timing model + buffer health / mode selection
     arbitration.ts            # rounds, proposal merge, one-vote rule, atomic winner
     db.ts                     # sqlite-zod-orm schemas + durable indexes
     repository.ts
@@ -328,8 +364,8 @@ src/
     pumpfun-lease.ts
     pumpfun.ts                # !next / !vote adapter
     pumpfun-socket.ts
-    worker.ts                 # buffer-aware ballot deadline + generation
-    generate.ts               # fal orchestration + reconciliation pipeline
+    worker.ts                 # adaptive 2–3 clip reserve + pipelined ballots + recovery modes
+    generate.ts               # measured FULL/FAST/EMERGENCY generation pipeline
     showrunner.tsx             # jsx-ai LLM shot planner
     visual-reconciler.tsx      # jsx-ai-authored vision audit prompt + canon correction
     video-frames.ts            # sampled frame extraction + end-frame reuse
@@ -383,6 +419,23 @@ current persisted world state
               ▼
  SQLite atomic clip + world snapshot
 ```
+
+## v0.10: adaptive recovery telemetry
+
+`StreamState.room.buffer` is the live control-plane summary used by the brainrot HUD:
+
+```text
+mode / recommendedMode       full | fast | emergency
+health                       healthy | tight | critical | empty
+bufferMs / targetBufferMs
+desiredClipsAhead
+adaptiveLeadMs
+sampleCount
+p50TotalMs / p90TotalMs
+p50H3Ms
+```
+
+Each clip also records the mode that produced it. This makes underrun investigations replayable: you can see whether H3 slowed down, whether vision became expensive, when the scheduler dropped to FAST/EMERGENCY, and whether the reserve recovered afterward.
 
 ## v0.9: rendered-reality reconciliation
 

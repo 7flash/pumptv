@@ -6,10 +6,7 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 let lastPayload = "";
 let polling = false;
 
-function write(
-  controller: ReadableStreamDefaultController<Uint8Array>,
-  payload: string,
-) {
+function write(controller: ReadableStreamDefaultController<Uint8Array>, payload: string) {
   controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
 }
 

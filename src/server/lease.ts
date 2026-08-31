@@ -31,11 +31,7 @@ export function acquireRoomLease(owner: string, ttlMs: number) {
           return false;
         }
 
-        if (
-          row.leaseOwner &&
-          row.leaseOwner !== owner &&
-          Number(row.leaseUntilMs) > now
-        ) {
+        if (row.leaseOwner && row.leaseOwner !== owner && Number(row.leaseUntilMs) > now) {
           db.exec("COMMIT");
           return false;
         }

@@ -206,7 +206,7 @@ button { cursor: pointer; }
 .chatPanel {
   border-left: 1px solid var(--line);
   display: grid;
-  grid-template-rows: auto auto 1fr auto auto;
+  grid-template-rows: auto auto auto 1fr auto auto;
   min-height: 0;
   background:
     radial-gradient(circle at 100% 0%, rgba(120,247,168,.08), transparent 28%),
@@ -457,4 +457,39 @@ footer { display: flex; justify-content: space-between; gap: 8px; padding: 8px 1
   .canonBrain summary { padding: 8px; }
   .canonBrainBody { padding: 8px; }
   .canonStats span:nth-child(4) { display: none; }
+}
+
+/* v0.10 — adaptive rolling buffer / recovery HUD */
+.bufferModeTag.full { color: var(--mint); border-color: rgba(120,247,168,.38) !important; }
+.bufferModeTag.fast { color: var(--yellow); border-color: rgba(242,255,87,.42) !important; }
+.bufferModeTag.emergency { color: #ff8893; border-color: rgba(255,94,108,.52) !important; animation: emergencyBlink .72s steps(2,end) infinite; }
+@keyframes emergencyBlink { 50% { opacity: .48; } }
+
+.bufferDeck {
+  margin: 8px 12px 0;
+  padding: 9px 10px 10px;
+  border: 1px solid #283329;
+  background: rgba(7,11,8,.94);
+  box-shadow: inset 0 0 26px rgba(120,247,168,.018);
+}
+.bufferDeck.healthy { border-color: rgba(120,247,168,.30); }
+.bufferDeck.tight { border-color: rgba(242,255,87,.38); }
+.bufferDeck.critical,
+.bufferDeck.empty { border-color: rgba(255,94,108,.46); }
+.bufferDeckTop,
+.bufferStats { display: flex; justify-content: space-between; gap: 9px; align-items: baseline; }
+.bufferDeckTop span { color: var(--mint); font: 1000 8px/1 "Courier New", monospace; letter-spacing: .08em; }
+.bufferDeckTop b { color: #e7ece4; font: 900 7px/1 "Courier New", monospace; }
+.bufferRail { height: 6px; margin: 8px 0 7px; border: 1px solid #29332a; background: #0c100d; overflow: hidden; }
+.bufferRail i { display: block; height: 100%; min-width: 2px; background: linear-gradient(90deg, var(--red) 0 18%, var(--yellow) 45%, var(--mint) 75%); transition: width .25s linear; }
+.bufferStats { color: #687369; font: 900 7px/1 "Courier New", monospace; letter-spacing: .04em; }
+.bufferStats em { color: var(--mint); font-style: normal; }
+.bufferDeck.tight .bufferStats em { color: var(--yellow); }
+.bufferDeck.critical .bufferStats em,
+.bufferDeck.empty .bufferStats em { color: var(--red); }
+.bufferDeck p { margin: 7px 0 0; color: #657067; font: 8px/1.35 "Courier New", monospace; }
+
+@media (max-width: 520px) {
+  .bufferDeck { margin: 6px 8px 0; padding: 8px; }
+  .bufferDeck p { display: none; }
 }

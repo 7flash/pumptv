@@ -2,12 +2,12 @@ export type Resolution = "480P" | "768P";
 export type DirectiveStatus = "queued" | "generating" | "used";
 export type DirectiveSource = "web" | "pumpfun";
 export type WorkerState = "idle" | "generating" | "error";
-export type PumpChatState =
-  "disabled" | "standby" | "connecting" | "live" | "error";
+export type GenerationMode = "full" | "fast" | "emergency";
+export type BufferHealthState = "healthy" | "tight" | "critical" | "empty";
+export type PumpChatState = "disabled" | "standby" | "connecting" | "live" | "error";
 export type ProposalStatus = "open" | "selected" | "lost";
 export type PromptRoundStatus = "open" | "closed";
-export type ReconciliationStatus =
-  "verified" | "corrected" | "fallback" | "skipped";
+export type ReconciliationStatus = "verified" | "corrected" | "fallback" | "skipped";
 
 export type Clip = {
   id: number;
@@ -31,6 +31,12 @@ export type Clip = {
   showrunnerPlanJson: string | null;
   showrunnerInputTokens: number | null;
   showrunnerOutputTokens: number | null;
+  generationMode: GenerationMode;
+  showrunnerMs: number | null;
+  h3Ms: number | null;
+  frameSampleMs: number | null;
+  visionMs: number | null;
+  totalGenerationMs: number | null;
 };
 
 export type Directive = {
@@ -70,6 +76,7 @@ export type PromptRound = {
   winnerProposalId: number | null;
   proposals: PromptProposal[];
 };
+
 
 export type WorldCharacter = {
   id: string;
@@ -112,6 +119,31 @@ export type WorldStateAudit = {
   cost: number | null;
 };
 
+
+export type GenerationTimingSample = {
+  generationMode: GenerationMode;
+  showrunnerMs: number | null;
+  h3Ms: number | null;
+  frameSampleMs: number | null;
+  visionMs: number | null;
+  totalGenerationMs: number | null;
+};
+
+export type BufferHealth = {
+  mode: GenerationMode;
+  recommendedMode: GenerationMode;
+  health: BufferHealthState;
+  bufferMs: number;
+  targetBufferMs: number;
+  minimumBufferMs: number;
+  desiredClipsAhead: number;
+  adaptiveLeadMs: number;
+  sampleCount: number;
+  p50TotalMs: number | null;
+  p90TotalMs: number | null;
+  p50H3Ms: number | null;
+};
+
 export type PumpfunChatStatus = {
   enabled: boolean;
   mint: string | null;
@@ -128,6 +160,7 @@ export type RoomState = {
   workerState: WorkerState;
   lastError: string | null;
   bufferedUntilMs: number | null;
+  buffer: BufferHealth;
   pumpfun: PumpfunChatStatus;
 };
 

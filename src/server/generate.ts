@@ -1,5 +1,5 @@
 import { fal } from "@fal-ai/client";
-import type { Clip, Resolution } from "../shared/contracts.ts";
+import type { Clip, GenerationMode, Resolution } from "../shared/contracts.ts";
 import { falMeasure } from "./observability.ts";
 import { AUTOPILOT, OPENING, renderH3Prompt } from "./prompt.ts";
 import { planNextShot } from "./showrunner.tsx";
@@ -22,6 +22,10 @@ function configureFal() {
   fal.config({ credentials: process.env.FAL_KEY });
 }
 
+function elapsed(startedAt: number) {
+  return Math.max(0, Math.round(performance.now() - startedAt));
+}
+
 async function continuityFrame(previousClip: Clip | null) {
   if (!previousClip) return null;
   if (previousClip.endFrameUrl) return previousClip.endFrameUrl;
@@ -31,27 +35,31 @@ async function continuityFrame(previousClip: Clip | null) {
 export async function generateNextClip(input: {
   previousClip: Clip | null;
   resolution: Resolution;
+  mode?: GenerationMode;
 }): Promise<Clip> {
   configureFal();
 
+  const generationStartedAt = performance.now();
+  const mode = input.mode || "full";
   const episode = await nextEpisode();
   const claimed = await claimQueuedDirective(episode);
   const directive = claimed?.text || (episode === 0 ? OPENING : AUTOPILOT);
 
   try {
-    const [story, worldState] = await Promise.all([
-      recentStory(),
-      getLatestWorldState(),
-    ]);
+    const [story, worldState] = await Promise.all([recentStory(), getLatestWorldState()]);
     const anchorFrameUrl = await continuityFrame(input.previousClip);
 
+    const showrunnerStartedAt = performance.now();
     const showrunner = await planNextShot({
       directive,
       recentStory: story,
       episode,
       hasAnchor: Boolean(anchorFrameUrl),
       worldState,
+      generationMode: mode,
     });
+    const showrunnerMs = elapsed(showrunnerStartedAt);
+
     const prompt = renderH3Prompt({
       plan: showrunner.plan,
       episode,
@@ -81,11 +89,12 @@ export async function generateNextClip(input: {
           prompt_expansion_mode: "balanced" as const,
         };
 
+    const h3StartedAt = performance.now();
     const result = await falMeasure.measure(
-      { label: "Generate H3 Max clip", episode, endpoint },
-      () =>
-        fal.subscribe(endpoint, { input: requestInput as any, logs: false }),
+      { label: "Generate H3 Max clip", episode, endpoint, mode },
+      () => fal.subscribe(endpoint, { input: requestInput as any, logs: false }),
     );
+    const h3Ms = elapsed(h3StartedAt);
     if (!result) throw new Error("fal generation failed");
 
     const data = result.data as {
@@ -95,11 +104,17 @@ export async function generateNextClip(input: {
     };
     if (!data.video?.url) throw new Error("fal returned no video URL");
 
-    // Reality is sampled after render. Failure here must not throw away an already-paid-for video.
+    // Under pressure we only extract what continuity strictly needs. FULL mode
+    // samples all three frames so the vision reconciler can audit rendered reality.
+    const frameStartedAt = performance.now();
     const frames = await sampleClipFrames({
       videoUrl: data.video.url,
       knownStartUrl: anchorFrameUrl,
+      mode: mode === "full" ? "full" : "continuity",
     });
+    const frameSampleMs = elapsed(frameStartedAt);
+
+    const visionStartedAt = performance.now();
     const reconciliation = await reconcileRenderedClip({
       episode,
       directive,
@@ -107,45 +122,51 @@ export async function generateNextClip(input: {
       priorWorldState: worldState,
       plannedWorldState: showrunner.nextWorldState,
       frames,
+      skipReason: mode === "full"
+        ? null
+        : `${mode.toUpperCase()} buffer recovery mode: visual reconciliation deferred; planned canon accepted for this episode.`,
     });
+    const visionMs = elapsed(visionStartedAt);
 
     const previousEndMs = input.previousClip
-      ? input.previousClip.startsAtMs +
-        input.previousClip.durationSeconds * 1000
+      ? input.previousClip.startsAtMs + input.previousClip.durationSeconds * 1000
       : 0;
     const startsAtMs = input.previousClip
-      ? Math.max(previousEndMs, Date.now() + 250)
-      : Date.now() + 350;
+      ? Math.max(previousEndMs, Date.now() + 75)
+      : Date.now() + 900;
+    const totalGenerationMs = elapsed(generationStartedAt);
 
-    const clip = await saveClipWithWorldState(
-      {
-        requestId: result.requestId,
-        videoUrl: data.video.url,
-        expandedPrompt: data.expanded_prompt ?? null,
-        h3Prompt: prompt,
-        inferenceSeconds: data.timings?.inference ?? null,
-        directive,
-        directiveId: claimed?.id ?? null,
-        episode,
-        anchorFrameUrl,
-        startFrameUrl: frames.start,
-        middleFrameUrl: frames.middle,
-        endFrameUrl: frames.end,
-        usedAnchorFrame: Boolean(anchorFrameUrl),
-        resolution: input.resolution,
-        startsAtMs,
-        durationSeconds: CLIP_SECONDS,
-        showrunnerModel: showrunner.model,
-        showrunnerPlanJson: JSON.stringify(showrunner.plan),
-        showrunnerInputTokens: showrunner.inputTokens,
-        showrunnerOutputTokens: showrunner.outputTokens,
-      },
-      reconciliation.worldState,
-      {
-        plannedWorldState: showrunner.nextWorldState,
-        audit: reconciliation.audit,
-      },
-    );
+    const clip = await saveClipWithWorldState({
+      requestId: result.requestId,
+      videoUrl: data.video.url,
+      expandedPrompt: data.expanded_prompt ?? null,
+      h3Prompt: prompt,
+      inferenceSeconds: data.timings?.inference ?? null,
+      directive,
+      directiveId: claimed?.id ?? null,
+      episode,
+      anchorFrameUrl,
+      startFrameUrl: frames.start,
+      middleFrameUrl: frames.middle,
+      endFrameUrl: frames.end,
+      usedAnchorFrame: Boolean(anchorFrameUrl),
+      resolution: input.resolution,
+      startsAtMs,
+      durationSeconds: CLIP_SECONDS,
+      showrunnerModel: showrunner.model,
+      showrunnerPlanJson: JSON.stringify(showrunner.plan),
+      showrunnerInputTokens: showrunner.inputTokens,
+      showrunnerOutputTokens: showrunner.outputTokens,
+      generationMode: mode,
+      showrunnerMs,
+      h3Ms,
+      frameSampleMs,
+      visionMs,
+      totalGenerationMs,
+    }, reconciliation.worldState, {
+      plannedWorldState: showrunner.nextWorldState,
+      audit: reconciliation.audit,
+    });
 
     if (claimed) await completeDirective(claimed.id);
     return clip;

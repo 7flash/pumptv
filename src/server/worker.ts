@@ -1,14 +1,17 @@
 import { hostname } from "node:os";
-import {
-  commitPromptRound,
-  ensurePromptRound,
-  GENERATION_LEAD_MS,
-} from "./arbitration.ts";
+import type { GenerationMode } from "../shared/contracts.ts";
+import { commitPromptRound, ensurePromptRound } from "./arbitration.ts";
+import { BUFFER_CLIP_MS, evaluateBuffer } from "./adaptive-buffer.ts";
 import { generateNextClip } from "./generate.ts";
-import { acquireRoomLease, releaseRoomLease, renewRoomLease } from "./lease.ts";
+import {
+  acquireRoomLease,
+  releaseRoomLease,
+  renewRoomLease,
+} from "./lease.ts";
 import { arbitrationMeasure, workerMeasure } from "./observability.ts";
 import {
   getLatestClip,
+  getRecentGenerationTimings,
   getRoomRow,
   hasQueuedDirective,
   nextEpisode,
@@ -17,7 +20,6 @@ import {
 } from "./repository.ts";
 
 const LEASE_TTL_MS = Number(process.env.SLOP_LEASE_TTL_MS || 30_000);
-const TARGET_BUFFER_MS = Number(process.env.SLOP_TARGET_BUFFER_MS || 6_500);
 const IDLE_POLL_MS = Number(process.env.SLOP_IDLE_POLL_MS || 250);
 const ERROR_BACKOFF_MS = Number(process.env.SLOP_ERROR_BACKOFF_MS || 2_000);
 
@@ -29,8 +31,24 @@ function clipEndMs(clip: Awaited<ReturnType<typeof getLatestClip>>) {
   return clip ? clip.startsAtMs + clip.durationSeconds * 1000 : null;
 }
 
+async function bufferSnapshot(
+  latest: Awaited<ReturnType<typeof getLatestClip>>,
+  activeMode?: GenerationMode,
+) {
+  const timings = await getRecentGenerationTimings();
+  const now = Date.now();
+  const endMs = clipEndMs(latest) || now;
+  return evaluateBuffer({
+    bufferMs: Math.max(0, endMs - now),
+    samples: timings,
+    activeMode,
+    hasClip: Boolean(latest),
+  });
+}
+
 async function waitForPromptWindow(
   latest: Awaited<ReturnType<typeof getLatestClip>>,
+  generationLeadMs: number,
 ) {
   if (!latest) return 0;
   if (await hasQueuedDirective()) return 0;
@@ -38,7 +56,7 @@ async function waitForPromptWindow(
   const episode = await nextEpisode();
   const endMs = clipEndMs(latest);
   const round = await arbitrationMeasure.measure("Ensure scene ballot", () =>
-    ensurePromptRound(episode, endMs),
+    ensurePromptRound(episode, endMs, generationLeadMs),
   );
   if (!round) return 0;
 
@@ -46,9 +64,9 @@ async function waitForPromptWindow(
   const bufferMs = Math.max(0, (endMs || now) - now);
   if (now >= round.closesAtMs) return 0;
 
-  // Never preserve voting at the expense of an underrun. Once only the expected
-  // generation lead remains, close early and let the generator start.
-  if (bufferMs <= GENERATION_LEAD_MS) return 0;
+  // Dynamic lead is based on recent end-to-end generation time. Keep voting open
+  // only while measured headroom says the next render can still land safely.
+  if (bufferMs <= generationLeadMs) return 0;
   return Math.max(25, Math.min(500, round.closesAtMs - now));
 }
 
@@ -60,32 +78,28 @@ async function generationTick() {
   }
 
   const latest = await getLatestClip();
-  const now = Date.now();
+  const adaptive = await bufferSnapshot(latest, room.generationMode || "full");
   const bufferedUntilMs = clipEndMs(latest) || 0;
-  const bufferMs = bufferedUntilMs - now;
 
-  if (latest && bufferMs >= TARGET_BUFFER_MS) {
-    // The scene ballot remains live while enough generated video exists.
-    await ensurePromptRound(await nextEpisode(), bufferedUntilMs);
+  if (latest && adaptive.bufferMs >= adaptive.targetBufferMs) {
+    // The prompt market remains live while the worker sits on a healthy 2–3 clip reserve.
+    await ensurePromptRound(await nextEpisode(), bufferedUntilMs, adaptive.adaptiveLeadMs);
     return {
       generated: false,
-      sleepMs: Math.max(100, Math.min(500, bufferMs - TARGET_BUFFER_MS)),
+      sleepMs: Math.max(100, Math.min(500, adaptive.bufferMs - adaptive.targetBufferMs)),
     };
   }
 
-  const ballotSleep = await waitForPromptWindow(latest);
+  const ballotSleep = await waitForPromptWindow(latest, adaptive.adaptiveLeadMs);
   if (ballotSleep > 0) return { generated: false, sleepMs: ballotSleep };
 
   if (!acquireRoomLease(owner, LEASE_TTL_MS)) {
     return { generated: false, sleepMs: IDLE_POLL_MS };
   }
 
-  const heartbeat = setInterval(
-    () => {
-      renewRoomLease(owner, LEASE_TTL_MS);
-    },
-    Math.max(1_000, Math.floor(LEASE_TTL_MS / 3)),
-  );
+  const heartbeat = setInterval(() => {
+    renewRoomLease(owner, LEASE_TTL_MS);
+  }, Math.max(1_000, Math.floor(LEASE_TTL_MS / 3)));
 
   try {
     await recoverGeneratingDirectives();
@@ -93,11 +107,9 @@ async function generationTick() {
     const lockedRoom = await getRoomRow();
     const lockedLatest = await getLatestClip();
     const lockedBufferUntil = clipEndMs(lockedLatest) || 0;
+    const lockedAdaptive = await bufferSnapshot(lockedLatest, lockedRoom.generationMode || "full");
 
-    if (
-      !lockedRoom.running ||
-      (lockedLatest && lockedBufferUntil - Date.now() >= TARGET_BUFFER_MS)
-    ) {
+    if (!lockedRoom.running || (lockedLatest && lockedAdaptive.bufferMs >= lockedAdaptive.targetBufferMs)) {
       return { generated: false, sleepMs: IDLE_POLL_MS };
     }
 
@@ -105,10 +117,10 @@ async function generationTick() {
     const queued = await hasQueuedDirective();
 
     if (lockedLatest && !queued) {
-      const round = await ensurePromptRound(episode, lockedBufferUntil);
+      const round = await ensurePromptRound(episode, lockedBufferUntil, lockedAdaptive.adaptiveLeadMs);
       const now = Date.now();
-      const bufferMs = lockedBufferUntil - now;
-      if (round && now < round.closesAtMs && bufferMs > GENERATION_LEAD_MS) {
+      const bufferMs = Math.max(0, lockedBufferUntil - now);
+      if (round && now < round.closesAtMs && bufferMs > lockedAdaptive.adaptiveLeadMs) {
         return {
           generated: false,
           sleepMs: Math.max(25, Math.min(500, round.closesAtMs - now)),
@@ -121,21 +133,35 @@ async function generationTick() {
       );
     }
 
-    await setWorkerState("generating", null);
+    // Pipeline the market: while episode N is rendering, viewers vote on N+1.
+    // The projected end includes the clip we are about to append to the timeline.
+    const projectedStartMs = lockedLatest
+      ? Math.max(lockedBufferUntil, Date.now() + 75)
+      : Date.now() + 900;
+    const projectedBufferUntil = projectedStartMs + BUFFER_CLIP_MS;
+    await arbitrationMeasure.measure("Open pipelined scene ballot", () =>
+      ensurePromptRound(episode + 1, projectedBufferUntil, lockedAdaptive.adaptiveLeadMs),
+    );
+
+    const mode = lockedLatest ? lockedAdaptive.recommendedMode : "full";
+    await setWorkerState("generating", null, mode);
     const clip = await generateNextClip({
       previousClip: lockedLatest,
       resolution: lockedRoom.resolution,
+      mode,
     });
-    await setWorkerState("idle", null);
+    await setWorkerState("idle", null, mode);
 
-    await arbitrationMeasure.measure("Open next scene ballot", () =>
+    const postAdaptive = await bufferSnapshot(clip, mode);
+    await arbitrationMeasure.measure("Sync next scene ballot", () =>
       ensurePromptRound(
         clip.episode + 1,
         clip.startsAtMs + clip.durationSeconds * 1000,
+        postAdaptive.adaptiveLeadMs,
       ),
     );
 
-    return { generated: true, sleepMs: 50 };
+    return { generated: true, sleepMs: 40 };
   } finally {
     clearInterval(heartbeat);
     releaseRoomLease(owner);
@@ -146,14 +172,9 @@ export async function runRoomWorker() {
   console.log(`[worker] slop room worker ${owner}`);
 
   while (!stopping) {
-    const result = await workerMeasure.measure("Room tick", () =>
-      generationTick(),
-    );
+    const result = await workerMeasure.measure("Room tick", () => generationTick());
     if (!result) {
-      await setWorkerState(
-        "error",
-        "Generation tick failed; retrying automatically.",
-      );
+      await setWorkerState("error", "Generation tick failed; retrying automatically.");
       await sleep(ERROR_BACKOFF_MS);
       continue;
     }
