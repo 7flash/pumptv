@@ -67,9 +67,11 @@ button { font: inherit; }
 }
 .tvScreenFrame { min-width: 0; min-height: 0; display: grid; place-items: center; padding: 8px; border-radius: 24px; background: #030403; box-shadow: inset 0 0 0 2px rgba(0,0,0,.9), inset 0 0 24px rgba(0,0,0,.8), 0 1px 0 rgba(255,255,255,.08); }
 .tvGlass { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; border-radius: 16px; background: #010201; box-shadow: inset 0 0 40px rgba(0,0,0,.72); }
-.tvVideo { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; background: #000; }
-.glassGlow { position: absolute; inset: 0; pointer-events: none; border-radius: inherit; background: linear-gradient(120deg, rgba(255,255,255,.05), transparent 18%, transparent 72%, rgba(100,239,151,.035)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.055); }
-.tvIdle { position: absolute; inset: 0; display: grid; place-items: center; background: radial-gradient(circle, rgba(100,239,151,.08), transparent 30%), #030503; }
+.tvPosterFallback { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; filter: saturate(.96); }
+.tvVideoLayer { position: absolute; z-index: 2; inset: 0; width: 100%; height: 100%; object-fit: cover; background: transparent; opacity: 0; transition: opacity .11s linear; }
+.tvVideoLayer.active { opacity: 1; }
+.glassGlow { position: absolute; z-index: 5; inset: 0; pointer-events: none; border-radius: inherit; background: linear-gradient(120deg, rgba(255,255,255,.05), transparent 18%, transparent 72%, rgba(100,239,151,.035)); box-shadow: inset 0 0 0 1px rgba(255,255,255,.055); }
+.tvIdle { position: absolute; z-index: 4; inset: 0; display: grid; place-items: center; background: radial-gradient(circle, rgba(100,239,151,.08), transparent 30%), #030503; }
 .idleOrb { width: 74px; height: 74px; display: grid; place-items: center; border-radius: 50%; background: #1c241e; box-shadow: inset 0 -6px 14px rgba(0,0,0,.35), 0 0 0 10px rgba(255,255,255,.018); }
 .idleOrb span { color: #687069; font-size: 19px; }
 .idleOrb.work span, .idleOrb.ready span { color: var(--green); text-shadow: 0 0 20px var(--green); }
@@ -77,6 +79,7 @@ button { font: inherit; }
 
 .currentPrompt {
   position: absolute;
+  z-index: 8;
   left: 14px;
   right: 14px;
   bottom: 14px;
@@ -94,6 +97,7 @@ button { font: inherit; }
 
 .nextChip {
   position: absolute;
+  z-index: 8;
   top: 13px;
   right: 13px;
   max-width: 48%;
@@ -113,8 +117,8 @@ button { font: inherit; }
 .nextChip.working .nextArrow { color: var(--yellow); animation: blink .7s infinite alternate; }
 .nextText { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; font-weight: 760; }
 .nextAuthor { color: var(--muted); font: 750 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace; }
-.nextEmpty { position: absolute; top: 16px; right: 16px; padding: 5px 9px 7px; border-radius: 999px; color: #59625a; background: rgba(0,0,0,.35); font-weight: 1000; letter-spacing: .12em; }
-.liveReturn { position: absolute; left: 14px; top: 14px; width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(100,239,151,.38); color: var(--green); background: rgba(5,10,6,.76); box-shadow: 0 0 16px rgba(100,239,151,.18); }
+.nextEmpty { position: absolute; z-index: 8; top: 16px; right: 16px; padding: 5px 9px 7px; border-radius: 999px; color: #59625a; background: rgba(0,0,0,.35); font-weight: 1000; letter-spacing: .12em; }
+.liveReturn { position: absolute; z-index: 9; left: 14px; top: 14px; width: 34px; height: 34px; border-radius: 50%; border: 1px solid rgba(100,239,151,.38); color: var(--green); background: rgba(5,10,6,.76); box-shadow: 0 0 16px rgba(100,239,151,.18); }
 
 .tvHardware { display: flex; flex-direction: column; align-items: center; gap: 22px; padding: 18px 4px 8px; }
 .powerLamp { width: 14px; height: 14px; border: 0; border-radius: 50%; background: #4a524b; box-shadow: inset 0 -2px 3px rgba(0,0,0,.5), 0 0 0 5px rgba(0,0,0,.16); }
@@ -124,6 +128,10 @@ button { font: inherit; }
 .knob { position: relative; width: 49px; height: 49px; border-radius: 50%; border: 1px solid rgba(255,255,255,.15); background: radial-gradient(circle at 35% 30%, #444d45, #202621 58%, #111411); box-shadow: inset 0 -5px 10px rgba(0,0,0,.4), 0 5px 11px rgba(0,0,0,.35); }
 .knob span { position: absolute; width: 3px; height: 14px; border-radius: 2px; top: 7px; left: 22px; background: #808a81; transform-origin: 1.5px 17px; transform: rotate(-38deg); transition: transform .18s ease; }
 .knob.on span { background: var(--green); transform: rotate(38deg); }
+.hardwareControls { display: grid; grid-template-columns: repeat(2, 30px); gap: 8px; }
+.hardwareToggle { width: 30px; height: 26px; display: grid; place-items: center; padding: 0; border-radius: 8px; border: 1px solid rgba(255,255,255,.12); background: linear-gradient(#2b322c, #181d19); color: #737d74; font: 900 13px/1 ui-monospace, SFMono-Regular, Menlo, monospace; box-shadow: inset 0 -3px 6px rgba(0,0,0,.35), 0 2px 4px rgba(0,0,0,.26); cursor: pointer; transform: translateY(0); }
+.hardwareToggle:active { transform: translateY(2px); box-shadow: inset 0 -1px 3px rgba(0,0,0,.35); }
+.hardwareToggle.on { color: #071009; background: var(--green); border-color: rgba(100,239,151,.65); box-shadow: inset 0 -3px 5px rgba(0,0,0,.15), 0 0 12px rgba(100,239,151,.18); }
 .speaker { margin-top: auto; width: 56px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; opacity: .8; }
 .speaker i { width: 7px; height: 7px; margin: auto; border-radius: 50%; background: #0b0e0b; box-shadow: inset 0 1px 2px rgba(0,0,0,.8), 0 1px 0 rgba(255,255,255,.045); }
 .tvScrew { position: absolute; z-index: 3; width: 8px; height: 8px; border-radius: 50%; background: #0d110e; border: 1px solid rgba(255,255,255,.12); box-shadow: inset 0 0 0 2px rgba(255,255,255,.02); }
@@ -162,6 +170,8 @@ button { font: inherit; }
   .tvHardware { gap: 12px; padding-top: 10px; }
   .knob { width: 36px; height: 36px; }
   .knob span { left: 16px; top: 5px; height: 10px; transform-origin: 1.5px 13px; }
+  .hardwareControls { grid-template-columns: 28px; gap: 6px; }
+  .hardwareToggle { width: 28px; height: 24px; font-size: 11px; }
   .speaker { width: 38px; gap: 4px; }
   .speaker i { width: 5px; height: 5px; }
   .episodeCard { grid-template-columns: 1fr; min-height: 60px; }

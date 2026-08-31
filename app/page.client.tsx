@@ -10,13 +10,19 @@ let timeline: Clip[] = [];
 let room: RoomState | null = null;
 let nextDirective: Directive | null = null;
 let serverOffsetMs = 0;
-let soundEnabled = false;
 let replayClipId: number | null = null;
 let source: EventSource | null = null;
 let viewerId = "";
 let transport: "connecting" | "live" | "reconnecting" = "connecting";
 let error: string | null = null;
 let timer: ReturnType<typeof setInterval> | null = null;
+
+let soundEnabled = false;
+let captionsEnabled = true;
+let nextCueEnabled = true;
+let activeVideoSlot = 0;
+let activeVideoClipId: number | null = null;
+let swappingVideo = false;
 
 function liveNowMs() {
   return Date.now() + serverOffsetMs;
@@ -37,13 +43,28 @@ function replayClip() {
     : timeline.find((clip) => clip.id === replayClipId) || null;
 }
 
-function displayClip() {
+function desiredClip() {
   return replayClip() || latestPublishedClip();
+}
+
+function visibleClip() {
+  return (
+    (activeVideoClipId == null
+      ? null
+      : timeline.find((clip) => clip.id === activeVideoClipId)) || desiredClip()
+  );
 }
 
 function nextScheduledClip() {
   const now = liveNowMs();
   return timeline.find((clip) => clip.startsAtMs > now) || null;
+}
+
+function clipAfter(clip: Clip | null) {
+  if (!clip) return null;
+  const ordered = replayClipId == null ? timeline : publishedTimeline();
+  const index = ordered.findIndex((candidate) => candidate.id === clip.id);
+  return index >= 0 ? ordered[index + 1] || null : null;
 }
 
 function redraw() {
@@ -71,20 +92,33 @@ function applyState(state: StreamState) {
     replayClipId = null;
   error = null;
   redraw();
-  queueMicrotask(syncVideo);
+  queueMicrotask(syncVideoDeck);
 }
 
-function ensureViewerId() {
+function readPref(key: string, fallback: boolean) {
+  const value = localStorage.getItem(key);
+  return value == null ? fallback : value === "1";
+}
+
+function writePref(key: string, value: boolean) {
+  localStorage.setItem(key, value ? "1" : "0");
+}
+
+function ensureViewerIdAndPrefs() {
   const key = "pumptv-viewer-id";
   viewerId = localStorage.getItem(key) || "";
   if (!viewerId) {
     viewerId = crypto.randomUUID();
     localStorage.setItem(key, viewerId);
   }
+
+  soundEnabled = readPref("pumptv-sound", false);
+  captionsEnabled = readPref("pumptv-captions", true);
+  nextCueEnabled = readPref("pumptv-next-cue", true);
 }
 
 async function boot() {
-  ensureViewerId();
+  ensureViewerIdAndPrefs();
   try {
     applyState(await json<StreamState>("/api/state"));
   } catch (cause) {
@@ -98,6 +132,7 @@ async function boot() {
   source.onopen = () => {
     transport = "live";
     redraw();
+    queueMicrotask(syncVideoDeck);
   };
   source.onmessage = (event) => {
     try {
@@ -112,54 +147,186 @@ async function boot() {
     redraw();
   };
 
-  timer = setInterval(() => {
-    redraw();
-    queueMicrotask(syncVideo);
-  }, 500);
+  // Playback timing is deliberately separate from UI rendering. The video deck
+  // can swap on the exact episode boundary without rerendering the whole app.
+  timer = setInterval(syncVideoDeck, 100);
 }
 
-function syncVideo() {
-  const clip = displayClip();
-  const video = document.querySelector(
-    "video.tvVideo",
-  ) as HTMLVideoElement | null;
-  if (!clip || !video) return;
+function videoNodes() {
+  return [0, 1].map(
+    (slot) =>
+      document.querySelector(
+        `video.tvVideoLayer[data-slot="${slot}"]`,
+      ) as HTMLVideoElement | null,
+  );
+}
 
-  video.muted = !soundEnabled;
+function clipPoster(clip: Clip | null) {
+  if (!clip) return "";
+  return clip.anchorFrameUrl || clip.startFrameUrl || clip.endFrameUrl || "";
+}
 
-  // Live follows the newest published clip. When no newer Pump.fun prompt exists,
-  // keep the last episode looping instead of showing a dead screen.
-  if (replayClipId == null) {
-    const age = Math.max(0, (liveNowMs() - clip.startsAtMs) / 1000);
-    if (age < clip.durationSeconds && Math.abs(video.currentTime - age) > 0.8) {
-      video.currentTime = age;
+function configureVideo(video: HTMLVideoElement, clip: Clip, slot: number) {
+  if (video.dataset.clipId === String(clip.id) && video.src) return;
+
+  video.pause();
+  video.classList.remove("active");
+  video.dataset.clipId = String(clip.id);
+  video.dataset.ready = "0";
+  video.preload = "auto";
+  video.playsInline = true;
+  video.muted = true;
+  video.poster = clipPoster(clip);
+  video.src = clip.videoUrl;
+  video.oncanplay = () => {
+    video.dataset.ready = "1";
+    syncVideoDeck();
+  };
+  video.onloadeddata = () => {
+    video.dataset.ready = "1";
+    syncVideoDeck();
+  };
+  video.onended = () => handleDeckEnded(slot, clip.id);
+  video.load();
+}
+
+function targetTimeFor(clip: Clip) {
+  if (replayClipId != null) return 0;
+  const duration = Math.max(0.1, clip.durationSeconds);
+  const age = Math.max(0, (liveNowMs() - clip.startsAtMs) / 1000);
+  // When chat is quiet the newest episode is the channel loop. Keep it moving
+  // while waiting, but a newly scheduled clip can still take over immediately.
+  return age % duration;
+}
+
+function activateVideoSlot(
+  slot: number,
+  clip: Clip,
+  video: HTMLVideoElement,
+  nodes: Array<HTMLVideoElement | null>,
+) {
+  const alreadyActive =
+    slot === activeVideoSlot &&
+    activeVideoClipId === clip.id &&
+    video.classList.contains("active");
+  if (alreadyActive) {
+    video.muted = !soundEnabled;
+    if (video.paused) void video.play().catch(() => {});
+    return;
+  }
+  if (swappingVideo) return;
+  swappingVideo = true;
+
+  const previous = nodes[activeVideoSlot];
+  const changedClip = activeVideoClipId !== clip.id;
+
+  if (changedClip) {
+    try {
+      video.currentTime = targetTimeFor(clip);
+    } catch {}
+  } else if (replayClipId == null) {
+    const target = targetTimeFor(clip);
+    if (Math.abs(video.currentTime - target) > 0.9) {
+      try {
+        video.currentTime = target;
+      } catch {}
     }
   }
 
-  void video.play().catch(() => {});
+  video.muted = !soundEnabled;
+  void video
+    .play()
+    .then(() => {
+      // The incoming deck becomes visible only after play() succeeds. The outgoing
+      // deck therefore remains the visual fallback throughout network/decode delay.
+      video.classList.add("active");
+      video.setAttribute("aria-hidden", "false");
+      if (previous && previous !== video) {
+        previous.classList.remove("active");
+        previous.setAttribute("aria-hidden", "true");
+        previous.muted = true;
+        previous.pause();
+      }
+
+      activeVideoSlot = slot;
+      const didChange = activeVideoClipId !== clip.id;
+      activeVideoClipId = clip.id;
+      swappingVideo = false;
+      if (didChange) redraw();
+      queueMicrotask(syncVideoDeck);
+    })
+    .catch(() => {
+      swappingVideo = false;
+    });
 }
 
-function toggleSound() {
-  soundEnabled = !soundEnabled;
-  redraw();
-  queueMicrotask(syncVideo);
+function syncVideoDeck() {
+  const wanted = desiredClip();
+  const nodes = videoNodes();
+  if (!nodes[0] || !nodes[1]) return;
+
+  if (!wanted) {
+    for (const video of nodes) {
+      if (!video) continue;
+      video.pause();
+      video.classList.remove("active");
+      video.muted = true;
+    }
+    activeVideoClipId = null;
+    return;
+  }
+
+  let wantedSlot = nodes.findIndex(
+    (video) => video?.dataset.clipId === String(wanted.id),
+  );
+  if (wantedSlot < 0) {
+    wantedSlot =
+      activeVideoClipId == null ? activeVideoSlot : 1 - activeVideoSlot;
+    const target = nodes[wantedSlot];
+    if (target) configureVideo(target, wanted, wantedSlot);
+  }
+
+  const wantedVideo = nodes[wantedSlot];
+  if (wantedVideo) {
+    const ready =
+      wantedVideo.dataset.ready === "1" ||
+      wantedVideo.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
+    if (ready) activateVideoSlot(wantedSlot, wanted, wantedVideo, nodes);
+  }
+
+  const activeClip =
+    activeVideoClipId == null
+      ? null
+      : timeline.find((clip) => clip.id === activeVideoClipId) || wanted;
+  const preload = clipAfter(activeClip);
+  if (preload && preload.id !== wanted.id) {
+    const preloadSlot = 1 - activeVideoSlot;
+    const preloadVideo = nodes[preloadSlot];
+    if (preloadVideo && preloadVideo.dataset.clipId !== String(preload.id)) {
+      configureVideo(preloadVideo, preload, preloadSlot);
+    }
+  }
+
+  const active = nodes[activeVideoSlot];
+  if (active && activeVideoClipId === wanted.id) {
+    active.muted = !soundEnabled;
+    if (
+      replayClipId == null &&
+      active.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+    ) {
+      const target = targetTimeFor(wanted);
+      if (Math.abs(active.currentTime - target) > 1.1) {
+        try {
+          active.currentTime = target;
+        } catch {}
+      }
+    }
+  }
 }
 
-function jumpToEpisode(id: number) {
-  const live = latestPublishedClip();
-  replayClipId = live?.id === id ? null : id;
-  redraw();
-  queueMicrotask(syncVideo);
-}
+function handleDeckEnded(slot: number, clipId: number) {
+  if (slot !== activeVideoSlot || clipId !== activeVideoClipId) return;
 
-function returnLive() {
-  replayClipId = null;
-  redraw();
-  queueMicrotask(syncVideo);
-}
-
-function handleEnded(event: Event) {
-  const video = event.currentTarget as HTMLVideoElement;
   if (replayClipId != null) {
     const published = publishedTimeline();
     const index = published.findIndex((clip) => clip.id === replayClipId);
@@ -167,18 +334,71 @@ function handleEnded(event: Event) {
     const live = latestPublishedClip();
     if (following && following.id !== live?.id) {
       replayClipId = following.id;
-      redraw();
-      queueMicrotask(syncVideo);
-      return;
+    } else {
+      replayClipId = null;
     }
-    replayClipId = null;
     redraw();
-    queueMicrotask(syncVideo);
+    queueMicrotask(syncVideoDeck);
     return;
   }
 
-  video.currentTime = 0;
-  void video.play().catch(() => {});
+  const current = timeline.find((clip) => clip.id === clipId) || null;
+  const following = clipAfter(current);
+  if (following && following.startsAtMs <= liveNowMs() + 250) {
+    syncVideoDeck();
+    return;
+  }
+
+  // No next Pump.fun episode is ready yet. Loop the latest episode without ever
+  // clearing the current frame; the second deck remains free for preloading.
+  const active = videoNodes()[slot];
+  if (active) {
+    try {
+      active.currentTime = 0;
+    } catch {}
+    active.muted = !soundEnabled;
+    void active.play().catch(() => {});
+  }
+}
+
+function toggleSound() {
+  soundEnabled = !soundEnabled;
+  writePref("pumptv-sound", soundEnabled);
+  redraw();
+  queueMicrotask(syncVideoDeck);
+}
+
+function toggleCaptions() {
+  captionsEnabled = !captionsEnabled;
+  writePref("pumptv-captions", captionsEnabled);
+  redraw();
+}
+
+function toggleNextCue() {
+  nextCueEnabled = !nextCueEnabled;
+  writePref("pumptv-next-cue", nextCueEnabled);
+  redraw();
+}
+
+async function toggleFullscreen() {
+  const target = document.querySelector(".tvShell") as HTMLElement | null;
+  try {
+    if (document.fullscreenElement) await document.exitFullscreen();
+    else if (target?.requestFullscreen) await target.requestFullscreen();
+  } catch {}
+}
+
+function jumpToEpisode(id: number) {
+  const live = latestPublishedClip();
+  replayClipId = live?.id === id ? null : id;
+  redraw();
+  queueMicrotask(syncVideoDeck);
+}
+
+function returnLive() {
+  replayClipId = null;
+  redraw();
+  queueMicrotask(syncVideoDeck);
 }
 
 function shortAddress(value: string | null | undefined) {
@@ -246,10 +466,31 @@ function tooltipStatus() {
   return "Waiting for the next Pump.fun prompt";
 }
 
+function ControlButton(props: {
+  active?: boolean;
+  title: string;
+  glyph: string;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      className={`hardwareToggle ${props.active ? "on" : ""}`}
+      type="button"
+      onClick={props.onClick}
+      title={props.title}
+      aria-label={props.title}
+      aria-pressed={Boolean(props.active)}
+    >
+      {props.glyph}
+    </button>
+  );
+}
+
 function TactileTV({ clip }: { clip: Clip | null }) {
   const state = engineState();
   const isReplay = replayClipId != null;
   const prompt = nextPrompt();
+  const poster = clipPoster(clip);
 
   return (
     <div className="tvShell">
@@ -260,26 +501,35 @@ function TactileTV({ clip }: { clip: Clip | null }) {
 
       <div className="tvScreenFrame">
         <div className="tvGlass">
-          {clip ? (
-            <video
-              className="tvVideo"
-              src={clip.videoUrl}
-              autoplay
-              playsInline
-              muted={!soundEnabled}
-              onEnded={handleEnded as any}
-            />
-          ) : (
+          {poster ? (
+            <img className="tvPosterFallback" src={poster} alt="" />
+          ) : null}
+          <video
+            className="tvVideoLayer"
+            data-slot="0"
+            preload="auto"
+            playsInline
+            aria-hidden="true"
+          />
+          <video
+            className="tvVideoLayer"
+            data-slot="1"
+            preload="auto"
+            playsInline
+            aria-hidden="true"
+          />
+
+          {!clip ? (
             <div className="tvIdle" title={tooltipStatus()}>
               <div className={`idleOrb ${state}`}>
                 <span>●</span>
               </div>
             </div>
-          )}
+          ) : null}
 
           <div className="glassGlow" />
 
-          {clip ? (
+          {clip && captionsEnabled ? (
             <div
               className="currentPrompt"
               title={`Episode ${clip.episode + 1} · ${clipAuthor(clip)}`}
@@ -295,12 +545,13 @@ function TactileTV({ clip }: { clip: Clip | null }) {
               type="button"
               onClick={returnLive}
               title="Return to live"
+              aria-label="Return to live"
             >
               ●
             </button>
           ) : null}
 
-          {prompt ? (
+          {nextCueEnabled && prompt ? (
             <div
               className={`nextChip ${prompt.generating ? "working" : ""}`}
               title="Next prompt from Pump.fun chat"
@@ -309,14 +560,14 @@ function TactileTV({ clip }: { clip: Clip | null }) {
               <span className="nextText">{prompt.text}</span>
               <span className="nextAuthor">{prompt.author}</span>
             </div>
-          ) : (
+          ) : nextCueEnabled ? (
             <div
               className="nextEmpty"
               title="Waiting for the next Pump.fun prompt"
             >
               •••
             </div>
-          )}
+          ) : null}
         </div>
       </div>
 
@@ -332,9 +583,33 @@ function TactileTV({ clip }: { clip: Clip | null }) {
           onClick={toggleSound}
           title={soundEnabled ? "Mute" : "Unmute"}
           aria-label={soundEnabled ? "Mute" : "Unmute"}
+          aria-pressed={soundEnabled}
         >
           <span />
         </button>
+
+        <div className="hardwareControls">
+          <ControlButton
+            active={captionsEnabled}
+            title={
+              captionsEnabled ? "Hide prompt caption" : "Show prompt caption"
+            }
+            glyph="▤"
+            onClick={toggleCaptions}
+          />
+          <ControlButton
+            active={nextCueEnabled}
+            title={nextCueEnabled ? "Hide next prompt" : "Show next prompt"}
+            glyph="↗"
+            onClick={toggleNextCue}
+          />
+          <ControlButton
+            title="Fullscreen"
+            glyph="⛶"
+            onClick={toggleFullscreen}
+          />
+        </div>
+
         <div className="speaker" aria-hidden="true">
           {Array.from({ length: 18 }, (_, i) => (
             <i key={i} />
@@ -347,7 +622,7 @@ function TactileTV({ clip }: { clip: Clip | null }) {
 
 function EpisodeShelf() {
   const published = [...publishedTimeline()].reverse();
-  const shown = displayClip();
+  const shown = visibleClip();
   const live = latestPublishedClip();
 
   return (
@@ -396,7 +671,7 @@ function EpisodeShelf() {
 }
 
 function App() {
-  const clip = displayClip();
+  const clip = visibleClip();
   const state = engineState();
 
   return (

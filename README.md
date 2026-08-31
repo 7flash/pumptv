@@ -1,47 +1,43 @@
-# PumpTV v0.17
+# PumpTV v0.19
 
-PumpTV is a shared AI-generated live video stream driven by Pump.fun chat.
+PumpTV is a shared AI-generated video channel driven only by Pump.fun chat. The web UI is view-only.
 
-The browser is deliberately **view-only**. There is no prompt box, web voting, or web queue mutation. Pump.fun chat is the only source of continuation prompts.
+## Playback
 
-## Behavior
+- 480P / 16:9 by default inside a fixed tactile TV enclosure.
+- Two video decks are kept in the browser. While one episode plays, the next generated episode is preloaded into the other deck. PumpTV only swaps decks after the incoming video has decoded enough data to play.
+- The outgoing frame remains visible during network/decode delay, so episode changes do not expose a black loading frame.
+- When no Pump.fun continuation exists, the newest episode loops.
+- The vertical episode shelf remains available for replay; replay does not stop generation.
 
-- PumpTV generates **one opening episode** automatically on a fresh database.
-- After the opening, the worker does **nothing** until an accepted Pump.fun chat prompt is queued.
-- Each accepted Pump.fun prompt becomes exactly one future episode, FIFO.
-- No autopilot filler is generated when chat is quiet.
-- Default output is **480P / 16:9**.
-- The video sits inside a fixed tactile TV-style player so 480P still reads intentionally.
-- The right-side episode shelf is vertical and replayable, similar to an anime episode browser.
-- Replaying old episodes does not stop the authoritative worker.
-- The latest finished episode loops while PumpTV waits for another Pump.fun prompt.
-- Viewer count comes from active room SSE presence.
-- Visual/canon reconciliation is disabled for now. The JSX-AI/Codex showrunner still carries planned continuity/world state forward, and the previous clip's end frame remains the next H3 image anchor.
+The TV hardware has local viewer controls with tooltip-only labels:
 
-## Prompt source
+- rotary knob: sound on/off
+- `▤`: current prompt caption
+- `↗`: next Pump.fun prompt cue
+- `⛶`: fullscreen
 
-By default only Pump.fun messages beginning with `!next` are accepted:
+Sound, caption, and next-cue preferences persist in `localStorage`.
+
+## Generation behavior
+
+- A fresh database generates EP 1 once to establish the world.
+- EP 2+ require a real accepted Pump.fun message.
+- There is no browser prompt box, browser voting, or autopilot continuation.
+- Pump.fun messages are FIFO. The immediate next prompt can be shown on the TV; the rest stay server-side.
+- Vision/canon reconciliation is disabled. Continuity comes from the durable planned world state plus the previous episode's final-frame H3 image anchor.
+
+## Pump.fun
+
+Default chat command:
 
 ```text
-!next the vending machine opens and a tiny limo drives out
+!next the freezer door opens and something impossible rolls out
 ```
 
-Set `pumpfun_prefix = ""` to treat every Pump.fun chat message as a continuation prompt.
-
-There is no `!vote` command in the current version.
+Set `pumpfun_prefix = ""` to accept every Pump.fun chat message as a continuation prompt.
 
 ## Runtime
-
-PumpTV uses:
-
-- `tradjs` + `tradjs/client`
-- `bgrun` SDK for the managed generation worker
-- `sqlite-zod-orm`
-- `measure-fn`
-- `jsx-ai` native Codex mode
-- fal / MiniMax H3 Max for video
-
-The web process starts/refreshes `pumptv-worker` through `bgrun.handleRun()` using the same repo-root `.config.toml`.
 
 ```powershell
 bun install
@@ -53,13 +49,33 @@ bunx bgrun `
   --force
 ```
 
-Worker logs:
+The TradJS process manages `pumptv-worker` through the bgrun SDK. Worker logs:
 
 ```powershell
 bunx bgrun pumptv-worker --logs
 ```
 
-## `.config.toml`
+## Reset / regenerate from an episode
+
+Reset is intentionally **inclusive**: resetting from EP 7 deletes EP 7 and later, keeps EP 1–6, and re-queues the Pump.fun messages that originally produced the removed episodes. The next generated episode is EP 7 again.
+
+Interactive:
+
+```powershell
+bun run reset
+```
+
+Direct:
+
+```powershell
+bun run reset -- 7
+# or
+bun run reset -- --from=7
+```
+
+The command refuses to mutate the timeline while a render is actively generating. It loads the repo-root `.config.toml` itself, so it uses the same SQLite path as web/worker without `bgrun inline`.
+
+## Config
 
 ```toml
 [fal]
@@ -75,9 +91,7 @@ approval_policy = "never"
 db_path = ".data/pumptv.sqlite"
 room = "main"
 resolution = "480P"
-admin_token = ""
 
-min_generation_interval_ms = 0
 lease_ttl_ms = 30000
 timeline_window = 96
 idle_poll_ms = 500
@@ -95,43 +109,6 @@ silent = 1
 timestamps = 1
 ```
 
-## Important when upgrading from the old autopilot builds
+## JSX-AI showrunner
 
-Older builds may already have generated many filler episodes. v0.17 does not delete history automatically. If you want to test the new behavior from a clean slate, stop PumpTV and remove:
-
-```text
-.data/pumptv.sqlite
-```
-
-Then restart. You should see one opening episode and no EP 2 until a real Pump.fun prompt arrives.
-
-## Expected worker log
-
-Fresh database:
-
-```text
-[worker] generating EP 1 · 480P · opening
-[showrunner] staged EP 1 via JSX-AI tools · ... calls · Codex ...
-[worker] published EP 1 · ...ms
-```
-
-Then the worker stays idle.
-
-After Pump.fun receives:
-
-```text
-!next a shopping cart rolls in by itself
-```
-
-logs should show:
-
-```text
-[pumpfun] queued @username → a shopping cart rolls in by itself
-[worker] generating EP 2 · 480P · pump.fun prompt
-[showrunner] staged EP 2 via JSX-AI tools · ... calls · Codex ...
-[worker] published EP 2 · ...ms
-```
-## v0.18 showrunner architecture
-
-The JSX-AI showrunner is tool-driven rather than JSON-text-driven. The prompt is composed from reusable JSX components for identity, continuity doctrine, canon context, recent episodes, Pump.fun intent, and production tools. `stage_shot` is mandatory once; canon is updated only through patch tools such as `set_location`, `upsert_character`, `upsert_prop`, `open_thread`, and `resolve_thread`. PumpTV uses JSX-AI's `natural` tool strategy for the native Codex path so JSX-AI itself renders/parses the tool protocol into `result.toolCalls`. The server applies those calls to durable canon; it no longer scrapes a JSON object from model text.
-
+The showrunner uses reusable JSX prompt components and JSX-AI's tool protocol. `stage_shot` commits the next shot; canon changes happen through explicit tools such as `set_location`, `upsert_character`, `upsert_prop`, `open_thread`, and `resolve_thread`. Existing canon is server-owned and is patched rather than rewritten wholesale.
