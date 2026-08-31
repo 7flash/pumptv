@@ -1,4 +1,5 @@
 import { getStreamState } from "./repository.ts";
+import { viewerJoined, viewerLeft } from "./presence.ts";
 
 const encoder = new TextEncoder();
 const subscribers = new Set<ReadableStreamDefaultController<Uint8Array>>();
@@ -6,7 +7,10 @@ let timer: ReturnType<typeof setTimeout> | null = null;
 let lastPayload = "";
 let polling = false;
 
-function write(controller: ReadableStreamDefaultController<Uint8Array>, payload: string) {
+function write(
+  controller: ReadableStreamDefaultController<Uint8Array>,
+  payload: string,
+) {
   controller.enqueue(encoder.encode(`data: ${payload}\n\n`));
 }
 
@@ -54,13 +58,15 @@ function remove(controller: ReadableStreamDefaultController<Uint8Array>) {
   }
 }
 
-export function streamState(signal: AbortSignal) {
+export function streamState(signal: AbortSignal, viewerId = "") {
+  let presenceKey: string | null = null;
   let controllerRef: ReadableStreamDefaultController<Uint8Array> | null = null;
 
   return new ReadableStream<Uint8Array>({
     start(controller) {
       controllerRef = controller;
       subscribers.add(controller);
+      presenceKey = viewerJoined(viewerId);
 
       if (lastPayload) write(controller, lastPayload);
       if (!timer && !polling) void poll();
@@ -69,6 +75,10 @@ export function streamState(signal: AbortSignal) {
         "abort",
         () => {
           remove(controller);
+          if (presenceKey) {
+            viewerLeft(presenceKey);
+            presenceKey = null;
+          }
           try {
             controller.close();
           } catch {}
@@ -78,6 +88,10 @@ export function streamState(signal: AbortSignal) {
     },
     cancel() {
       if (controllerRef) remove(controllerRef);
+      if (presenceKey) {
+        viewerLeft(presenceKey);
+        presenceKey = null;
+      }
     },
   });
 }

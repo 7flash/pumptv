@@ -1,6 +1,6 @@
 # SLOP TV
 
-An endless shared AI-generated livestream where the audience decides what happens next. v0.10 adds a **rolling adaptive playback reserve**: voting for scene N+1 overlaps scene N rendering, measured generation latency controls ballot safety margins, and the pipeline automatically degrades from FULL → FAST → EMERGENCY before playback runs dry. The continuity stack from v0.9 remains: jsx-ai plans, H3 renders, and FULL mode visually reconciles rendered reality back into durable canon.
+An endless shared AI-generated livestream where the audience decides what happens next. v0.11 adds a **replay line + graceful generation recovery + live audience count** on top of the adaptive reserve: every published episode stays jumpable from a horizontal bottom rail, insufficient fal credits/provider cooldowns fall back to archive playback instead of a dead player, optional render spacing is supported, and the UI shows unique active room viewers. The continuity stack remains: jsx-ai plans, H3 renders, and FULL mode visually reconciles rendered reality back into durable canon.
 
 ## Stack
 
@@ -31,6 +31,33 @@ bun run worker
 
 Open `http://localhost:3000`.
 
+
+## v0.11 replay line / balance-safe archive / viewer count
+
+The video stage now has a persistent horizontal **REPLAY LINE** at the bottom. It only exposes episodes whose scheduled start time has already been reached, so prebuffered future clips are never leaked. Clicking a candle detaches that viewer from the wall-clock stream and replays the chosen episode; playback advances through recorded episodes until it catches the live edge. The NOW PLAYING card switches to `REWATCHING`, keeps the original prompt + suggester/source/proposal/vote attribution, and exposes a one-click `RETURN TO LIVE`.
+
+If there is no live clip because generation is delayed, the latest published episode automatically becomes an **ARCHIVE LOOP** rather than showing a dead black stage. This makes the existing library usable even during long funding/provider interruptions. `SLOP_TIMELINE_WINDOW` controls how many recent episodes are shipped in the live state/rail (default 64, capped server-side).
+
+Generation availability is durable room state in SQLite. fal/H3 failures are classified into:
+
+```text
+funds       → insufficient credits / payment-required style failure
+rate_limit  → 429 / quota cooldown
+provider    → other transient provider failure
+cooldown    → intentional spacing between successful generations
+```
+
+The claimed winning directive is released back to `queued` on any failed generation, so low balance never eats the audience's winner. Funds/provider failures use exponential retry delays and keep every completed episode replayable. After a successful generation the pause clears automatically. Optional spacing can be enabled with `SLOP_MIN_GENERATION_INTERVAL_MS`; this deliberately allows gaps between new scenes while the archive stays available.
+
+```bash
+SLOP_MIN_GENERATION_INTERVAL_MS=0
+SLOP_FUNDS_RETRY_BASE_MS=30000
+SLOP_FUNDS_RETRY_MAX_MS=900000
+SLOP_PROVIDER_RETRY_BASE_MS=3000
+SLOP_PROVIDER_RETRY_MAX_MS=60000
+```
+
+The header/footer also show `👁 N WATCHING`. Presence is counted from unique active SSE viewer IDs, so EventSource reconnects and multiple connections using the same local identity do not inflate the number. This is intentionally an in-process presence adapter for the current single TradJS web process; if the web tier is horizontally replicated, replace `src/server/presence.ts` with Redis/edge presence while leaving the StreamState contract unchanged.
 
 ## Prompt generation / AI showrunner
 

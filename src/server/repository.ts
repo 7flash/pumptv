@@ -17,6 +17,7 @@ import { db } from "./db.ts";
 import { ROOM_NAME } from "./lease.ts";
 import { dbMeasure } from "./observability.ts";
 import { EMPTY_WORLD_STATE, parseWorldStateJson } from "./world-state.ts";
+import { getViewerCount } from "./presence.ts";
 
 const PUMPFUN_MINT = (process.env.SLOP_PUMPFUN_MINT || "").trim();
 const PUMPFUN_PREFIX = process.env.SLOP_PUMPFUN_PREFIX ?? "!next";
@@ -51,6 +52,13 @@ function toClip(row: any): Clip {
     frameSampleMs: row.frameSampleMs ?? null,
     visionMs: row.visionMs ?? null,
     totalGenerationMs: row.totalGenerationMs ?? null,
+    directiveSource: row.directiveSource ?? null,
+    directiveAuthor: row.directiveAuthor ?? null,
+    directiveAuthorAddress: row.directiveAuthorAddress ?? null,
+    directiveProposalId:
+      row.directiveProposalId == null ? null : Number(row.directiveProposalId),
+    directiveVoteCount:
+      row.directiveVoteCount == null ? null : Number(row.directiveVoteCount),
   };
 }
 
@@ -70,26 +78,29 @@ function toDirective(row: any): Directive {
   };
 }
 
-
 function directiveWithVotesById(id: number) {
-  return dbMeasure.measureSync("Load attributed directive", () =>
-    db.raw<any>(
-      `SELECT d.*,
+  return dbMeasure.measureSync(
+    "Load attributed directive",
+    () =>
+      db.raw<any>(
+        `SELECT d.*,
               CASE WHEN d.proposalId IS NULL THEN NULL
                    ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
               END AS voteCount
        FROM directives d
        WHERE d.id = ?
        LIMIT 1`,
-      id,
-    )[0] || null,
+        id,
+      )[0] || null,
   );
 }
 
 function nextPendingDirectiveWithVotes() {
-  return dbMeasure.measureSync("Load next pending directive", () =>
-    db.raw<any>(
-      `SELECT d.*,
+  return dbMeasure.measureSync(
+    "Load next pending directive",
+    () =>
+      db.raw<any>(
+        `SELECT d.*,
               CASE WHEN d.proposalId IS NULL THEN NULL
                    ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
               END AS voteCount
@@ -97,7 +108,7 @@ function nextPendingDirectiveWithVotes() {
        WHERE d.status IN ('generating', 'queued')
        ORDER BY CASE d.status WHEN 'generating' THEN 0 ELSE 1 END, d.id ASC
        LIMIT 1`,
-    )[0] || null,
+      )[0] || null,
   );
 }
 
@@ -116,7 +127,11 @@ function recentDirectivesWithVotes(limit: number) {
   );
 }
 
-function toRoom(row: any, bufferedUntilMs: number | null = null, buffer?: RoomState["buffer"]): RoomState {
+function toRoom(
+  row: any,
+  bufferedUntilMs: number | null = null,
+  buffer?: RoomState["buffer"],
+): RoomState {
   return {
     name: row.name,
     running: Boolean(row.running),
@@ -124,7 +139,14 @@ function toRoom(row: any, bufferedUntilMs: number | null = null, buffer?: RoomSt
     workerState: row.workerState,
     lastError: row.lastError ?? null,
     bufferedUntilMs,
-    buffer: buffer || evaluateBuffer({ bufferMs: 0, samples: [], activeMode: row.generationMode || "full", hasClip: false }),
+    buffer:
+      buffer ||
+      evaluateBuffer({
+        bufferMs: 0,
+        samples: [],
+        activeMode: row.generationMode || "full",
+        hasClip: false,
+      }),
     pumpfun: {
       enabled: Boolean(PUMPFUN_MINT),
       mint: PUMPFUN_MINT || null,
@@ -133,6 +155,17 @@ function toRoom(row: any, bufferedUntilMs: number | null = null, buffer?: RoomSt
       state: PUMPFUN_MINT ? row.pumpChatState || "standby" : "disabled",
       lastError: row.pumpChatError ?? null,
     },
+    generation: {
+      paused: Boolean(row.generationPauseKind),
+      kind: row.generationPauseKind ?? null,
+      reason: row.generationPauseReason ?? null,
+      retryAtMs:
+        row.generationRetryAtMs == null
+          ? null
+          : Number(row.generationRetryAtMs),
+      failureCount: Number(row.generationFailureCount || 0),
+    },
+    viewerCount: getViewerCount(),
   };
 }
 
@@ -146,13 +179,18 @@ export async function getRoomRow() {
   );
 
   if (!row) {
-    row = await dbMeasure.measureSync("Create room", () => db.rooms.insert({ name: ROOM_NAME }));
+    row = await dbMeasure.measureSync("Create room", () =>
+      db.rooms.insert({ name: ROOM_NAME }),
+    );
   }
   if (!row) throw new Error("Room row is missing");
   return row as any;
 }
 
-export async function updateRoomSettings(input: { running?: boolean; resolution?: Resolution }) {
+export async function updateRoomSettings(input: {
+  running?: boolean;
+  resolution?: Resolution;
+}) {
   const room = await getRoomRow();
   const patch: Record<string, unknown> = {};
   if (typeof input.running === "boolean") patch.running = input.running;
@@ -160,7 +198,10 @@ export async function updateRoomSettings(input: { running?: boolean; resolution?
   if (!Object.keys(patch).length) return room;
 
   await dbMeasure.measureSync("Update room settings", () =>
-    db.rooms.select().where({ id: room.id }).updateAll(patch as any),
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll(patch as any),
   );
   return getRoomRow();
 }
@@ -172,27 +213,86 @@ export async function setWorkerState(
 ) {
   const room = await getRoomRow();
   return dbMeasure.measureSync("Set worker state", () =>
-    db.rooms.select().where({ id: room.id }).updateAll({
-      workerState: state,
-      lastError: error ? error.replace(/\s+/g, " ").trim().slice(0, 600) : null,
-      ...(generationMode ? { generationMode } : {}),
-    }),
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({
+        workerState: state,
+        lastError: error
+          ? error.replace(/\s+/g, " ").trim().slice(0, 600)
+          : null,
+        ...(generationMode ? { generationMode } : {}),
+      }),
   );
 }
 
-export async function setPumpChatState(state: PumpChatState, error: string | null = null) {
+export async function setGenerationPause(input: {
+  kind: "cooldown" | "funds" | "rate_limit" | "provider";
+  reason: string;
+  retryAtMs: number;
+  failureCount?: number;
+}) {
+  const room = await getRoomRow();
+  return dbMeasure.measureSync("Pause generation", () =>
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({
+        generationPauseKind: input.kind,
+        generationPauseReason: input.reason
+          .replace(/\s+/g, " ")
+          .trim()
+          .slice(0, 600),
+        generationRetryAtMs: input.retryAtMs,
+        generationFailureCount:
+          input.failureCount ?? Number(room.generationFailureCount || 0),
+        workerState: "idle",
+        lastError: null,
+      }),
+  );
+}
+
+export async function clearGenerationPause(lastGenerationAtMs?: number) {
+  const room = await getRoomRow();
+  return dbMeasure.measureSync("Clear generation pause", () =>
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({
+        generationPauseKind: null,
+        generationPauseReason: null,
+        generationRetryAtMs: null,
+        generationFailureCount: 0,
+        ...(lastGenerationAtMs === undefined ? {} : { lastGenerationAtMs }),
+      }),
+  );
+}
+
+export async function setPumpChatState(
+  state: PumpChatState,
+  error: string | null = null,
+) {
   const room = await getRoomRow();
   return dbMeasure.measureSync("Set Pump.fun chat state", () =>
-    db.rooms.select().where({ id: room.id }).updateAll({
-      pumpChatState: state,
-      pumpChatError: error ? error.replace(/\s+/g, " ").trim().slice(0, 600) : null,
-    }),
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({
+        pumpChatState: state,
+        pumpChatError: error
+          ? error.replace(/\s+/g, " ").trim().slice(0, 600)
+          : null,
+      }),
   );
 }
 
 export async function claimQueuedDirective(episode: number) {
   const queued = await dbMeasure.measureSync("Get queued directive", () =>
-    db.directives.select().where({ status: "queued" }).orderBy("id", "ASC").first(),
+    db.directives
+      .select()
+      .where({ status: "queued" })
+      .orderBy("id", "ASC")
+      .first(),
   );
   if (!queued) return null;
 
@@ -209,7 +309,11 @@ export async function claimQueuedDirective(episode: number) {
 
 export async function hasQueuedDirective() {
   const row = await dbMeasure.measureSync("Check queued directive", () =>
-    db.directives.select("id").where({ status: "queued" }).orderBy("id", "ASC").first(),
+    db.directives
+      .select("id")
+      .where({ status: "queued" })
+      .orderBy("id", "ASC")
+      .first(),
   );
   return Boolean(row);
 }
@@ -236,15 +340,18 @@ export async function recoverGeneratingDirectives() {
 
   for (const row of rows || []) {
     const directive = row as any;
-    const clip = await dbMeasure.measureSync("Check recovered directive clip", () =>
-      db.clips.select("id").where({ directiveId: directive.id }).first(),
+    const clip = await dbMeasure.measureSync(
+      "Check recovered directive clip",
+      () => db.clips.select("id").where({ directiveId: directive.id }).first(),
     );
 
     await dbMeasure.measureSync("Recover abandoned directive", () =>
       db.directives
         .select()
         .where({ id: directive.id })
-        .updateAll(clip ? { status: "used" } : { status: "queued", usedEpisode: null }),
+        .updateAll(
+          clip ? { status: "used" } : { status: "queued", usedEpisode: null },
+        ),
     );
   }
 }
@@ -264,11 +371,14 @@ export async function recentStory(limit = 6) {
   return (rows || []).reverse().map((row: any) => {
     let realitySummary: string | null = null;
     try {
-      const audit = row.reconciliationJson ? JSON.parse(row.reconciliationJson) : null;
+      const audit = row.reconciliationJson
+        ? JSON.parse(row.reconciliationJson)
+        : null;
       if (audit?.summary) {
-        const drift = Array.isArray(audit.drift) && audit.drift.length
-          ? `; corrected drift: ${audit.drift.slice(0, 3).join("; ")}`
-          : "";
+        const drift =
+          Array.isArray(audit.drift) && audit.drift.length
+            ? `; corrected drift: ${audit.drift.slice(0, 3).join("; ")}`
+            : "";
         realitySummary = `Rendered reality (${audit.status || "unknown"}): ${audit.summary}${drift}`;
       }
     } catch {
@@ -290,7 +400,9 @@ export async function recentStory(limit = 6) {
           plan.transition ? `Planned handoff: ${plan.transition}` : null,
           realitySummary,
           plan.endingBeat ? `Planned ending: ${plan.endingBeat}` : null,
-        ].filter(Boolean).join(" | ");
+        ]
+          .filter(Boolean)
+          .join(" | ");
       } catch {
         // Legacy/bad plan JSON falls through to durable prompt/directive canon.
       }
@@ -307,7 +419,9 @@ export async function recentStory(limit = 6) {
 function parseWorldStateAudit(row: any): WorldStateAudit {
   let persisted: any = null;
   try {
-    persisted = row.reconciliationJson ? JSON.parse(row.reconciliationJson) : null;
+    persisted = row.reconciliationJson
+      ? JSON.parse(row.reconciliationJson)
+      : null;
   } catch {
     persisted = null;
   }
@@ -315,12 +429,18 @@ function parseWorldStateAudit(row: any): WorldStateAudit {
   const status = persisted?.status;
   return {
     episode: Number(row.episode),
-    status: status === "verified" || status === "corrected" || status === "fallback" || status === "skipped"
-      ? status
-      : "skipped",
+    status:
+      status === "verified" ||
+      status === "corrected" ||
+      status === "fallback" ||
+      status === "skipped"
+        ? status
+        : "skipped",
     model: row.reconcilerModel ?? persisted?.model ?? null,
     summary: typeof persisted?.summary === "string" ? persisted.summary : null,
-    drift: Array.isArray(persisted?.drift) ? persisted.drift.map(String).slice(0, 8) : [],
+    drift: Array.isArray(persisted?.drift)
+      ? persisted.drift.map(String).slice(0, 8)
+      : [],
     sampledFrameUrls: Array.isArray(persisted?.sampledFrameUrls)
       ? persisted.sampledFrameUrls.map(String).slice(0, 3)
       : [],
@@ -334,15 +454,23 @@ export async function getLatestWorldState(): Promise<WorldState> {
   const row = await dbMeasure.measureSync("Load latest world state", () =>
     db.worldStateSnapshots.select().orderBy("episode", "DESC").first(),
   );
-  return row ? parseWorldStateJson((row as any).stateJson) || EMPTY_WORLD_STATE : EMPTY_WORLD_STATE;
+  return row
+    ? parseWorldStateJson((row as any).stateJson) || EMPTY_WORLD_STATE
+    : EMPTY_WORLD_STATE;
 }
 
-export async function getWorldStateSnapshotForEpisode(episode: number): Promise<{
+export async function getWorldStateSnapshotForEpisode(
+  episode: number,
+): Promise<{
   worldState: WorldState;
   audit: WorldStateAudit;
 } | null> {
   const row = await dbMeasure.measureSync("Load episode world state", () =>
-    db.worldStateSnapshots.select().where({ episode }).orderBy("id", "DESC").first(),
+    db.worldStateSnapshots
+      .select()
+      .where({ episode })
+      .orderBy("id", "DESC")
+      .first(),
   );
   if (!row) return null;
   const worldState = parseWorldStateJson((row as any).stateJson);
@@ -350,7 +478,9 @@ export async function getWorldStateSnapshotForEpisode(episode: number): Promise<
   return { worldState, audit: parseWorldStateAudit(row as any) };
 }
 
-export async function getWorldStateForEpisode(episode: number): Promise<WorldState | null> {
+export async function getWorldStateForEpisode(
+  episode: number,
+): Promise<WorldState | null> {
   return (await getWorldStateSnapshotForEpisode(episode))?.worldState ?? null;
 }
 
@@ -362,56 +492,75 @@ export async function nextEpisode() {
 }
 
 export async function saveClipWithWorldState(
-  input: Omit<Clip, "id">,
+  input: Omit<
+    Clip,
+    | "id"
+    | "directiveSource"
+    | "directiveAuthor"
+    | "directiveAuthorAddress"
+    | "directiveProposalId"
+    | "directiveVoteCount"
+  >,
   worldState: WorldState,
   snapshotMeta?: {
     plannedWorldState?: WorldState | null;
     audit?: Omit<WorldStateAudit, "episode"> | null;
   },
 ) {
-  const row = await dbMeasure.measureSync.assert("Persist generated scene + reconciled world state", () => {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const clipRow = db.clips.insert(input);
-      if (!clipRow) throw new Error("Failed to persist generated clip");
-
-      const audit = snapshotMeta?.audit ?? null;
-      const snapshot = db.worldStateSnapshots.insert({
-        episode: input.episode,
-        clipId: Number((clipRow as any).id),
-        stateJson: JSON.stringify(worldState),
-        plannedStateJson: snapshotMeta?.plannedWorldState ? JSON.stringify(snapshotMeta.plannedWorldState) : null,
-        showrunnerModel: input.showrunnerModel ?? null,
-        reconciliationJson: audit ? JSON.stringify({
-          status: audit.status,
-          model: audit.model,
-          summary: audit.summary,
-          drift: audit.drift,
-          sampledFrameUrls: audit.sampledFrameUrls,
-        }) : null,
-        reconcilerModel: audit?.model ?? null,
-        reconcilerInputTokens: audit?.inputTokens ?? null,
-        reconcilerOutputTokens: audit?.outputTokens ?? null,
-        reconcilerCost: audit?.cost ?? null,
-      });
-      if (!snapshot) throw new Error("Failed to persist world state snapshot");
-
-      db.exec("COMMIT");
-      return clipRow;
-    } catch (error) {
+  const row = await dbMeasure.measureSync.assert(
+    "Persist generated scene + reconciled world state",
+    () => {
+      db.exec("BEGIN IMMEDIATE");
       try {
-        db.exec("ROLLBACK");
-      } catch {}
-      throw error;
-    }
-  });
+        const clipRow = db.clips.insert(input);
+        if (!clipRow) throw new Error("Failed to persist generated clip");
+
+        const audit = snapshotMeta?.audit ?? null;
+        const snapshot = db.worldStateSnapshots.insert({
+          episode: input.episode,
+          clipId: Number((clipRow as any).id),
+          stateJson: JSON.stringify(worldState),
+          plannedStateJson: snapshotMeta?.plannedWorldState
+            ? JSON.stringify(snapshotMeta.plannedWorldState)
+            : null,
+          showrunnerModel: input.showrunnerModel ?? null,
+          reconciliationJson: audit
+            ? JSON.stringify({
+                status: audit.status,
+                model: audit.model,
+                summary: audit.summary,
+                drift: audit.drift,
+                sampledFrameUrls: audit.sampledFrameUrls,
+              })
+            : null,
+          reconcilerModel: audit?.model ?? null,
+          reconcilerInputTokens: audit?.inputTokens ?? null,
+          reconcilerOutputTokens: audit?.outputTokens ?? null,
+          reconcilerCost: audit?.cost ?? null,
+        });
+        if (!snapshot)
+          throw new Error("Failed to persist world state snapshot");
+
+        db.exec("COMMIT");
+        return clipRow;
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {}
+        throw error;
+      }
+    },
+  );
 
   return toClip(row);
 }
 
-export async function getRecentGenerationTimings(limit = 16): Promise<GenerationTimingSample[]> {
-  const rows = await dbMeasure.measureSync("Load generation timing window", () =>
-    db.clips.select().orderBy("episode", "DESC").limit(limit).all(),
+export async function getRecentGenerationTimings(
+  limit = 16,
+): Promise<GenerationTimingSample[]> {
+  const rows = await dbMeasure.measureSync(
+    "Load generation timing window",
+    () => db.clips.select().orderBy("episode", "DESC").limit(limit).all(),
   );
   return (rows || []).map((row: any) => ({
     generationMode: row.generationMode || "full",
@@ -439,25 +588,48 @@ export async function getLatestClip(): Promise<Clip | null> {
   return { ...clip, startsAtMs };
 }
 
-export async function getTimeline(limit = 16): Promise<Clip[]> {
-  const rows = await dbMeasure.measureSync("Load timeline window", () =>
-    db.clips.select().orderBy("episode", "DESC").limit(limit).all(),
+export async function getTimeline(
+  limit = Number(process.env.SLOP_TIMELINE_WINDOW || 64),
+): Promise<Clip[]> {
+  const safeLimit = Math.max(8, Math.min(240, Math.floor(limit || 64)));
+  const rows = await dbMeasure.measureSync(
+    "Load attributed timeline window",
+    () =>
+      db.raw<any>(
+        `SELECT c.*,
+              d.source AS directiveSource,
+              d.author AS directiveAuthor,
+              d.authorAddress AS directiveAuthorAddress,
+              d.proposalId AS directiveProposalId,
+              CASE WHEN d.proposalId IS NULL THEN NULL
+                   ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
+              END AS directiveVoteCount
+       FROM clips c
+       LEFT JOIN directives d ON d.id = c.directiveId
+       ORDER BY c.episode DESC
+       LIMIT ?`,
+        safeLimit,
+      ),
   );
-  return (rows || []).reverse().map(toClip).filter((clip: Clip) => clip.startsAtMs > 0);
+  return (rows || [])
+    .reverse()
+    .map(toClip)
+    .filter((clip: Clip) => clip.startsAtMs > 0);
 }
 
 export async function getStreamState(): Promise<StreamState> {
   const serverNowMs = Date.now();
-  const [roomRow, timeline, directives, queuedCount, arena, timings] = await Promise.all([
-    getRoomRow(),
-    getTimeline(),
-    recentDirectivesWithVotes(12),
-    dbMeasure.measureSync("Count queued directives", () =>
-      db.directives.select().where({ status: "queued" }).count(),
-    ),
-    getPromptArena(),
-    getRecentGenerationTimings(),
-  ]);
+  const [roomRow, timeline, directives, queuedCount, arena, timings] =
+    await Promise.all([
+      getRoomRow(),
+      getTimeline(),
+      recentDirectivesWithVotes(12),
+      dbMeasure.measureSync("Count queued directives", () =>
+        db.directives.select().where({ status: "queued" }).count(),
+      ),
+      getPromptArena(),
+      getRecentGenerationTimings(),
+    ]);
 
   const latestClip = timeline.length ? timeline[timeline.length - 1] : null;
   const currentClip =
@@ -466,16 +638,18 @@ export async function getStreamState(): Promise<StreamState> {
         clip.startsAtMs <= serverNowMs &&
         serverNowMs < clip.startsAtMs + clip.durationSeconds * 1000,
     ) || null;
-  const nextClip = timeline.find((clip) => clip.startsAtMs > serverNowMs) || null;
+  const nextClip =
+    timeline.find((clip) => clip.startsAtMs > serverNowMs) || null;
   const bufferedUntilMs = latestClip
     ? latestClip.startsAtMs + latestClip.durationSeconds * 1000
     : null;
   const buffer = evaluateBuffer({
     bufferMs: Math.max(0, (bufferedUntilMs || serverNowMs) - serverNowMs),
     samples: timings,
-    activeMode: roomRow.workerState === "generating"
-      ? ((roomRow.generationMode || "full") as GenerationMode)
-      : undefined,
+    activeMode:
+      roomRow.workerState === "generating"
+        ? ((roomRow.generationMode || "full") as GenerationMode)
+        : undefined,
     hasClip: Boolean(latestClip),
   });
 
@@ -483,14 +657,20 @@ export async function getStreamState(): Promise<StreamState> {
     ? directiveWithVotesById(currentClip.directiveId)
     : null;
   const nextDirectiveRow = nextClip
-    ? (nextClip.directiveId ? directiveWithVotesById(nextClip.directiveId) : null)
+    ? nextClip.directiveId
+      ? directiveWithVotesById(nextClip.directiveId)
+      : null
     : nextPendingDirectiveWithVotes();
   // Show canon only for reality the viewer has reached. Never leak a prebuffered future snapshot.
-  const lastStartedClip = currentClip || [...timeline].reverse().find((clip) => clip.startsAtMs <= serverNowMs) || null;
+  const lastStartedClip =
+    currentClip ||
+    [...timeline].reverse().find((clip) => clip.startsAtMs <= serverNowMs) ||
+    null;
   const worldStateEpisode = lastStartedClip?.episode ?? null;
-  const worldSnapshot = worldStateEpisode == null
-    ? null
-    : await getWorldStateSnapshotForEpisode(worldStateEpisode);
+  const worldSnapshot =
+    worldStateEpisode == null
+      ? null
+      : await getWorldStateSnapshotForEpisode(worldStateEpisode);
   const worldState = worldSnapshot?.worldState ?? null;
   const worldStateAudit = worldSnapshot?.audit ?? null;
 
@@ -500,7 +680,9 @@ export async function getStreamState(): Promise<StreamState> {
     currentClip,
     nextClip,
     latestClip,
-    currentDirective: currentDirectiveRow ? toDirective(currentDirectiveRow) : null,
+    currentDirective: currentDirectiveRow
+      ? toDirective(currentDirectiveRow)
+      : null,
     nextDirective: nextDirectiveRow ? toDirective(nextDirectiveRow) : null,
     timeline,
     recentDirectives: (directives || []).reverse().map(toDirective),

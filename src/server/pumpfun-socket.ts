@@ -91,13 +91,17 @@ async function connectOnce(input: {
 
       // Engine.IO open: acknowledge the Socket.IO namespace with no auth token.
       if (frame.startsWith("0")) {
-        socket.send(`40${JSON.stringify({ origin: "https://pump.fun", timestamp: Date.now(), token: null })}`);
+        socket.send(
+          `40${JSON.stringify({ origin: "https://pump.fun", timestamp: Date.now(), token: null })}`,
+        );
         return;
       }
 
       // Socket.IO namespace connected: join the token/mint chat room. Ack id=0.
       if (frame.startsWith("40")) {
-        socket.send(`420${JSON.stringify(["joinRoom", { roomId: input.mint, username: "slopstream-reader" }])}`);
+        socket.send(
+          `420${JSON.stringify(["joinRoom", { roomId: input.mint, username: "slopstream-reader" }])}`,
+        );
         return;
       }
 
@@ -115,13 +119,20 @@ async function connectOnce(input: {
       }
 
       const event = parseEventFrame(frame);
-      if (event?.[0] === "newMessage" && event[1] && typeof event[1] === "object") {
+      if (
+        event?.[0] === "newMessage" &&
+        event[1] &&
+        typeof event[1] === "object"
+      ) {
         input.onMessage(event[1] as PumpfunMessage);
       }
     });
 
     socket.on("error", (error) => {
-      input.onState("error", error instanceof Error ? error.message : String(error));
+      input.onState(
+        "error",
+        error instanceof Error ? error.message : String(error),
+      );
     });
 
     socket.on("close", finish);
@@ -142,7 +153,10 @@ export async function runPumpfunSocket(input: {
     try {
       reachedLive = await connectOnce(input);
     } catch (error) {
-      input.onState("error", error instanceof Error ? error.message : String(error));
+      input.onState(
+        "error",
+        error instanceof Error ? error.message : String(error),
+      );
     }
 
     if (input.signal.aborted) break;

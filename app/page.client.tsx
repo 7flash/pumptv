@@ -26,6 +26,7 @@ let serverOffsetMs = 0;
 let input = "";
 let error: string | null = null;
 let soundEnabled = false;
+let replayClipId: number | null = null;
 let transport = "CONNECTING";
 let source: EventSource | null = null;
 let clockTimer: ReturnType<typeof setInterval> | null = null;
@@ -40,7 +41,8 @@ function redraw() {
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
   const response = await fetch(url, init);
   const payload = await response.json();
-  if (!response.ok) throw new Error(payload.error || `Request failed: ${response.status}`);
+  if (!response.ok)
+    throw new Error(payload.error || `Request failed: ${response.status}`);
   return payload as T;
 }
 
@@ -62,40 +64,97 @@ function upcomingClipAt(nowMs: number) {
   return timeline.find((clip) => clip.startsAtMs > nowMs) || null;
 }
 
+function publishedTimeline(nowMs = liveNowMs()) {
+  return timeline.filter((clip) => clip.startsAtMs <= nowMs);
+}
+
+function replayClip() {
+  return replayClipId == null
+    ? null
+    : timeline.find((clip) => clip.id === replayClipId) || null;
+}
+
+function displayClip() {
+  const replay = replayClip();
+  if (replay) return replay;
+  if (current) return current;
+  const published = publishedTimeline();
+  return published.length ? published[published.length - 1] : null;
+}
+
+function isArchivePlayback() {
+  return replayClipId != null || (!current && Boolean(displayClip()));
+}
+
 function syncVideoClock() {
-  if (!current) return;
-  const video = document.querySelector("video.video") as HTMLVideoElement | null;
+  const clip = displayClip();
+  if (!clip) return;
+  const video = document.querySelector(
+    "video.video",
+  ) as HTMLVideoElement | null;
   if (!video) return;
 
-  const expected = Math.max(0, (liveNowMs() - current.startsAtMs) / 1000);
-  if (expected >= current.durationSeconds) return;
-  if (Number.isFinite(video.duration) && Math.abs(video.currentTime - expected) > 0.7) {
-    video.currentTime = Math.min(expected, Math.max(0, video.duration - 0.05));
+  if (!isArchivePlayback()) {
+    const expected = Math.max(0, (liveNowMs() - clip.startsAtMs) / 1000);
+    if (
+      expected < clip.durationSeconds &&
+      Number.isFinite(video.duration) &&
+      Math.abs(video.currentTime - expected) > 0.7
+    ) {
+      video.currentTime = Math.min(
+        expected,
+        Math.max(0, video.duration - 0.05),
+      );
+    }
   }
+
   video.muted = !soundEnabled;
   void video.play().catch(() => {});
 }
 
+function syncEpisodeRail() {
+  const active = document.querySelector(
+    ".episodeTick.active",
+  ) as HTMLElement | null;
+  active?.scrollIntoView({
+    behavior: "auto",
+    block: "nearest",
+    inline: "center",
+  });
+}
+
 function syncTemporalUi() {
   if (arena) {
-    const roundNode = document.querySelector("[data-round-countdown]") as HTMLElement | null;
+    const roundNode = document.querySelector(
+      "[data-round-countdown]",
+    ) as HTMLElement | null;
     if (roundNode) {
       if (arena.status !== "open") {
         roundNode.textContent = "LOCKED";
       } else {
         const remaining = Math.max(0, arena.closesAtMs - liveNowMs());
-        roundNode.textContent = remaining > 0 ? `${(remaining / 1000).toFixed(1)}s` : "LOCKING…";
+        roundNode.textContent =
+          remaining > 0 ? `${(remaining / 1000).toFixed(1)}s` : "LOCKING…";
       }
     }
   }
 
-  const sceneProgress = document.querySelector("[data-current-progress]") as HTMLProgressElement | null;
-  if (sceneProgress && current) {
-    sceneProgress.max = current.durationSeconds;
-    sceneProgress.value = Math.min(
-      current.durationSeconds,
-      Math.max(0, (liveNowMs() - current.startsAtMs) / 1000),
-    );
+  const sceneProgress = document.querySelector(
+    "[data-current-progress]",
+  ) as HTMLProgressElement | null;
+  const shown = displayClip();
+  if (sceneProgress && shown) {
+    sceneProgress.max = shown.durationSeconds;
+    const video = document.querySelector(
+      "video.video",
+    ) as HTMLVideoElement | null;
+    sceneProgress.value =
+      isArchivePlayback() && video
+        ? Math.min(shown.durationSeconds, Math.max(0, video.currentTime))
+        : Math.min(
+            shown.durationSeconds,
+            Math.max(0, (liveNowMs() - shown.startsAtMs) / 1000),
+          );
   }
 
   const nextNodes = document.querySelectorAll("[data-next-countdown]");
@@ -104,7 +163,8 @@ function syncTemporalUi() {
     let label = "VOTING NOW";
     if (upcoming) {
       const remaining = Math.max(0, upcoming.startsAtMs - liveNowMs());
-      label = remaining > 0 ? `PLAYS IN ${(remaining / 1000).toFixed(1)}s` : "READY";
+      label =
+        remaining > 0 ? `PLAYS IN ${(remaining / 1000).toFixed(1)}s` : "READY";
     } else if (nextDirective?.status === "generating") {
       label = "RENDERING NOW";
     } else if (nextDirective) {
@@ -129,6 +189,7 @@ function syncActiveClip(forceRedraw = false) {
     queueMicrotask(() => {
       syncVideoClock();
       syncTemporalUi();
+      syncEpisodeRail();
     });
   } else {
     syncVideoClock();
@@ -140,6 +201,11 @@ function applyState(state: StreamState) {
   serverOffsetMs = state.serverNowMs - Date.now();
   room = state.room;
   timeline = state.timeline;
+  if (
+    replayClipId != null &&
+    !timeline.some((clip) => clip.id === replayClipId)
+  )
+    replayClipId = null;
   current = state.currentClip;
   nextClip = state.nextClip;
   currentDirective = state.currentDirective;
@@ -169,12 +235,15 @@ async function boot() {
   try {
     applyState(await json<StreamState>("/api/state"));
   } catch (cause) {
-    error = cause instanceof Error ? cause.message : "Could not load the stream.";
+    error =
+      cause instanceof Error ? cause.message : "Could not load the stream.";
     transport = "OFFLINE";
     redraw();
   }
 
-  source = new EventSource("/api/events");
+  source = new EventSource(
+    `/api/events?viewerId=${encodeURIComponent(voterId)}`,
+  );
   source.onopen = () => {
     transport = "LIVE FEED";
     redraw();
@@ -198,7 +267,9 @@ async function boot() {
 function findSubmittedProposal(round: PromptRound, text: string) {
   const normalized = text.replace(/\s+/g, " ").trim().toLocaleLowerCase();
   return round.proposals.find(
-    (proposal) => proposal.text.replace(/\s+/g, " ").trim().toLocaleLowerCase() === normalized,
+    (proposal) =>
+      proposal.text.replace(/\s+/g, " ").trim().toLocaleLowerCase() ===
+      normalized,
   );
 }
 
@@ -220,7 +291,8 @@ async function submitProposal(event: SubmitEvent) {
     if (proposal) localVotes.set(nextArena.id, proposal.id);
     redraw();
   } catch (cause) {
-    error = cause instanceof Error ? cause.message : "Could not submit proposal.";
+    error =
+      cause instanceof Error ? cause.message : "Could not submit proposal.";
     redraw();
   }
 }
@@ -248,9 +320,66 @@ function toggleSound() {
   queueMicrotask(syncVideoClock);
 }
 
+function jumpToEpisode(clipId: number) {
+  replayClipId = current?.id === clipId ? null : clipId;
+  redraw();
+  queueMicrotask(() => {
+    syncVideoClock();
+    syncEpisodeRail();
+  });
+}
+
+function returnToLive() {
+  replayClipId = null;
+  redraw();
+  queueMicrotask(() => {
+    syncVideoClock();
+    syncEpisodeRail();
+  });
+}
+
+function handleVideoEnded(event: Event) {
+  const shown = displayClip();
+  if (!shown) return syncActiveClip(true);
+
+  if (replayClipId != null) {
+    const published = publishedTimeline();
+    const index = published.findIndex((clip) => clip.id === shown.id);
+    const following = index >= 0 ? published[index + 1] : null;
+    if (following && following.id !== current?.id) {
+      replayClipId = following.id;
+      redraw();
+      queueMicrotask(() => {
+        syncVideoClock();
+        syncEpisodeRail();
+      });
+      return;
+    }
+    if (current) {
+      returnToLive();
+      return;
+    }
+  }
+
+  if (!current) {
+    const video = event.currentTarget as HTMLVideoElement | null;
+    if (video) {
+      video.currentTime = 0;
+      void video.play().catch(() => {});
+    }
+    return;
+  }
+
+  syncActiveClip(true);
+}
+
 function streamStatus() {
+  if (replayClipId != null) return "REWATCH";
   if (!room) return transport;
   if (!room.running) return "PAUSED";
+  if (room.generation.kind === "funds")
+    return current ? "LIVE · FUNDS LOW" : "ARCHIVE MODE";
+  if (room.generation.paused && !current) return "ARCHIVE MODE";
   if (room.workerState === "error") return "DEGRADED";
   if (current) return "LIVE";
   if (timeline.length) return "BUFFERING";
@@ -262,7 +391,6 @@ function bufferLabel() {
   const seconds = Math.max(0, room.bufferedUntilMs - liveNowMs()) / 1000;
   return `${seconds.toFixed(1)}s BUF`;
 }
-
 
 function bufferModeLabel() {
   if (!room) return "BUFFER SYNC";
@@ -296,8 +424,14 @@ function shortAddress(value: string | null) {
 
 function authorName(directive: Directive | null) {
   if (!directive) return "SLOP AI";
-  if (directive.author) return directive.author.startsWith("@") ? directive.author : `@${directive.author}`;
-  return shortAddress(directive.authorAddress) || (directive.source === "pumpfun" ? "PUMP ANON" : "WEB ANON");
+  if (directive.author)
+    return directive.author.startsWith("@")
+      ? directive.author
+      : `@${directive.author}`;
+  return (
+    shortAddress(directive.authorAddress) ||
+    (directive.source === "pumpfun" ? "PUMP ANON" : "WEB ANON")
+  );
 }
 
 function sourceName(directive: Directive | null) {
@@ -306,19 +440,21 @@ function sourceName(directive: Directive | null) {
 }
 
 function attribution(directive: Directive | null) {
-  const votes = directive?.voteCount == null
-    ? ""
-    : ` · ${directive.voteCount} ${directive.voteCount === 1 ? "VOTE" : "VOTES"}`;
+  const votes =
+    directive?.voteCount == null
+      ? ""
+      : ` · ${directive.voteCount} ${directive.voteCount === 1 ? "VOTE" : "VOTES"}`;
   const proposal = directive?.proposalId ? ` · #${directive.proposalId}` : "";
   return `${authorName(directive)} · ${sourceName(directive)}${proposal}${votes}`;
 }
 
 function directiveLabel(directive: Directive) {
-  const state = directive.status === "queued"
-    ? "LOCKED NEXT"
-    : directive.status === "generating"
-      ? "RENDERING"
-      : "PLAYED";
+  const state =
+    directive.status === "queued"
+      ? "LOCKED NEXT"
+      : directive.status === "generating"
+        ? "RENDERING"
+        : "PLAYED";
   return `${state} · ${attribution(directive)}`;
 }
 
@@ -331,13 +467,17 @@ function pumpfunLabel() {
 
 function proposalSource(proposal: PromptProposal) {
   const who = proposal.author
-    ? (proposal.author.startsWith("@") ? proposal.author : `@${proposal.author}`)
+    ? proposal.author.startsWith("@")
+      ? proposal.author
+      : `@${proposal.author}`
     : shortAddress(proposal.authorAddress) || "ANON";
   return proposal.source === "pumpfun" ? `PUMP · ${who}` : `WEB · ${who}`;
 }
 
 function roundIsOpen() {
-  return Boolean(arena && arena.status === "open" && liveNowMs() < arena.closesAtMs);
+  return Boolean(
+    arena && arena.status === "open" && liveNowMs() < arena.closesAtMs,
+  );
 }
 
 function candidateClass(proposal: PromptProposal, rank: number) {
@@ -346,11 +486,56 @@ function candidateClass(proposal: PromptProposal, rank: number) {
 }
 
 function nextPromptText() {
-  return nextDirective?.text || nextClip?.directive || "Chat is still cooking the next mutation…";
+  return (
+    nextDirective?.text ||
+    nextClip?.directive ||
+    "Chat is still cooking the next mutation…"
+  );
 }
 
 function currentPromptText() {
-  return current?.directive || "The GPU cauldron is manufacturing the opening reality…";
+  return (
+    displayClip()?.directive ||
+    "The GPU cauldron is manufacturing the opening reality…"
+  );
+}
+
+function clipAttribution(clip: Clip | null) {
+  if (!clip || !clip.directiveId) return "SLOP AI · OPENING / AUTOPILOT";
+  const author = clip.directiveAuthor
+    ? clip.directiveAuthor.startsWith("@")
+      ? clip.directiveAuthor
+      : `@${clip.directiveAuthor}`
+    : shortAddress(clip.directiveAuthorAddress) ||
+      (clip.directiveSource === "pumpfun" ? "PUMP ANON" : "WEB ANON");
+  const source =
+    clip.directiveSource === "pumpfun" ? "PUMP.FUN CHAT" : "WEB CHAT";
+  const proposal = clip.directiveProposalId
+    ? ` · #${clip.directiveProposalId}`
+    : "";
+  const votes =
+    clip.directiveVoteCount == null
+      ? ""
+      : ` · ${clip.directiveVoteCount} ${clip.directiveVoteCount === 1 ? "VOTE" : "VOTES"}`;
+  return `${author} · ${source}${proposal}${votes}`;
+}
+
+function generationPauseLabel() {
+  if (!room?.generation.paused) return null;
+  if (room.generation.kind === "funds")
+    return "💸 GENERATION PAUSED · TOP UP WHEN READY";
+  if (room.generation.kind === "cooldown") return "⏳ NEXT DROP DELAYED";
+  if (room.generation.kind === "rate_limit") return "🚦 PROVIDER COOLDOWN";
+  return "🛟 GENERATION RECOVERY";
+}
+
+function generationRetryLabel() {
+  const retryAt = room?.generation.retryAtMs;
+  if (!retryAt) return "AUTO RETRY";
+  const seconds = Math.max(0, retryAt - liveNowMs()) / 1000;
+  return seconds > 0
+    ? `RETRY IN ${seconds.toFixed(seconds < 10 ? 1 : 0)}s`
+    : "RETRYING…";
 }
 
 function canonEntityCount() {
@@ -359,7 +544,9 @@ function canonEntityCount() {
 }
 
 function canonCharacterLabel(character: WorldState["characters"][number]) {
-  const detail = [character.status, character.position].filter(Boolean).join(" · ");
+  const detail = [character.status, character.position]
+    .filter(Boolean)
+    .join(" · ");
   return `${character.name}${detail ? ` — ${detail}` : ""}`;
 }
 
@@ -371,7 +558,8 @@ function canonPropLabel(prop: WorldState["props"][number]) {
 function realityCheckLabel() {
   if (!worldStateAudit) return "VISION PENDING";
   if (worldStateAudit.status === "verified") return "👁 VISION VERIFIED";
-  if (worldStateAudit.status === "corrected") return `👁 CANON PATCHED · ${worldStateAudit.drift.length} DRIFT`;
+  if (worldStateAudit.status === "corrected")
+    return `👁 CANON PATCHED · ${worldStateAudit.drift.length} DRIFT`;
   if (worldStateAudit.status === "skipped") return "👁 VISION OFF";
   return "👁 VISION FALLBACK";
 }
@@ -380,37 +568,63 @@ function App() {
   const open = roundIsOpen();
   const candidates = arena?.proposals || [];
   const totalVotes = candidates.reduce((sum, item) => sum + item.voteCount, 0);
-  const currentDirectiveId = current?.directiveId ?? null;
+  const shown = displayClip();
+  const replaying = isArchivePlayback();
+  const published = publishedTimeline();
+  const currentDirectiveId = shown?.directiveId ?? null;
   const nextDirectiveId = nextClip?.directiveId ?? null;
   const activeDirective = currentDirectiveId
-    ? (currentDirective?.id === currentDirectiveId ? currentDirective : directives.find((item) => item.id === currentDirectiveId) || null)
+    ? shown?.id === current?.id && currentDirective?.id === currentDirectiveId
+      ? currentDirective
+      : directives.find((item) => item.id === currentDirectiveId) || null
     : null;
   const upcomingDirective = nextDirectiveId
-    ? (nextDirective?.id === nextDirectiveId ? nextDirective : directives.find((item) => item.id === nextDirectiveId) || nextDirective)
+    ? nextDirective?.id === nextDirectiveId
+      ? nextDirective
+      : directives.find((item) => item.id === nextDirectiveId) || nextDirective
     : nextDirective;
   const nextLocked = Boolean(upcomingDirective || nextClip);
-  const currentByline = current?.directiveId ? attribution(activeDirective) : "SLOP AI · OPENING / AUTOPILOT";
-  const nextByline = upcomingDirective ? attribution(upcomingDirective) : nextClip?.directiveId ? "LOCKED FROM CHAT" : "SLOP AI · AUTOPILOT";
+  const currentByline = shown?.directiveId
+    ? activeDirective
+      ? attribution(activeDirective)
+      : clipAttribution(shown)
+    : "SLOP AI · OPENING / AUTOPILOT";
+  const nextByline = upcomingDirective
+    ? attribution(upcomingDirective)
+    : nextClip?.directiveId
+      ? "LOCKED FROM CHAT"
+      : "SLOP AI · AUTOPILOT";
 
   return (
     <>
       <section className="stage">
-        {current ? (
+        {shown ? (
           <video
-            key={current.id}
+            key={shown.id}
             className="video"
-            src={current.videoUrl}
+            src={shown.videoUrl}
             autoPlay
             muted={!soundEnabled}
             playsInline
             onLoadedMetadata={syncVideoClock}
-            onEnded={() => syncActiveClip(true)}
+            onEnded={handleVideoEnded as any}
           />
         ) : (
           <div className="void">
-            <div className="coinLoader"><span>$SLOP</span></div>
-            <strong>GENERATING REALITY</strong>
-            <p>{streamStatus()} · do not refresh your brain</p>
+            <div className="coinLoader">
+              <span>$SLOP</span>
+            </div>
+            <strong>
+              {room?.generation.paused
+                ? "ARCHIVE IS STILL OPEN"
+                : "GENERATING REALITY"}
+            </strong>
+            <p>
+              {streamStatus()} ·{" "}
+              {room?.generation.paused
+                ? "pick an episode below while the GPU rests"
+                : "do not refresh your brain"}
+            </p>
           </div>
         )}
 
@@ -433,18 +647,30 @@ function App() {
 
         <header className="topbar">
           <div className="brandLockup">
-            <div className="coinMark"><span>S</span></div>
+            <div className="coinMark">
+              <span>S</span>
+            </div>
             <div>
-              <div className="brand"><span className="liveDot" />SLOP TV</div>
+              <div className="brand">
+                <span className="liveDot" />
+                SLOP TV
+              </div>
               <div className="brandSub">$SLOP · infinite story market</div>
             </div>
           </div>
           <div className="meta">
-            <span className={`liveState ${streamStatus().toLowerCase()}`}>{streamStatus()}</span>
-            <span>EP {current ? current.episode + 1 : "—"}</span>
+            <span className={`liveState ${streamStatus().toLowerCase()}`}>
+              {streamStatus()}
+            </span>
+            <span>EP {shown ? shown.episode + 1 : "—"}</span>
             <span>{room?.resolution || "—"}</span>
+            <span className="viewerCount">
+              👁 {room?.viewerCount ?? 0} WATCHING
+            </span>
             <span>{bufferLabel()}</span>
-            <span className={`bufferModeTag ${room?.buffer.mode || "full"}`}>{bufferModeLabel()}</span>
+            <span className={`bufferModeTag ${room?.buffer.mode || "full"}`}>
+              {bufferModeLabel()}
+            </span>
             <button className="soundToggle" onClick={toggleSound}>
               {soundEnabled ? "🔊 SOUND ON" : "🔇 UNMUTE"}
             </button>
@@ -454,8 +680,16 @@ function App() {
         <div className="sceneHud">
           <article className="nowCard">
             <div className="cardEyebrow">
-              <span className="statusChip liveChip">● NOW PLAYING</span>
-              <span>EP {current ? current.episode + 1 : "—"}</span>
+              <span
+                className={`statusChip ${replaying ? "replayChip" : "liveChip"}`}
+              >
+                {replaying
+                  ? replayClipId != null
+                    ? "↶ REWATCHING"
+                    : "⏸ ARCHIVE LOOP"
+                  : "● NOW PLAYING"}
+              </span>
+              <span>EP {shown ? shown.episode + 1 : "—"}</span>
             </div>
             <h2>{currentPromptText()}</h2>
             <div className="promptAttribution">
@@ -465,25 +699,108 @@ function App() {
             <progress
               className="sceneProgress"
               data-current-progress
-              max={current?.durationSeconds || 5}
-              value={current ? Math.max(0, (liveNowMs() - current.startsAtMs) / 1000) : 0}
+              max={shown?.durationSeconds || 5}
+              value={
+                shown && !replaying
+                  ? Math.max(0, (liveNowMs() - shown.startsAtMs) / 1000)
+                  : 0
+              }
             />
+            {replaying ? (
+              <button
+                className="returnLive"
+                type="button"
+                onClick={returnToLive}
+                disabled={!current}
+              >
+                {current
+                  ? "● RETURN TO LIVE"
+                  : "⏳ LIVE RESUMES WHEN NEXT EP DROPS"}
+              </button>
+            ) : null}
           </article>
 
           <article className={`nextCard ${nextLocked ? "locked" : "open"}`}>
             <div className="cardEyebrow">
-              <span className={`statusChip ${nextLocked ? "nextChip" : "voteChip"}`}>
-                {nextLocked ? "🔒 LOCKED NEXT" : "🗳️ NEXT PROMPT"}
+              <span
+                className={`statusChip ${nextLocked ? "nextChip" : "voteChip"}`}
+              >
+                {nextLocked
+                  ? replaying
+                    ? "🔒 LIVE NEXT"
+                    : "🔒 LOCKED NEXT"
+                  : replaying
+                    ? "🗳️ LIVE QUEUE"
+                    : "🗳️ NEXT PROMPT"}
               </span>
-              <strong data-next-countdown>{nextLocked ? "READY" : "VOTING NOW"}</strong>
+              <strong data-next-countdown>
+                {nextLocked ? "READY" : "VOTING NOW"}
+              </strong>
             </div>
-            <p>{upcomingDirective?.text || nextClip?.directive || nextPromptText()}</p>
+            <p>
+              {upcomingDirective?.text ||
+                nextClip?.directive ||
+                nextPromptText()}
+            </p>
             <div className="nextMeta">{nextByline}</div>
           </article>
         </div>
 
-        {room?.lastError ? <p className="error stageError">{room.lastError}</p> : null}
-        {room?.pumpfun.lastError ? <p className="error stageError pumpError">Pump.fun: {room.pumpfun.lastError}</p> : null}
+        {room?.generation.paused ? (
+          <div
+            className={`generationPause ${room.generation.kind || "provider"}`}
+          >
+            <strong>{generationPauseLabel()}</strong>
+            <span>{generationRetryLabel()}</span>
+            <p>
+              {room.generation.reason ||
+                "Existing episodes stay online while generation waits."}
+            </p>
+          </div>
+        ) : null}
+
+        {published.length ? (
+          <nav className="episodeRail" aria-label="Episode replay timeline">
+            <div className="episodeRailHead">
+              <span>REPLAY LINE</span>
+              <b>
+                {replayClipId != null
+                  ? `REWATCHING EP ${(shown?.episode ?? 0) + 1}`
+                  : current
+                    ? "● LIVE EDGE"
+                    : "ARCHIVE EDGE"}
+              </b>
+              <em>{published.length} EP IN LOCAL RAIL</em>
+            </div>
+            <div className="episodeTrack">
+              {published.map((clip) => {
+                const active = shown?.id === clip.id;
+                const live = current?.id === clip.id && replayClipId == null;
+                return (
+                  <button
+                    type="button"
+                    key={clip.id}
+                    className={`episodeTick${active ? " active" : ""}${live ? " live" : ""}`}
+                    onClick={() => jumpToEpisode(clip.id)}
+                    title={`EP ${clip.episode + 1}: ${clip.directive}`}
+                  >
+                    <i />
+                    <span>EP {clip.episode + 1}</span>
+                  </button>
+                );
+              })}
+            </div>
+          </nav>
+        ) : null}
+
+        {room?.lastError ? (
+          <p className="error stageError">{room.lastError}</p>
+        ) : null}
+        {room?.pumpfun.lastError ? (
+          <p className="error stageError pumpError">
+            Pump.fun: {room.pumpfun.lastError}
+          </p>
+        ) : null}
         {error ? <p className="error stageError clientError">{error}</p> : null}
       </section>
 
@@ -499,12 +816,22 @@ function App() {
           </div>
         </div>
 
-        <section className={`lockedNextPanel ${nextLocked ? "hasNext" : "waiting"}`}>
+        <section
+          className={`lockedNextPanel ${nextLocked ? "hasNext" : "waiting"}`}
+        >
           <div className="lockedTopline">
-            <span>{nextLocked ? "🔒 NEXT PROMPT LOCKED" : "🟢 NEXT PROMPT IS LIVE"}</span>
+            <span>
+              {nextLocked
+                ? replaying
+                  ? "🔒 LIVE NEXT PROMPT"
+                  : "🔒 NEXT PROMPT LOCKED"
+                : "🟢 NEXT PROMPT IS LIVE"}
+            </span>
             <b data-next-countdown>{nextLocked ? "READY" : "VOTING NOW"}</b>
           </div>
-          <strong>{upcomingDirective?.text || nextClip?.directive || nextPromptText()}</strong>
+          <strong>
+            {upcomingDirective?.text || nextClip?.directive || nextPromptText()}
+          </strong>
           <div className="lockedByline">{nextByline}</div>
         </section>
 
@@ -514,27 +841,44 @@ function App() {
             <b>{bufferHealthLabel()}</b>
           </div>
           <div className="bufferRail">
-            <i style={{ width: `${Math.min(100, room ? (room.buffer.bufferMs / room.buffer.targetBufferMs) * 100 : 0)}%` }} />
+            <i
+              style={{
+                width: `${Math.min(100, room ? (room.buffer.bufferMs / room.buffer.targetBufferMs) * 100 : 0)}%`,
+              }}
+            />
           </div>
           <div className="bufferStats">
             <span>{latencyLabel()}</span>
             <em>{room?.buffer.health.toUpperCase() || "EMPTY"}</em>
           </div>
-          <p>{room?.buffer.mode === "full"
-            ? "Full showrunner + vision audit online."
-            : room?.buffer.mode === "fast"
-              ? "Vision is temporarily skipped so the stream can rebuild headroom."
-              : "Deterministic continuity planner active. H3 stays live while optional AI steps are bypassed."}</p>
+          <p>
+            {room?.buffer.mode === "full"
+              ? "Full showrunner + vision audit online."
+              : room?.buffer.mode === "fast"
+                ? "Vision is temporarily skipped so the stream can rebuild headroom."
+                : "Deterministic continuity planner active. H3 stays live while optional AI steps are bypassed."}
+          </p>
         </section>
 
         <div className="messages">
           <details className="canonBrain" open>
             <summary>
-              <span>🧠 CANON BRAIN</span>
-              <b>{worldState ? `REV ${worldState.revision} · EP ${(worldStateEpisode ?? 0) + 1}` : "SYNCING"}</b>
+              <span>🧠 {replaying ? "LIVE CANON BRAIN" : "CANON BRAIN"}</span>
+              <b>
+                {worldState
+                  ? `REV ${worldState.revision} · EP ${(worldStateEpisode ?? 0) + 1}`
+                  : "SYNCING"}
+              </b>
             </summary>
             {worldState ? (
               <div className="canonBrainBody">
+                {replayClipId != null &&
+                worldStateEpisode !== shown?.episode ? (
+                  <div className="replayCanonNotice">
+                    REPLAY VIEW · CANON BRAIN IS PINNED TO LIVE EDGE EP{" "}
+                    {(worldStateEpisode ?? 0) + 1}
+                  </div>
+                ) : null}
                 <div className="canonLocation">
                   <span>📍 CURRENT MAP TILE</span>
                   <strong>{worldState.location}</strong>
@@ -546,15 +890,23 @@ function App() {
                   <span>{worldState.openThreads.length} OPEN LOOPS</span>
                   <span>{canonEntityCount()} ENTITIES</span>
                 </div>
-                <div className={`realityCheck ${worldStateAudit?.status || "pending"}`}>
+                <div
+                  className={`realityCheck ${worldStateAudit?.status || "pending"}`}
+                >
                   <div>
                     <span>RENDERED REALITY CHECK</span>
                     <strong>{realityCheckLabel()}</strong>
                   </div>
-                  {worldStateAudit?.summary ? <p>{worldStateAudit.summary}</p> : <p>Waiting for sampled-frame reconciliation.</p>}
+                  {worldStateAudit?.summary ? (
+                    <p>{worldStateAudit.summary}</p>
+                  ) : (
+                    <p>Waiting for sampled-frame reconciliation.</p>
+                  )}
                   {worldStateAudit?.drift.length ? (
                     <ul>
-                      {worldStateAudit.drift.slice(0, 3).map((item, index) => <li key={`${index}-${item}`}>{item}</li>)}
+                      {worldStateAudit.drift.slice(0, 3).map((item, index) => (
+                        <li key={`${index}-${item}`}>{item}</li>
+                      ))}
                     </ul>
                   ) : null}
                 </div>
@@ -563,7 +915,11 @@ function App() {
                     <span className="canonGroupTitle">CAST BAGHOLDERS</span>
                     <div className="canonChips">
                       {worldState.characters.slice(0, 5).map((character) => (
-                        <span className="canonChip characterChip" key={character.id} title={`${character.appearance} · ${character.wardrobe}`}>
+                        <span
+                          className="canonChip characterChip"
+                          key={character.id}
+                          title={`${character.appearance} · ${character.wardrobe}`}
+                        >
                           {canonCharacterLabel(character)}
                         </span>
                       ))}
@@ -575,7 +931,11 @@ function App() {
                     <span className="canonGroupTitle">LORE OBJECTS</span>
                     <div className="canonChips">
                       {worldState.props.slice(0, 6).map((prop) => (
-                        <span className="canonChip propChip" key={prop.id} title={prop.description}>
+                        <span
+                          className="canonChip propChip"
+                          key={prop.id}
+                          title={prop.description}
+                        >
                           {canonPropLabel(prop)}
                         </span>
                       ))}
@@ -586,7 +946,11 @@ function App() {
                   <div className="canonGroup">
                     <span className="canonGroupTitle">UNRESOLVED ALPHA</span>
                     <ol className="threadList">
-                      {worldState.openThreads.slice(0, 4).map((thread, index) => <li key={`${index}-${thread}`}>{thread}</li>)}
+                      {worldState.openThreads
+                        .slice(0, 4)
+                        .map((thread, index) => (
+                          <li key={`${index}-${thread}`}>{thread}</li>
+                        ))}
                     </ol>
                   </div>
                 ) : null}
@@ -595,50 +959,82 @@ function App() {
                   <p>{worldState.lastEndingBeat}</p>
                 </div>
               </div>
-            ) : <div className="canonBrainEmpty">WORLD MODEL IS BOOTING…</div>}
+            ) : (
+              <div className="canonBrainEmpty">WORLD MODEL IS BOOTING…</div>
+            )}
           </details>
 
           <section className="arena">
             <div className="arenaHeader">
               <div>
-                <span>{arena ? `NEXT PROMPT QUEUE · ROUND #${arena.id}` : "NEXT PROMPT QUEUE"}</span>
-                <strong>{arena ? `VOTING FOR EP ${arena.targetEpisode + 1} · ${open ? "OPEN" : "LOCKED"}` : "BOOTING BALLOT"}</strong>
+                <span>
+                  {arena
+                    ? `NEXT PROMPT QUEUE · ROUND #${arena.id}`
+                    : "NEXT PROMPT QUEUE"}
+                </span>
+                <strong>
+                  {arena
+                    ? `VOTING FOR EP ${arena.targetEpisode + 1} · ${open ? "OPEN" : "LOCKED"}`
+                    : "BOOTING BALLOT"}
+                </strong>
               </div>
               <div className="roundNumbers">
-                <b data-round-countdown>{arena?.status === "open" ? "…" : "LOCKED"}</b>
-                <em>{totalVotes} {totalVotes === 1 ? "VOTE" : "VOTES"}</em>
+                <b data-round-countdown>
+                  {arena?.status === "open" ? "…" : "LOCKED"}
+                </b>
+                <em>
+                  {totalVotes} {totalVotes === 1 ? "VOTE" : "VOTES"}
+                </em>
               </div>
             </div>
 
             <div className="queueLegend">
-              <span>RANK</span><span>PROMPT</span><span>VOTES</span>
+              <span>RANK</span>
+              <span>PROMPT</span>
+              <span>VOTES</span>
             </div>
 
             <div className="candidates">
-              {candidates.length ? candidates.map((proposal, rank) => (
-                <button
-                  type="button"
-                  className={candidateClass(proposal, rank)}
-                  key={proposal.id}
-                  disabled={!open || proposal.status !== "open"}
-                  onClick={() => voteProposal(proposal.id)}
-                >
-                  <span className="rankBadge">{String(rank + 1).padStart(2, "0")}</span>
-                  <span className="candidateBody">
-                    <span className="candidateMeta">
-                      <em>#{proposal.id} · {proposalSource(proposal)}</em>
-                      {rank === 0 && proposal.voteCount > 0 ? <i>LEADING</i> : null}
-                      {arena && localVotes.get(arena.id) === proposal.id ? <i>YOUR VOTE</i> : null}
+              {candidates.length ? (
+                candidates.map((proposal, rank) => (
+                  <button
+                    type="button"
+                    className={candidateClass(proposal, rank)}
+                    key={proposal.id}
+                    disabled={!open || proposal.status !== "open"}
+                    onClick={() => voteProposal(proposal.id)}
+                  >
+                    <span className="rankBadge">
+                      {String(rank + 1).padStart(2, "0")}
                     </span>
-                    <span className="candidateText">{proposal.text}</span>
-                    <progress className="voteMeter" value={proposal.voteCount} max={Math.max(1, totalVotes)} />
-                  </span>
-                  <span className="voteStack">
-                    <strong>{proposal.voteCount}</strong>
-                    <small>{proposal.voteCount === 1 ? "VOTE" : "VOTES"}</small>
-                  </span>
-                </button>
-              )) : (
+                    <span className="candidateBody">
+                      <span className="candidateMeta">
+                        <em>
+                          #{proposal.id} · {proposalSource(proposal)}
+                        </em>
+                        {rank === 0 && proposal.voteCount > 0 ? (
+                          <i>LEADING</i>
+                        ) : null}
+                        {arena && localVotes.get(arena.id) === proposal.id ? (
+                          <i>YOUR VOTE</i>
+                        ) : null}
+                      </span>
+                      <span className="candidateText">{proposal.text}</span>
+                      <progress
+                        className="voteMeter"
+                        value={proposal.voteCount}
+                        max={Math.max(1, totalVotes)}
+                      />
+                    </span>
+                    <span className="voteStack">
+                      <strong>{proposal.voteCount}</strong>
+                      <small>
+                        {proposal.voteCount === 1 ? "VOTE" : "VOTES"}
+                      </small>
+                    </span>
+                  </button>
+                ))
+              ) : (
                 <div className="emptyBallot">
                   <b>QUEUE EMPTY</b>
                   {open
@@ -650,10 +1046,15 @@ function App() {
           </section>
 
           <details className="canonLog">
-            <summary>RECENT CANON / WINNERS <span>{directives.length}</span></summary>
+            <summary>
+              RECENT CANON / WINNERS <span>{directives.length}</span>
+            </summary>
             <div className="canonItems">
               {directives.map((directive) => (
-                <div className={`message ${directive.status}`} key={directive.id}>
+                <div
+                  className={`message ${directive.status}`}
+                  key={directive.id}
+                >
                   <span>{directiveLabel(directive)}</span>
                   {directive.text}
                 </div>
@@ -663,7 +1064,8 @@ function App() {
 
           <div className="systemMessage">
             <span>{pumpfunLabel()}</span>
-            Pump.fun: <b>!next your idea</b> proposes + votes. <b>!vote 42</b> moves your vote. Duplicate ideas merge instead of clogging the lore.
+            Pump.fun: <b>!next your idea</b> proposes + votes. <b>!vote 42</b>{" "}
+            moves your vote. Duplicate ideas merge instead of clogging the lore.
           </div>
         </div>
 
@@ -678,28 +1080,43 @@ function App() {
             onInput={(event: any) => {
               input = (event.currentTarget as HTMLTextAreaElement).value;
             }}
-            placeholder={open
-              ? "make the raccoon ape into a cursed vending machine coin and the machine starts screaming tomorrow's chat…"
-              : "round locked — the winner is becoming reality…"}
+            placeholder={
+              open
+                ? "make the raccoon ape into a cursed vending machine coin and the machine starts screaming tomorrow's chat…"
+                : "round locked — the winner is becoming reality…"
+            }
             maxLength={500}
             rows={3}
             onKeyDown={(event: any) => {
               if (event.key === "Enter" && !event.shiftKey) {
                 event.preventDefault();
-                (event.currentTarget as HTMLTextAreaElement).form?.requestSubmit();
+                (
+                  event.currentTarget as HTMLTextAreaElement
+                ).form?.requestSubmit();
               }
             }}
           />
           <div className="composerBottom">
-            <div className="qualityReadout">{room?.resolution || "—"} · {room?.buffer.mode.toUpperCase() || "FULL"} · 1 WALLET / 1 VOTE</div>
-            <div className="queueCount">{queuedCount ? `${queuedCount} WINNER LOCKED` : `${candidates.length} IN QUEUE`}</div>
-            <button type="submit" disabled={!open}>SEND IT ↗</button>
+            <div className="qualityReadout">
+              {room?.resolution || "—"} ·{" "}
+              {room?.buffer.mode.toUpperCase() || "FULL"} · 1 WALLET / 1 VOTE
+            </div>
+            <div className="queueCount">
+              {queuedCount
+                ? `${queuedCount} WINNER LOCKED`
+                : `${candidates.length} IN QUEUE`}
+            </div>
+            <button type="submit" disabled={!open}>
+              SEND IT ↗
+            </button>
           </div>
         </form>
 
         <footer>
           <span>tradjs · jsx-ai · sqlite-zod-orm</span>
-          <span>{transport} · H3 MAX</span>
+          <span>
+            👁 {room?.viewerCount ?? 0} WATCHING · {transport} · H3 MAX
+          </span>
         </footer>
       </aside>
     </>

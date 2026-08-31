@@ -8,13 +8,17 @@ export type ClipFrameSample = {
   end: string | null;
 };
 
-export async function extractVideoFrame(videoUrl: string, frameType: VideoFrameType): Promise<string> {
+export async function extractVideoFrame(
+  videoUrl: string,
+  frameType: VideoFrameType,
+): Promise<string> {
   const result = await falMeasure.measure(
     { label: "Extract video frame", frameType },
-    () => fal.subscribe("fal-ai/ffmpeg-api/extract-frame", {
-      input: { video_url: videoUrl, frame_type: frameType },
-      logs: false,
-    }),
+    () =>
+      fal.subscribe("fal-ai/ffmpeg-api/extract-frame", {
+        input: { video_url: videoUrl, frame_type: frameType },
+        logs: false,
+      }),
   );
   if (!result) throw new Error(`Could not extract ${frameType} frame`);
 
@@ -41,14 +45,18 @@ export async function sampleClipFrames(input: {
   const mode = input.mode || "full";
   if (mode === "continuity") {
     const [start, end] = await Promise.all([
-      input.knownStartUrl ? Promise.resolve(input.knownStartUrl) : safeExtract(input.videoUrl, "first"),
+      input.knownStartUrl
+        ? Promise.resolve(input.knownStartUrl)
+        : safeExtract(input.videoUrl, "first"),
       safeExtract(input.videoUrl, "last"),
     ]);
     return { start, middle: null, end };
   }
 
   const [start, middle, end] = await Promise.all([
-    input.knownStartUrl ? Promise.resolve(input.knownStartUrl) : safeExtract(input.videoUrl, "first"),
+    input.knownStartUrl
+      ? Promise.resolve(input.knownStartUrl)
+      : safeExtract(input.videoUrl, "first"),
     safeExtract(input.videoUrl, "middle"),
     safeExtract(input.videoUrl, "last"),
   ]);

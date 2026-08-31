@@ -4,10 +4,14 @@ export type DirectiveSource = "web" | "pumpfun";
 export type WorkerState = "idle" | "generating" | "error";
 export type GenerationMode = "full" | "fast" | "emergency";
 export type BufferHealthState = "healthy" | "tight" | "critical" | "empty";
-export type PumpChatState = "disabled" | "standby" | "connecting" | "live" | "error";
+export type PumpChatState =
+  "disabled" | "standby" | "connecting" | "live" | "error";
 export type ProposalStatus = "open" | "selected" | "lost";
 export type PromptRoundStatus = "open" | "closed";
-export type ReconciliationStatus = "verified" | "corrected" | "fallback" | "skipped";
+export type ReconciliationStatus =
+  "verified" | "corrected" | "fallback" | "skipped";
+export type GenerationPauseKind =
+  "cooldown" | "funds" | "rate_limit" | "provider";
 
 export type Clip = {
   id: number;
@@ -37,6 +41,11 @@ export type Clip = {
   frameSampleMs: number | null;
   visionMs: number | null;
   totalGenerationMs: number | null;
+  directiveSource: DirectiveSource | null;
+  directiveAuthor: string | null;
+  directiveAuthorAddress: string | null;
+  directiveProposalId: number | null;
+  directiveVoteCount: number | null;
 };
 
 export type Directive = {
@@ -76,7 +85,6 @@ export type PromptRound = {
   winnerProposalId: number | null;
   proposals: PromptProposal[];
 };
-
 
 export type WorldCharacter = {
   id: string;
@@ -119,7 +127,6 @@ export type WorldStateAudit = {
   cost: number | null;
 };
 
-
 export type GenerationTimingSample = {
   generationMode: GenerationMode;
   showrunnerMs: number | null;
@@ -144,6 +151,14 @@ export type BufferHealth = {
   p50H3Ms: number | null;
 };
 
+export type GenerationAvailability = {
+  paused: boolean;
+  kind: GenerationPauseKind | null;
+  reason: string | null;
+  retryAtMs: number | null;
+  failureCount: number;
+};
+
 export type PumpfunChatStatus = {
   enabled: boolean;
   mint: string | null;
@@ -162,6 +177,8 @@ export type RoomState = {
   bufferedUntilMs: number | null;
   buffer: BufferHealth;
   pumpfun: PumpfunChatStatus;
+  generation: GenerationAvailability;
+  viewerCount: number;
 };
 
 export type StreamState = {

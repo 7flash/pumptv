@@ -4,7 +4,11 @@ import { z } from "sqlite-zod-orm";
 import { showrunnerMeasure } from "./observability.ts";
 import { sanitizeLine, type ShotPlan } from "./prompt.ts";
 import type { GenerationMode, WorldState } from "../shared/contracts.ts";
-import { EMPTY_WORLD_STATE, normalizeWorldState, worldStateForShowrunner } from "./world-state.ts";
+import {
+  EMPTY_WORLD_STATE,
+  normalizeWorldState,
+  worldStateForShowrunner,
+} from "./world-state.ts";
 
 const MODEL = process.env.SLOP_SHOWRUNNER_MODEL || "gemini-2.5-flash";
 
@@ -37,7 +41,9 @@ function ShowrunnerPrompt(input: {
   worldState: WorldState;
 }) {
   const canon = input.recentStory.length
-    ? input.recentStory.map((item, i) => `${i + 1}. ${sanitizeLine(item, 500)}`).join("\n")
+    ? input.recentStory
+        .map((item, i) => `${i + 1}. ${sanitizeLine(item, 500)}`)
+        .join("\n")
     : "No prior generated scenes yet.";
 
   return (
@@ -62,17 +68,45 @@ Hard rules:
 - Never add titles, captions, credits, logos, fades-to-black or arbitrary time jumps.
 - You MUST call emit_shot_plan exactly once. Return no prose outside the tool call.`}</system>
 
-      <tool name="emit_shot_plan" description="Commit the production plan for the next five-second video shot">
-        <param name="premise" type="string" required>One sentence describing what this shot is fundamentally doing.</param>
-        <param name="action" type="string" required>Concrete physical action that unfolds during the next five seconds.</param>
-        <param name="transition" type="string" required>How the first one to two seconds visibly and causally bridge the prior final frame into the winning audience idea without a reset.</param>
-        <param name="continuity" type="string" required>Specific continuity constraints inherited from prior shots and the anchor frame.</param>
-        <param name="camera" type="string" required>Framing and camera movement that keeps the action readable.</param>
-        <param name="visualDetails" type="string" required>Important character, prop, lighting, environment and motion details.</param>
-        <param name="audio" type="string" required>Ambience, foley, music if motivated, and other synchronized sound.</param>
-        <param name="dialogue" type="string" required>Exact short dialogue if useful, otherwise an empty string.</param>
-        <param name="endingBeat" type="string" required>The active visual state of the final frame that the next shot can inherit.</param>
-        <param name="worldStateJson" type="string" required>{`Strict JSON for the complete canon world state AFTER this shot. Preserve unchanged durable facts. Shape: {"revision":number,"location":string,"locationDetails":string,"characters":[{"id":string,"name":string,"appearance":string,"wardrobe":string,"status":string,"position":string}],"props":[{"id":string,"name":string,"description":string,"status":string,"position":string}],"openThreads":string[],"motifs":string[],"visualRules":string[],"lastEndingBeat":string}.`}</param>
+      <tool
+        name="emit_shot_plan"
+        description="Commit the production plan for the next five-second video shot"
+      >
+        <param name="premise" type="string" required>
+          One sentence describing what this shot is fundamentally doing.
+        </param>
+        <param name="action" type="string" required>
+          Concrete physical action that unfolds during the next five seconds.
+        </param>
+        <param name="transition" type="string" required>
+          How the first one to two seconds visibly and causally bridge the prior
+          final frame into the winning audience idea without a reset.
+        </param>
+        <param name="continuity" type="string" required>
+          Specific continuity constraints inherited from prior shots and the
+          anchor frame.
+        </param>
+        <param name="camera" type="string" required>
+          Framing and camera movement that keeps the action readable.
+        </param>
+        <param name="visualDetails" type="string" required>
+          Important character, prop, lighting, environment and motion details.
+        </param>
+        <param name="audio" type="string" required>
+          Ambience, foley, music if motivated, and other synchronized sound.
+        </param>
+        <param name="dialogue" type="string" required>
+          Exact short dialogue if useful, otherwise an empty string.
+        </param>
+        <param name="endingBeat" type="string" required>
+          The active visual state of the final frame that the next shot can
+          inherit.
+        </param>
+        <param
+          name="worldStateJson"
+          type="string"
+          required
+        >{`Strict JSON for the complete canon world state AFTER this shot. Preserve unchanged durable facts. Shape: {"revision":number,"location":string,"locationDetails":string,"characters":[{"id":string,"name":string,"appearance":string,"wardrobe":string,"status":string,"position":string}],"props":[{"id":string,"name":string,"description":string,"status":string,"position":string}],"openThreads":string[],"motifs":string[],"visualRules":string[],"lastEndingBeat":string}.`}</param>
       </tool>
 
       <message role="user">{`Target shot: ${input.episode + 1}
@@ -102,24 +136,35 @@ function deterministicFallback(input: {
   return {
     premise: sanitizeLine(input.directive, 500),
     action: `Continue directly from ${sanitizeLine(last, 300)} and make the viewer directive happen through one clear physical action.`,
-    transition: "Spend the first beat continuing the exact pose, motion and spatial relationships already visible, then reveal or introduce the new audience idea through an on-screen causal event rather than a cut or teleport.",
+    transition:
+      "Spend the first beat continuing the exact pose, motion and spatial relationships already visible, then reveal or introduce the new audience idea through an on-screen causal event rather than a cut or teleport.",
     continuity: input.hasAnchor
       ? "Treat the anchor image as exact visual truth and preserve every visible identity, prop, wardrobe and spatial relationship."
       : "Establish a stable protagonist, location and visual grammar that can persist across later shots.",
-    camera: "Use one coherent cinematic setup with restrained movement that follows the main action and preserves screen direction.",
-    visualDetails: "Keep identities and key props visually consistent; favor readable foreground action and grounded environmental motion.",
-    audio: "Use synchronized room tone, movement foley and motivated environmental sound; music only if already established or clearly motivated.",
+    camera:
+      "Use one coherent cinematic setup with restrained movement that follows the main action and preserves screen direction.",
+    visualDetails:
+      "Keep identities and key props visually consistent; favor readable foreground action and grounded environmental motion.",
+    audio:
+      "Use synchronized room tone, movement foley and motivated environmental sound; music only if already established or clearly motivated.",
     dialogue: "",
-    endingBeat: "End mid-consequence on a visually legible state with the protagonist and important props still readable for immediate continuation.",
+    endingBeat:
+      "End mid-consequence on a visually legible state with the protagonist and important props still readable for immediate continuation.",
   };
 }
 
-function fallbackWorldState(input: { worldState: WorldState }, plan: ShotPlan): WorldState {
-  return normalizeWorldState({
-    ...input.worldState,
-    revision: input.worldState.revision + 1,
-    lastEndingBeat: plan.endingBeat,
-  }, input.worldState);
+function fallbackWorldState(
+  input: { worldState: WorldState },
+  plan: ShotPlan,
+): WorldState {
+  return normalizeWorldState(
+    {
+      ...input.worldState,
+      revision: input.worldState.revision + 1,
+      lastEndingBeat: plan.endingBeat,
+    },
+    input.worldState,
+  );
 }
 
 export async function planNextShot(input: {
@@ -148,16 +193,20 @@ export async function planNextShot(input: {
   try {
     const result = await showrunnerMeasure.measure(
       { label: "Plan next shot", episode: input.episode, model: MODEL },
-      () => callLLM(<ShowrunnerPrompt {...promptInput} />, {
-        model: MODEL,
-        strategy: "hybrid",
-        temperature: generationMode === "fast" ? 0.25 : 0.35,
-        maxTokens: generationMode === "fast" ? 950 : 1500,
-      }),
+      () =>
+        callLLM(<ShowrunnerPrompt {...promptInput} />, {
+          model: MODEL,
+          strategy: "hybrid",
+          temperature: generationMode === "fast" ? 0.25 : 0.35,
+          maxTokens: generationMode === "fast" ? 950 : 1500,
+        }),
     );
 
-    const toolCall = result?.toolCalls.find((call) => call.name === "emit_shot_plan");
-    if (!toolCall) throw new Error("Showrunner returned no emit_shot_plan tool call");
+    const toolCall = result?.toolCalls.find(
+      (call) => call.name === "emit_shot_plan",
+    );
+    if (!toolCall)
+      throw new Error("Showrunner returned no emit_shot_plan tool call");
     const parsed = ShotPlanSchema.parse(toolCall.args);
     const { worldStateJson, ...shotPlan } = parsed;
     const plan = shotPlan as ShotPlan;
@@ -177,7 +226,10 @@ export async function planNextShot(input: {
       nextWorldState,
     };
   } catch (error) {
-    console.error("[showrunner] falling back to deterministic shot plan", error);
+    console.error(
+      "[showrunner] falling back to deterministic shot plan",
+      error,
+    );
     const fallbackInput = { ...input, worldState };
     const plan = deterministicFallback(fallbackInput);
     return {
