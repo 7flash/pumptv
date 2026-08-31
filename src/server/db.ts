@@ -27,6 +27,12 @@ const openedDb = dbMeasure.measureSync(
           leaseOwner: z.string().nullable().default(null),
           leaseUntilMs: z.number().default(0),
           heartbeatAtMs: z.number().default(0),
+          webOwnerPid: z.number().nullable().default(null),
+          webHeartbeatAtMs: z.number().default(0),
+          generationStage: z
+            .enum(["idle", "planning", "rendering", "finalizing"])
+            .default("idle"),
+          generationStartedAtMs: z.number().nullable().default(null),
           generationMode: z.enum(["full", "fast", "emergency"]).default("full"),
           generationPauseKind: z
             .enum(["config", "cooldown", "funds", "rate_limit", "provider"])
@@ -59,6 +65,7 @@ const openedDb = dbMeasure.measureSync(
           targetEpisode: z.number(),
           status: z.enum(["open", "closed"]).default("open"),
           openedAtMs: z.number(),
+          votingStartedAtMs: z.number().nullable().default(null),
           closesAtMs: z.number(),
           closedAtMs: z.number().nullable().default(null),
           winnerProposalId: z.number().nullable().default(null),
@@ -73,11 +80,13 @@ const openedDb = dbMeasure.measureSync(
           author: z.string().nullable().default(null),
           authorAddress: z.string().nullable().default(null),
           sourceRoom: z.string().nullable().default(null),
+          operatorVoteOverride: z.number().nullable().default(null),
         }),
         proposalVotes: z.object({
           roundId: z.number(),
           proposalId: z.number(),
           voterKey: z.string(),
+          voterHandle: z.string().nullable().default(null),
           source: z.enum(["web", "pumpfun"]).default("web"),
           sourceId: z.string().nullable().default(null),
         }),
@@ -156,6 +165,13 @@ dbMeasure.measureSync("Create proposal voter index", () =>
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS proposal_votes_round_voter_unique
      ON proposalVotes(roundId, voterKey)`,
+  ),
+);
+
+dbMeasure.measureSync("Create proposal voter handle index", () =>
+  db.exec(
+    `CREATE INDEX IF NOT EXISTS proposal_votes_round_handle_idx
+     ON proposalVotes(roundId, voterHandle)`,
   ),
 );
 

@@ -10,10 +10,9 @@ import type {
   WorldState,
 } from "../shared/contracts.ts";
 import { EMPTY_WORLD_STATE, normalizeWorldState } from "./world-state.ts";
-import { codexCallOptions, getCodexConfig } from "./codex-config.ts";
 import { PumpTVShowrunnerPrompt } from "./showrunner-prompt.tsx";
 
-const MODEL = getCodexConfig().model;
+const MODEL = process.env.JSX_AI_MODEL || "runtime-default";
 
 export type ShowrunnerResult = {
   plan: ShotPlan;
@@ -276,14 +275,8 @@ export async function planNextShot(input: {
           episode={input.episode}
           hasAnchor={input.hasAnchor}
           worldState={worldState}
+          maxTokens={generationMode === "fast" ? 1800 : 2800}
         />,
-        // Codex native mode is text-first in our runtime. JSX-AI's natural
-        // strategy renders JSX tools into an explicit protocol and parses those
-        // calls back into result.toolCalls, avoiding provider-specific FC shape.
-        codexCallOptions({
-          strategy: "natural",
-          maxTokens: generationMode === "fast" ? 1800 : 2800,
-        }),
       ),
   );
 
@@ -333,7 +326,7 @@ export async function planNextShot(input: {
   }
 
   console.log(
-    `[showrunner] staged EP ${input.episode + 1} via JSX-AI tools · ${calls.length} calls · Codex ${MODEL}`,
+    `[showrunner] staged EP ${input.episode + 1} via JSX-AI tools · ${calls.length} calls · ${process.env.JSX_AI_RUNTIME || "default"}/${MODEL}`,
   );
 
   return {

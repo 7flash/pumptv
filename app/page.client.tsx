@@ -2,13 +2,19 @@ import { render } from "tradjs/client";
 import type {
   Clip,
   Directive,
+  LiveProgramState,
+  PromptProposal,
+  PromptRound,
   RoomState,
   StreamState,
+  WorldState,
 } from "../src/shared/contracts.ts";
 
 let timeline: Clip[] = [];
 let room: RoomState | null = null;
 let nextDirective: Directive | null = null;
+let program: LiveProgramState | null = null;
+let worldState: WorldState | null = null;
 let serverOffsetMs = 0;
 let replayClipId: number | null = null;
 let source: EventSource | null = null;
@@ -19,10 +25,28 @@ let timer: ReturnType<typeof setInterval> | null = null;
 
 let soundEnabled = false;
 let captionsEnabled = true;
-let nextCueEnabled = true;
+let liveOverlayEnabled = true;
+let infoOpen = false;
+
+type LiveSlotState = "playing" | "intermission" | "transitioning";
+let liveSlotState: LiveSlotState = "playing";
+
+let mediaDeck: HTMLDivElement | null = null;
+let posterNode: HTMLImageElement | null = null;
 let activeVideoSlot = 0;
 let activeVideoClipId: number | null = null;
-let swappingVideo = false;
+let switchSerial = 0;
+let crossfade: {
+  incomingClipId: number;
+  incomingSlot: number;
+  outgoingSlot: number;
+  serial: number;
+} | null = null;
+let pendingActivation: { clipId: number; slot: number; serial: number } | null =
+  null;
+let mediaTargetObserver: ResizeObserver | null = null;
+let observedGlass: HTMLElement | null = null;
+let lastMediaRect = "";
 
 function liveNowMs() {
   return Date.now() + serverOffsetMs;
@@ -55,11 +79,6 @@ function visibleClip() {
   );
 }
 
-function nextScheduledClip() {
-  const now = liveNowMs();
-  return timeline.find((clip) => clip.startsAtMs > now) || null;
-}
-
 function clipAfter(clip: Clip | null) {
   if (!clip) return null;
   const ordered = replayClipId == null ? timeline : publishedTimeline();
@@ -67,9 +86,112 @@ function clipAfter(clip: Clip | null) {
   return index >= 0 ? ordered[index + 1] || null : null;
 }
 
+function clipPoster(clip: Clip | null) {
+  if (!clip) return "";
+  return clip.startFrameUrl || clip.anchorFrameUrl || clip.endFrameUrl || "";
+}
+
+function createMediaDeck() {
+  const deck = document.createElement("div");
+  deck.className = "mediaDeck";
+
+  const poster = document.createElement("img");
+  poster.className = "tvPosterFallback";
+  poster.alt = "";
+  poster.decoding = "async";
+  deck.appendChild(poster);
+  posterNode = poster;
+
+  for (let slot = 0; slot < 2; slot += 1) {
+    const video = document.createElement("video");
+    video.className = "tvVideoLayer";
+    video.dataset.slot = String(slot);
+    video.preload = "auto";
+    video.playsInline = true;
+    video.setAttribute("playsinline", "");
+    video.setAttribute("aria-hidden", "true");
+    deck.appendChild(video);
+  }
+
+  return deck;
+}
+
+function positionMediaDeck() {
+  if (!mediaDeck) return;
+  const glass = document.querySelector(".tvGlass") as HTMLElement | null;
+  if (!glass) {
+    mediaDeck.style.visibility = "hidden";
+    lastMediaRect = "";
+    return;
+  }
+  const rect = glass.getBoundingClientRect();
+  const nextRect = `${Math.round(rect.left * 10) / 10}:${Math.round(rect.top * 10) / 10}:${Math.round(rect.width * 10) / 10}:${Math.round(rect.height * 10) / 10}`;
+  if (nextRect !== lastMediaRect) {
+    mediaDeck.style.left = `${rect.left}px`;
+    mediaDeck.style.top = `${rect.top}px`;
+    mediaDeck.style.width = `${rect.width}px`;
+    mediaDeck.style.height = `${rect.height}px`;
+    lastMediaRect = nextRect;
+  }
+  mediaDeck.style.visibility =
+    rect.width > 0 && rect.height > 0 ? "visible" : "hidden";
+}
+
+function observeMediaTarget() {
+  const glass = document.querySelector(".tvGlass") as HTMLElement | null;
+  if (glass === observedGlass) return;
+  mediaTargetObserver?.disconnect();
+  observedGlass = glass;
+  if (!glass || typeof ResizeObserver === "undefined") {
+    positionMediaDeck();
+    return;
+  }
+  mediaTargetObserver = new ResizeObserver(() => positionMediaDeck());
+  mediaTargetObserver.observe(glass);
+  positionMediaDeck();
+}
+
+function ensureMediaDeck() {
+  if (!mediaDeck) mediaDeck = createMediaDeck();
+  const host = document.getElementById("pumptv-media-host");
+  if (host && mediaDeck.parentElement !== host) host.appendChild(mediaDeck);
+  positionMediaDeck();
+  syncPoster();
+  return mediaDeck;
+}
+
+function videoNodes() {
+  const deck = ensureMediaDeck();
+  return [0, 1].map(
+    (slot) =>
+      deck.querySelector(
+        `video[data-slot="${slot}"]`,
+      ) as HTMLVideoElement | null,
+  );
+}
+
+function syncPoster() {
+  if (!posterNode) return;
+  const poster = clipPoster(visibleClip() || desiredClip());
+  if (poster && posterNode.src !== poster) posterNode.src = poster;
+  posterNode.style.opacity = poster ? "1" : "0";
+}
+
 function redraw() {
   const root = document.getElementById("pumptv-root");
-  if (root) render(<App />, root);
+  if (!root) return;
+
+  // The media deck lives in a sibling host that TradJS never renders into.
+  // UI redraws therefore cannot detach, replace, or repaint the video elements.
+  render(<App />, root);
+  queueMicrotask(() => {
+    ensureMediaDeck();
+    observeMediaTarget();
+    syncVideoDeck();
+    syncLocalPresentation();
+    updateLiveMeters();
+    centerSelectedEpisode();
+  });
 }
 
 async function json<T>(url: string): Promise<T> {
@@ -85,6 +207,8 @@ function applyState(state: StreamState) {
   room = state.room;
   timeline = state.timeline;
   nextDirective = state.nextDirective;
+  program = state.program;
+  worldState = state.worldState;
   if (
     replayClipId != null &&
     !timeline.some((clip) => clip.id === replayClipId)
@@ -92,7 +216,6 @@ function applyState(state: StreamState) {
     replayClipId = null;
   error = null;
   redraw();
-  queueMicrotask(syncVideoDeck);
 }
 
 function readPref(key: string, fallback: boolean) {
@@ -104,21 +227,106 @@ function writePref(key: string, value: boolean) {
   localStorage.setItem(key, value ? "1" : "0");
 }
 
+function syncLocalUiState() {
+  const html = document.documentElement;
+  html.dataset.pumptvSound = soundEnabled ? "on" : "off";
+  html.dataset.pumptvCaptions = captionsEnabled ? "on" : "off";
+  html.dataset.pumptvOverlay = liveOverlayEnabled ? "on" : "off";
+  html.dataset.pumptvInfo = infoOpen ? "open" : "closed";
+  html.dataset.pumptvMode = replayClipId == null ? "live" : "replay";
+  html.dataset.pumptvSlot = replayClipId == null ? liveSlotState : "replay";
+
+  document
+    .querySelectorAll<HTMLElement>("[data-control]")
+    .forEach((control) => {
+      const name = control.dataset.control;
+      const active =
+        name === "sound"
+          ? soundEnabled
+          : name === "captions"
+            ? captionsEnabled
+            : name === "overlay"
+              ? liveOverlayEnabled
+              : name === "info"
+                ? infoOpen
+                : false;
+      control.classList.toggle("on", active);
+      if (name !== "fullscreen")
+        control.setAttribute("aria-pressed", String(active));
+    });
+
+  if (mediaDeck) {
+    const nodes = Array.from(
+      mediaDeck.querySelectorAll("video"),
+    ) as HTMLVideoElement[];
+    for (const video of nodes) {
+      if (video.dataset.clipId === String(activeVideoClipId))
+        video.muted = !soundEnabled;
+      else video.muted = true;
+    }
+  }
+}
+
+function syncEpisodeSelection() {
+  const desiredId = desiredClip()?.id ?? null;
+  const liveId = latestPublishedClip()?.id ?? null;
+  document
+    .querySelectorAll<HTMLElement>(".episodeCard[data-episode-id]")
+    .forEach((card) => {
+      const id = Number(card.dataset.episodeId);
+      card.classList.toggle("active", Number.isFinite(id) && id === desiredId);
+      card.classList.toggle(
+        "live",
+        Number.isFinite(id) && id === liveId && replayClipId == null,
+      );
+    });
+  const liveCap = document.querySelector<HTMLElement>(".liveCap");
+  if (liveCap) liveCap.classList.toggle("active", replayClipId == null);
+}
+
+function syncCurrentPromptDom() {
+  const clip = visibleClip();
+  const prompt = document.querySelector<HTMLElement>("[data-current-prompt]");
+  const text = document.querySelector<HTMLElement>(
+    "[data-current-prompt-text]",
+  );
+  const author = document.querySelector<HTMLElement>(
+    "[data-current-prompt-author]",
+  );
+  if (!prompt) return;
+  if (clip) prompt.removeAttribute("data-empty");
+  else prompt.setAttribute("data-empty", "");
+  if (text) text.textContent = clip?.directive || "";
+  if (author) author.textContent = clip ? clipAuthor(clip) : "";
+  prompt.setAttribute(
+    "title",
+    clip ? `Episode ${clip.episode + 1} · ${clipAuthor(clip)}` : "",
+  );
+}
+
+function syncLocalPresentation() {
+  syncLocalUiState();
+  syncEpisodeSelection();
+  syncCurrentPromptDom();
+}
+
 function ensureViewerIdAndPrefs() {
-  const key = "pumptv-viewer-id";
-  viewerId = localStorage.getItem(key) || "";
+  viewerId = localStorage.getItem("pumptv-viewer-id") || "";
   if (!viewerId) {
     viewerId = crypto.randomUUID();
-    localStorage.setItem(key, viewerId);
+    localStorage.setItem("pumptv-viewer-id", viewerId);
   }
 
-  soundEnabled = readPref("pumptv-sound", false);
-  captionsEnabled = readPref("pumptv-captions", true);
-  nextCueEnabled = readPref("pumptv-next-cue", true);
+  soundEnabled = readPref("pumptv-v25-sound", false);
+  captionsEnabled = readPref("pumptv-v25-captions", true);
+  liveOverlayEnabled = readPref("pumptv-v25-live-overlay", true);
 }
 
 async function boot() {
   ensureViewerIdAndPrefs();
+  installInteractionLayer();
+  syncLocalUiState();
+  redraw();
   try {
     applyState(await json<StreamState>("/api/state"));
   } catch (cause) {
@@ -132,7 +340,6 @@ async function boot() {
   source.onopen = () => {
     transport = "live";
     redraw();
-    queueMicrotask(syncVideoDeck);
   };
   source.onmessage = (event) => {
     try {
@@ -147,32 +354,20 @@ async function boot() {
     redraw();
   };
 
-  // Playback timing is deliberately separate from UI rendering. The video deck
-  // can swap on the exact episode boundary without rerendering the whole app.
-  timer = setInterval(syncVideoDeck, 100);
-}
-
-function videoNodes() {
-  return [0, 1].map(
-    (slot) =>
-      document.querySelector(
-        `video.tvVideoLayer[data-slot="${slot}"]`,
-      ) as HTMLVideoElement | null,
-  );
-}
-
-function clipPoster(clip: Clip | null) {
-  if (!clip) return "";
-  return clip.anchorFrameUrl || clip.startFrameUrl || clip.endFrameUrl || "";
+  timer = setInterval(() => {
+    syncVideoDeck();
+    updateLiveMeters();
+  }, 100);
 }
 
 function configureVideo(video: HTMLVideoElement, clip: Clip, slot: number) {
   if (video.dataset.clipId === String(clip.id) && video.src) return;
 
   video.pause();
-  video.classList.remove("active");
+  video.classList.remove("active", "retiring");
   video.dataset.clipId = String(clip.id);
   video.dataset.ready = "0";
+  video.dataset.resumePending = "0";
   video.preload = "auto";
   video.playsInline = true;
   video.muted = true;
@@ -190,74 +385,322 @@ function configureVideo(video: HTMLVideoElement, clip: Clip, slot: number) {
   video.load();
 }
 
-function targetTimeFor(clip: Clip) {
-  if (replayClipId != null) return 0;
-  const duration = Math.max(0.1, clip.durationSeconds);
-  const age = Math.max(0, (liveNowMs() - clip.startsAtMs) / 1000);
-  // When chat is quiet the newest episode is the channel loop. Keep it moving
-  // while waiting, but a newly scheduled clip can still take over immediately.
-  return age % duration;
+function targetTimeFor(_clip: Clip) {
+  // Publication decides which episode is live. Playback always reveals a newly
+  // selected/published episode from frame 0 so transitions never jump into the
+  // middle of a clip.
+  return 0;
 }
 
-function activateVideoSlot(
+function bufferedFromStart(video: HTMLVideoElement) {
+  for (let index = 0; index < video.buffered.length; index += 1) {
+    const start = video.buffered.start(index);
+    const end = video.buffered.end(index);
+    if (start <= 0.08) return Math.max(0, end);
+  }
+  return 0;
+}
+
+function smoothStartGoal(video: HTMLVideoElement) {
+  const duration = video.duration;
+  if (Number.isFinite(duration) && duration > 0) {
+    // PumpTV episodes are currently ~5 seconds. Fully buffer short episodes on
+    // a cold page load so the viewer never watches network/decode warm-up as
+    // visible stutter. Longer future formats only require a healthy runway.
+    if (duration <= 8) return Math.max(1.25, duration - 0.15);
+    return Math.max(2.5, Math.min(4, duration * 0.4));
+  }
+  return 2.5;
+}
+
+async function waitForSmoothStartBuffer(video: HTMLVideoElement) {
+  const goal = smoothStartGoal(video);
+  const startedAt = performance.now();
+  const hardTimeoutMs = 8_000;
+
+  while (bufferedFromStart(video) < goal) {
+    if (video.error)
+      throw new Error(`media error ${video.error.code} while buffering`);
+    if (performance.now() - startedAt >= hardTimeoutMs) {
+      const buffered = bufferedFromStart(video);
+      // Never fail forever on servers/browsers that do not aggressively honor
+      // preload=auto. We still require a meaningful runway before revealing.
+      if (
+        buffered >= 1.25 ||
+        video.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA
+      )
+        return;
+      throw new Error(
+        `timed out warming playback buffer (${buffered.toFixed(2)}s buffered)`,
+      );
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+}
+
+async function rewindForReveal(video: HTMLVideoElement) {
+  if (video.currentTime <= 0.03) {
+    try {
+      video.currentTime = 0;
+    } catch {}
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      video.removeEventListener("seeked", finish);
+      resolve();
+    };
+    const timeout = setTimeout(finish, 1_000);
+    video.addEventListener("seeked", finish, { once: true });
+    try {
+      video.currentTime = 0;
+    } catch {
+      finish();
+    }
+  });
+}
+
+async function waitForPaint(video: HTMLVideoElement) {
+  const hardTimeoutMs = 5_000;
+  const callback = (video as any).requestVideoFrameCallback;
+
+  if (typeof callback === "function") {
+    await new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timeout);
+        if (error) reject(error);
+        else resolve();
+      };
+      const timeout = setTimeout(
+        () =>
+          finish(new Error("timed out waiting for a presented video frame")),
+        hardTimeoutMs,
+      );
+      callback.call(video, () => finish());
+    });
+    return;
+  }
+
+  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
+    await new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        clearTimeout(timeout);
+        video.removeEventListener("loadeddata", onLoaded);
+        video.removeEventListener("error", onError);
+      };
+      const onLoaded = () => {
+        cleanup();
+        resolve();
+      };
+      const onError = () => {
+        cleanup();
+        reject(new Error("video failed before its first frame was available"));
+      };
+      const timeout = setTimeout(() => {
+        cleanup();
+        reject(new Error("timed out waiting for video data"));
+      }, hardTimeoutMs);
+      video.addEventListener("loadeddata", onLoaded, { once: true });
+      video.addEventListener("error", onError, { once: true });
+    });
+  }
+
+  // Browsers without requestVideoFrameCallback cannot prove compositor
+  // presentation. Two animation frames after HAVE_CURRENT_DATA is the safest
+  // fallback; importantly, an arbitrary short timeout is never treated as a
+  // successful paint anymore.
+  await new Promise<void>((resolve) =>
+    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+  );
+}
+
+function waitForOpacityTransition(video: HTMLVideoElement) {
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(fallback);
+      video.removeEventListener("transitionend", onEnd);
+      resolve();
+    };
+    const onEnd = (event: TransitionEvent) => {
+      if (event.propertyName === "opacity") finish();
+    };
+    const fallback = setTimeout(finish, 900);
+    video.addEventListener("transitionend", onEnd);
+  });
+}
+
+async function activateVideoSlot(
   slot: number,
   clip: Clip,
   video: HTMLVideoElement,
   nodes: Array<HTMLVideoElement | null>,
+  serial: number,
 ) {
-  const alreadyActive =
+  if (
     slot === activeVideoSlot &&
     activeVideoClipId === clip.id &&
-    video.classList.contains("active");
-  if (alreadyActive) {
-    video.muted = !soundEnabled;
-    if (video.paused) void video.play().catch(() => {});
+    video.classList.contains("active")
+  ) {
+    // Once the latest live episode has ended, keep its final painted frame
+    // parked beneath the intermission surface. Do not restart it just because
+    // the 100ms media synchronizer runs again.
+    const parkedAtLiveEdge =
+      replayClipId == null && liveSlotState === "intermission";
+    if (
+      !parkedAtLiveEdge &&
+      video.paused &&
+      !video.ended &&
+      video.dataset.resumePending !== "1"
+    ) {
+      // Resume muted first. A browser can pause a video when an async deck
+      // switch loses its user-activation token; retrying audibly here just
+      // repeats the autoplay rejection forever.
+      video.dataset.resumePending = "1";
+      video.muted = true;
+      void video
+        .play()
+        .then(() => {
+          video.dataset.resumePending = "0";
+          if (activeVideoClipId === clip.id) video.muted = !soundEnabled;
+        })
+        .catch(() => {
+          video.dataset.resumePending = "0";
+        });
+    } else if (!video.paused) {
+      video.muted = !soundEnabled;
+    }
     return;
   }
-  if (swappingVideo) return;
-  swappingVideo = true;
 
   const previous = nodes[activeVideoSlot];
-  const changedClip = activeVideoClipId !== clip.id;
 
-  if (changedClip) {
-    try {
-      video.currentTime = targetTimeFor(clip);
-    } catch {}
-  } else if (replayClipId == null) {
-    const target = targetTimeFor(clip);
-    if (Math.abs(video.currentTime - target) > 0.9) {
-      try {
-        video.currentTime = target;
-      } catch {}
+  try {
+    video.currentTime = targetTimeFor(clip);
+  } catch {}
+
+  // Always start an incoming deck muted. `canplay`/`loadeddata` fires after the
+  // original episode-card click, so attempting the first play unmuted can be
+  // rejected by browser autoplay policy even though the user initiated the
+  // switch. Once playback is actually running and a frame has painted we apply
+  // the user's sound preference to the now-active deck.
+  video.muted = true;
+
+  try {
+    const coldBootstrap = activeVideoClipId == null && previous === video;
+    if (coldBootstrap) {
+      if (replayClipId == null && liveSlotState !== "transitioning") {
+        liveSlotState = "transitioning";
+        syncLocalUiState();
+      }
+      // A fresh page load has no already-warm outgoing deck. Start the hidden
+      // video muted to make the browser fetch/decode aggressively, wait for a
+      // real playback runway, then rewind before the viewer sees frame 0.
+      await video.play();
+      await waitForSmoothStartBuffer(video);
+      video.pause();
+      await rewindForReveal(video);
     }
+    await video.play();
+    await waitForPaint(video);
+  } catch (cause) {
+    console.warn(
+      `[pumptv/media] activation failed for EP ${clip.episode + 1}`,
+      cause,
+      video.error,
+    );
+    // Keep the requested episode selected and retry from the media synchronizer
+    // instead of silently falling back to the previous clip.
+    video.dataset.ready =
+      video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
+        ? "1"
+        : video.dataset.ready;
+    return;
   }
 
-  video.muted = !soundEnabled;
-  void video
-    .play()
-    .then(() => {
-      // The incoming deck becomes visible only after play() succeeds. The outgoing
-      // deck therefore remains the visual fallback throughout network/decode delay.
-      video.classList.add("active");
-      video.setAttribute("aria-hidden", "false");
-      if (previous && previous !== video) {
-        previous.classList.remove("active");
-        previous.setAttribute("aria-hidden", "true");
-        previous.muted = true;
-        previous.pause();
-      }
+  if (serial !== switchSerial || desiredClip()?.id !== clip.id) {
+    if (activeVideoClipId !== clip.id) {
+      video.pause();
+      video.muted = true;
+    }
+    return;
+  }
 
-      activeVideoSlot = slot;
-      const didChange = activeVideoClipId !== clip.id;
-      activeVideoClipId = clip.id;
-      swappingVideo = false;
-      if (didChange) redraw();
-      queueMicrotask(syncVideoDeck);
-    })
-    .catch(() => {
-      swappingVideo = false;
-    });
+  const revealingFromIntermission =
+    replayClipId == null && liveSlotState === "intermission";
+  if (replayClipId == null) {
+    liveSlotState = revealingFromIntermission ? "transitioning" : "playing";
+    syncLocalUiState();
+  }
+
+  const changed = activeVideoClipId !== clip.id;
+  const outgoingSlot = activeVideoSlot;
+
+  // Reserve both decks for the entire visual transition. Until the incoming
+  // video is fully opaque, the outgoing deck is still part of the picture and
+  // MUST NOT be reused by the preloader. Reusing it early was the intermittent
+  // black/poster blink between otherwise identical episode pairs.
+  crossfade =
+    previous && previous !== video
+      ? { incomingClipId: clip.id, incomingSlot: slot, outgoingSlot, serial }
+      : null;
+
+  video.classList.remove("retiring", "reveal");
+  video.classList.add("active", "entering");
+  video.setAttribute("aria-hidden", "false");
+  video.muted = !soundEnabled;
+
+  if (previous && previous !== video) {
+    previous.classList.add("retiring");
+    previous.muted = true;
+  }
+
+  activeVideoSlot = slot;
+  activeVideoClipId = clip.id;
+  syncPoster();
+  if (changed) syncLocalPresentation();
+
+  if (previous && previous !== video) {
+    // Force the entering deck's opacity:0 state to become a committed style,
+    // then reveal on the next animation frame. This prevents the browser from
+    // coalescing setup + reveal into a single paint.
+    void video.offsetWidth;
+    await new Promise<void>((resolve) =>
+      requestAnimationFrame(() => {
+        video.classList.add("reveal");
+        resolve();
+      }),
+    );
+    await waitForOpacityTransition(video);
+
+    if (crossfade?.serial === serial && crossfade.incomingClipId === clip.id) {
+      video.classList.remove("entering", "reveal");
+      previous.classList.remove("active", "retiring", "entering", "reveal");
+      previous.setAttribute("aria-hidden", "true");
+      previous.pause();
+      previous.muted = true;
+      crossfade = null;
+
+      if (replayClipId == null && liveSlotState === "transitioning") {
+        liveSlotState = "playing";
+        syncLocalUiState();
+      }
+    }
+  } else {
+    video.classList.remove("entering", "reveal");
+  }
+
+  queueMicrotask(syncVideoDeck);
 }
 
 function syncVideoDeck() {
@@ -269,10 +712,17 @@ function syncVideoDeck() {
     for (const video of nodes) {
       if (!video) continue;
       video.pause();
-      video.classList.remove("active");
+      video.classList.remove("active", "retiring");
       video.muted = true;
     }
     activeVideoClipId = null;
+    crossfade = null;
+    pendingActivation = null;
+    if (replayClipId == null) {
+      liveSlotState = "intermission";
+      syncLocalUiState();
+    }
+    syncPoster();
     return;
   }
 
@@ -290,55 +740,126 @@ function syncVideoDeck() {
   if (wantedVideo) {
     const ready =
       wantedVideo.dataset.ready === "1" ||
-      wantedVideo.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA;
-    if (ready) activateVideoSlot(wantedSlot, wanted, wantedVideo, nodes);
+      wantedVideo.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
+    if (ready) {
+      const alreadyActive =
+        wantedSlot === activeVideoSlot &&
+        activeVideoClipId === wanted.id &&
+        wantedVideo.classList.contains("active");
+      if (alreadyActive) {
+        // The active-deck path is synchronous until its first return and is safe
+        // to run from the media heartbeat for pause/resume maintenance.
+        void activateVideoSlot(
+          wantedSlot,
+          wanted,
+          wantedVideo,
+          nodes,
+          switchSerial,
+        );
+      } else {
+        const sameActivationPending =
+          pendingActivation?.clipId === wanted.id &&
+          pendingActivation.slot === wantedSlot;
+        if (!sameActivationPending) {
+          const serial = ++switchSerial;
+          pendingActivation = { clipId: wanted.id, slot: wantedSlot, serial };
+          void activateVideoSlot(
+            wantedSlot,
+            wanted,
+            wantedVideo,
+            nodes,
+            serial,
+          ).finally(() => {
+            if (pendingActivation?.serial === serial) pendingActivation = null;
+          });
+        }
+      }
+    }
   }
 
-  const activeClip =
-    activeVideoClipId == null
-      ? null
-      : timeline.find((clip) => clip.id === activeVideoClipId) || wanted;
-  const preload = clipAfter(activeClip);
-  if (preload && preload.id !== wanted.id) {
-    const preloadSlot = 1 - activeVideoSlot;
-    const preloadVideo = nodes[preloadSlot];
-    if (preloadVideo && preloadVideo.dataset.clipId !== String(preload.id)) {
-      configureVideo(preloadVideo, preload, preloadSlot);
+  // Never preload into the inactive deck while a requested clip is still
+  // switching in. That deck belongs exclusively to `wanted` until activation
+  // commits. Once `wanted` is active, the other deck may safely preload the
+  // episode that follows `wanted`.
+  if (
+    activeVideoClipId === wanted.id &&
+    crossfade == null &&
+    pendingActivation == null
+  ) {
+    const preload = clipAfter(wanted);
+    if (preload && preload.id !== wanted.id) {
+      const preloadSlot = 1 - activeVideoSlot;
+      const preloadVideo = nodes[preloadSlot];
+      if (preloadVideo && preloadVideo.dataset.clipId !== String(preload.id))
+        configureVideo(preloadVideo, preload, preloadSlot);
     }
   }
 
   const active = nodes[activeVideoSlot];
-  if (active && activeVideoClipId === wanted.id) {
-    active.muted = !soundEnabled;
-    if (
-      replayClipId == null &&
-      active.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA
-    ) {
-      const target = targetTimeFor(wanted);
-      if (Math.abs(active.currentTime - target) > 1.1) {
-        try {
-          active.currentTime = target;
-        } catch {}
-      }
-    }
+  if (active && activeVideoClipId === wanted.id) active.muted = !soundEnabled;
+}
+
+function primeDesiredPlaybackFromGesture() {
+  const wanted = desiredClip();
+  if (!wanted) return;
+  const nodes = videoNodes();
+  if (!nodes[0] || !nodes[1]) return;
+
+  let slot = nodes.findIndex(
+    (video) => video?.dataset.clipId === String(wanted.id),
+  );
+  if (slot < 0) {
+    slot = activeVideoClipId == null ? activeVideoSlot : 1 - activeVideoSlot;
+    const target = nodes[slot];
+    if (target) configureVideo(target, wanted, slot);
   }
+
+  const video = nodes[slot];
+  if (!video) return;
+  try {
+    video.currentTime = 0;
+  } catch {}
+
+  // This function is called synchronously from the episode/live click handler,
+  // so it is the only place where we intentionally try an audible play under
+  // the browser's user-activation token. If that is rejected, immediately
+  // retry muted; activation/crossfade will restore the preferred mute state.
+  video.muted = !soundEnabled;
+  void video
+    .play()
+    .then(() => {
+      syncVideoDeck();
+    })
+    .catch(() => {
+      video.muted = true;
+      void video
+        .play()
+        .then(() => syncVideoDeck())
+        .catch(() => {});
+    });
 }
 
 function handleDeckEnded(slot: number, clipId: number) {
   if (slot !== activeVideoSlot || clipId !== activeVideoClipId) return;
 
   if (replayClipId != null) {
+    // An outgoing deck can finish while a different replay episode is loading.
+    // Never let that stale `ended` event advance/replace the newly requested
+    // replay target. Only the replay episode that is *currently selected* owns
+    // replay auto-advance semantics.
+    if (replayClipId !== clipId) return;
+
     const published = publishedTimeline();
-    const index = published.findIndex((clip) => clip.id === replayClipId);
+    const index = published.findIndex((clip) => clip.id === clipId);
     const following = index >= 0 ? published[index + 1] : null;
     const live = latestPublishedClip();
-    if (following && following.id !== live?.id) {
-      replayClipId = following.id;
-    } else {
-      replayClipId = null;
-    }
-    redraw();
-    queueMicrotask(syncVideoDeck);
+    if (following && following.id !== live?.id) replayClipId = following.id;
+    else replayClipId = null;
+    switchSerial += 1;
+    pendingActivation = null;
+    syncLocalUiState();
+    syncEpisodeSelection();
+    syncVideoDeck();
     return;
   }
 
@@ -349,56 +870,156 @@ function handleDeckEnded(slot: number, clipId: number) {
     return;
   }
 
-  // No next Pump.fun episode is ready yet. Loop the latest episode without ever
-  // clearing the current frame; the second deck remains free for preloading.
+  // Live TV is intentionally finite at the edge of the archive. Once the
+  // newest published episode ends we stop on its final painted frame and let
+  // the empty next-program slot carry voting / generation status. We never
+  // cover a still-playing episode with that UI and we never silently loop it.
+  liveSlotState = "intermission";
+  syncLocalUiState();
   const active = videoNodes()[slot];
   if (active) {
-    try {
-      active.currentTime = 0;
-    } catch {}
-    active.muted = !soundEnabled;
-    void active.play().catch(() => {});
+    active.pause();
+    active.muted = true;
   }
 }
 
 function toggleSound() {
   soundEnabled = !soundEnabled;
-  writePref("pumptv-sound", soundEnabled);
-  redraw();
-  queueMicrotask(syncVideoDeck);
+  writePref("pumptv-v25-sound", soundEnabled);
+  syncLocalUiState();
 }
 
 function toggleCaptions() {
   captionsEnabled = !captionsEnabled;
-  writePref("pumptv-captions", captionsEnabled);
-  redraw();
+  writePref("pumptv-v25-captions", captionsEnabled);
+  syncLocalUiState();
 }
 
-function toggleNextCue() {
-  nextCueEnabled = !nextCueEnabled;
-  writePref("pumptv-next-cue", nextCueEnabled);
-  redraw();
+function toggleLiveOverlay() {
+  liveOverlayEnabled = !liveOverlayEnabled;
+  writePref("pumptv-v25-live-overlay", liveOverlayEnabled);
+  syncLocalUiState();
+}
+
+function toggleInfo() {
+  infoOpen = !infoOpen;
+  syncLocalUiState();
 }
 
 async function toggleFullscreen() {
-  const target = document.querySelector(".tvShell") as HTMLElement | null;
   try {
     if (document.fullscreenElement) await document.exitFullscreen();
-    else if (target?.requestFullscreen) await target.requestFullscreen();
+    else if (document.documentElement.requestFullscreen)
+      await document.documentElement.requestFullscreen();
   } catch {}
 }
 
+function formatClock(ms: number) {
+  const total = Math.max(0, Math.ceil(ms / 100) / 10);
+  const seconds = Math.floor(total);
+  const tenths = Math.floor((total - seconds) * 10);
+  return `${String(seconds).padStart(2, "0")}.${tenths}`;
+}
+
+function updateLiveMeters() {
+  const vote = document.querySelector(
+    "[data-vote-countdown]",
+  ) as HTMLElement | null;
+  if (vote && program?.countdownEndsAtMs)
+    vote.textContent = formatClock(program.countdownEndsAtMs - liveNowMs());
+  const futureVote = document.querySelector(
+    "[data-future-vote-countdown]",
+  ) as HTMLElement | null;
+  if (futureVote && program?.votingRound?.closesAtMs)
+    futureVote.textContent = formatClock(
+      program.votingRound.closesAtMs - liveNowMs(),
+    );
+  const gen = document.querySelector(
+    "[data-generation-elapsed]",
+  ) as HTMLElement | null;
+  if (gen && program?.generationStartedAtMs)
+    gen.textContent = formatClock(liveNowMs() - program.generationStartedAtMs);
+}
+
 function jumpToEpisode(id: number) {
+  if (!timeline.some((clip) => clip.id === id)) return;
   const live = latestPublishedClip();
   replayClipId = live?.id === id ? null : id;
-  redraw();
-  queueMicrotask(syncVideoDeck);
+  if (replayClipId == null) liveSlotState = "playing";
+  switchSerial += 1;
+  pendingActivation = null;
+  syncLocalUiState();
+  syncEpisodeSelection();
+  centerSelectedEpisode("smooth");
+  primeDesiredPlaybackFromGesture();
+  syncVideoDeck();
 }
 
 function returnLive() {
   replayClipId = null;
-  redraw();
-  queueMicrotask(syncVideoDeck);
+  // Returning to live starts the latest archive episode cleanly. The ended
+  // edge will switch back to intermission when that episode actually finishes.
+  liveSlotState = "playing";
+  switchSerial += 1;
+  pendingActivation = null;
+  syncLocalUiState();
+  syncEpisodeSelection();
+  centerSelectedEpisode("smooth");
+  primeDesiredPlaybackFromGesture();
+  syncVideoDeck();
+}
+
+let interactionLayerInstalled = false;
+
+function installInteractionLayer() {
+  if (interactionLayerInstalled) return;
+  interactionLayerInstalled = true;
+
+  document.addEventListener(
+    "click",
+    (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const control = target?.closest<HTMLElement>("[data-action]");
+      if (!control) return;
+
+      const action = control.dataset.action;
+      if (!action) return;
+      event.preventDefault();
+
+      if (action === "sound") toggleSound();
+      else if (action === "captions") toggleCaptions();
+      else if (action === "overlay") toggleLiveOverlay();
+      else if (action === "info") toggleInfo();
+      else if (action === "close-info") {
+        if (infoOpen) {
+          infoOpen = false;
+          syncLocalUiState();
+        }
+      } else if (action === "fullscreen") void toggleFullscreen();
+      else if (action === "live") returnLive();
+      else if (action === "episode") {
+        const id = Number(control.dataset.episodeId);
+        if (Number.isFinite(id)) jumpToEpisode(id);
+      }
+    },
+    true,
+  );
+
+  document.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && infoOpen) {
+      infoOpen = false;
+      syncLocalUiState();
+    }
+  });
+
+  window.addEventListener("resize", positionMediaDeck);
+}
+
+function centerSelectedEpisode(behavior: ScrollBehavior = "auto") {
+  const active = document.querySelector(
+    ".episodeCard.active",
+  ) as HTMLElement | null;
+  if (active) active.scrollIntoView({ block: "nearest", behavior });
 }
 
 function shortAddress(value: string | null | undefined) {
@@ -407,90 +1028,320 @@ function shortAddress(value: string | null | undefined) {
   return `${value.slice(0, 5)}…${value.slice(-4)}`;
 }
 
+function authorLabel(author: string | null, address: string | null) {
+  if (author) return author.startsWith("@") ? author : `@${author}`;
+  return shortAddress(address) || "@?";
+}
+
 function clipAuthor(clip: Clip) {
-  if (clip.directiveAuthor)
-    return clip.directiveAuthor.startsWith("@")
-      ? clip.directiveAuthor
-      : `@${clip.directiveAuthor}`;
-  return (
-    shortAddress(clip.directiveAuthorAddress) ||
-    (clip.directiveSource === "pumpfun" ? "pump.fun" : "pumptv")
-  );
+  return authorLabel(clip.directiveAuthor, clip.directiveAuthorAddress);
 }
 
 function directiveAuthor(directive: Directive | null) {
-  if (!directive) return null;
-  if (directive.author)
-    return directive.author.startsWith("@")
-      ? directive.author
-      : `@${directive.author}`;
-  return shortAddress(directive.authorAddress) || "pump.fun";
-}
-
-function nextPrompt() {
-  const scheduled = nextScheduledClip();
-  if (scheduled) {
-    return {
-      text: scheduled.directive,
-      author: clipAuthor(scheduled),
-      generating: false,
-    };
-  }
-  if (nextDirective) {
-    return {
-      text: nextDirective.text,
-      author: directiveAuthor(nextDirective),
-      generating: nextDirective.status === "generating",
-    };
-  }
-  return null;
+  return directive
+    ? authorLabel(directive.author, directive.authorAddress)
+    : "@?";
 }
 
 function engineState() {
-  if (!room) return "boot";
-  if (!room.workerOnline) return "off";
-  if (room.generation.paused) return "pause";
-  if (room.workerState === "generating") return "work";
+  if (!program) return "boot";
+  if (program.phase === "starting") return "boot";
+  if (program.phase === "offline") return "off";
+  if (program.phase === "setup" || program.phase === "paused") return "pause";
+  if (
+    program.phase === "planning" ||
+    program.phase === "rendering" ||
+    program.phase === "finalizing"
+  )
+    return "work";
   return "ready";
 }
 
 function tooltipStatus() {
-  if (!room) return "PumpTV is starting";
-  if (!room.workerOnline) return "Generation worker offline";
-  if (room.generation.paused)
-    return room.generation.reason || "Generation paused";
+  if (!program || !room) return "PumpTV is starting";
+  if (program.reason) return program.reason;
+  if (program.phase === "starting") return "Generation worker is starting";
   if (!room.pumpfun.enabled) return "Pump.fun chat is not configured";
   if (room.pumpfun.state !== "live")
     return `Pump.fun chat: ${room.pumpfun.state}`;
-  if (room.workerState === "generating") return "Generating from Pump.fun chat";
-  return "Waiting for the next Pump.fun prompt";
+  if (program.phase === "voting")
+    return "Pump.fun is choosing the next episode";
+  if (program.phase === "locked") return "Next episode locked";
+  if (
+    program.phase === "planning" ||
+    program.phase === "rendering" ||
+    program.phase === "finalizing"
+  )
+    return "Generating next PumpTV episode";
+  if (program.phase === "ready") return "Next episode ready";
+  return "Waiting for Pump.fun suggestions";
 }
 
-function ControlButton(props: {
+type ControlIconName = "sound" | "captions" | "overlay" | "info" | "fullscreen";
+type ControlAction = "sound" | "captions" | "overlay" | "info" | "fullscreen";
+
+function ControlIcon({ name }: { name: ControlIconName }) {
+  if (name === "sound")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path d="M4 9v6h4l5 4V5L8 9H4Z" />
+        <path
+          className="stroke"
+          d="M16 9.2c1.1 1.1 1.1 4.5 0 5.6M18.5 7c2.6 2.5 2.6 7.5 0 10"
+        />
+      </svg>
+    );
+  if (name === "captions")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <rect className="stroke" x="3" y="5" width="18" height="14" rx="3" />
+        <path
+          className="stroke"
+          d="M9.8 10.2a2.4 2.4 0 1 0 0 3.6M16.8 10.2a2.4 2.4 0 1 0 0 3.6"
+        />
+      </svg>
+    );
+  if (name === "overlay")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle cx="12" cy="12" r="2" />
+        <path
+          className="stroke"
+          d="M8.3 8.3a5.2 5.2 0 0 0 0 7.4M15.7 8.3a5.2 5.2 0 0 1 0 7.4M5.5 5.5a9.2 9.2 0 0 0 0 13M18.5 5.5a9.2 9.2 0 0 1 0 13"
+        />
+      </svg>
+    );
+  if (name === "info")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle className="stroke" cx="12" cy="12" r="8" />
+        <circle cx="12" cy="8" r="1.2" />
+        <path className="stroke" d="M12 11v6" />
+      </svg>
+    );
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path className="stroke" d="M4 9V4h5M15 4h5v5M20 15v5h-5M9 20H4v-5" />
+    </svg>
+  );
+}
+
+function KnobControl(props: {
   active?: boolean;
   title: string;
-  glyph: string;
-  onClick: () => void;
+  icon: ControlIconName;
+  action: ControlAction;
 }) {
   return (
     <button
-      className={`hardwareToggle ${props.active ? "on" : ""}`}
+      className={`knobControl ${props.active ? "on" : ""}`}
       type="button"
-      onClick={props.onClick}
+      data-action={props.action}
+      data-control={props.action}
       title={props.title}
       aria-label={props.title}
       aria-pressed={Boolean(props.active)}
     >
-      {props.glyph}
+      <span className="knobNeedle" />
+      <span className="knobIcon">
+        <ControlIcon name={props.icon} />
+      </span>
     </button>
+  );
+}
+
+function sortedCandidates(round: PromptRound | null) {
+  return [...(round?.proposals || [])].sort(
+    (a, b) => b.voteCount - a.voteCount || a.id - b.id,
+  );
+}
+
+function candidateShare(
+  candidate: PromptProposal,
+  candidates: PromptProposal[],
+) {
+  const total = candidates.reduce(
+    (sum, item) => sum + Math.max(0, item.voteCount),
+    0,
+  );
+  return total > 0
+    ? Math.max(8, Math.round((candidate.voteCount / total) * 100))
+    : 8;
+}
+
+function stageGlyph(phase: LiveProgramState["phase"]) {
+  if (phase === "planning") return "◇";
+  if (phase === "rendering") return "▶";
+  if (phase === "finalizing") return "◆";
+  if (phase === "ready") return "●";
+  if (phase === "locked") return "◆";
+  if (phase === "voting") return "◉";
+  if (phase === "paused" || phase === "setup" || phase === "offline")
+    return "!";
+  if (phase === "starting") return "…";
+  return "○";
+}
+
+function CandidateRows({
+  round,
+  limit = 5,
+}: {
+  round: PromptRound | null;
+  limit?: number;
+}) {
+  const candidates = sortedCandidates(round);
+  if (!candidates.length) return null;
+  const winnerId = round?.winnerProposalId ?? null;
+  return (
+    <div className="liveRanking">
+      {candidates.slice(0, limit).map((candidate, index) => {
+        const selected =
+          winnerId === candidate.id || candidate.status === "selected";
+        return (
+          <div
+            className={`rankRow ${selected ? "winner" : ""}`}
+            key={candidate.id}
+          >
+            <em>{index + 1}</em>
+            <div className="rankIdea">
+              <span>{candidate.text}</span>
+              <i>{authorLabel(candidate.author, candidate.authorAddress)}</i>
+              <small
+                style={{ width: `${candidateShare(candidate, candidates)}%` }}
+              />
+            </div>
+            <b
+              className={
+                candidate.operatorVoteOverride == null ? "" : "override"
+              }
+            >
+              {candidate.voteCount}
+            </b>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function LiveProgramOverlay() {
+  if (!program) return null;
+
+  const phase = program.phase;
+  const generating =
+    phase === "planning" || phase === "rendering" || phase === "finalizing";
+  const voting = phase === "voting";
+  const ready = phase === "ready";
+  const locked = phase === "locked";
+  const decisionRound = program.decisionRound;
+  const votingRound = program.votingRound;
+  const primaryRound = voting ? votingRound : decisionRound;
+  const futureRound =
+    !voting &&
+    votingRound &&
+    votingRound.targetEpisode !== program.targetEpisode
+      ? votingRound
+      : null;
+
+  if (phase === "idle" && !votingRound?.proposals.length) {
+    return (
+      <div
+        className="liveProgram idleProgram"
+        title="Waiting for Pump.fun suggestions"
+      >
+        <span>•••</span>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={`liveProgram phase-${phase} ${generating ? "generating" : ""} ${ready ? "ready" : ""}`}
+    >
+      <div className="programGlass">
+        <div className="programPulse" aria-hidden="true">
+          <i />
+          <i />
+          <i />
+        </div>
+        <div className="programHead">
+          <span className="programEpisode">{program.targetEpisode + 1}</span>
+          {voting && program.countdownEndsAtMs ? (
+            <strong data-vote-countdown>
+              {formatClock(program.countdownEndsAtMs - liveNowMs())}
+            </strong>
+          ) : null}
+          {generating && program.generationStartedAtMs ? (
+            <strong data-generation-elapsed>
+              {formatClock(liveNowMs() - program.generationStartedAtMs)}
+            </strong>
+          ) : null}
+          {!voting && !generating ? <strong>{stageGlyph(phase)}</strong> : null}
+        </div>
+
+        {program.directive && (generating || locked || ready) ? (
+          <div className="winnerCard">
+            <span>{program.directive.text}</span>
+            <i>{directiveAuthor(program.directive)}</i>
+          </div>
+        ) : null}
+
+        {voting ? <CandidateRows round={primaryRound} /> : null}
+        {generating ? (
+          <div className={`stageTrack ${phase}`}>
+            <i />
+            <i />
+            <i />
+          </div>
+        ) : null}
+        {(phase === "paused" || phase === "setup" || phase === "offline") &&
+        program.reason ? (
+          <div className="programReason" title={program.reason}>
+            !
+          </div>
+        ) : null}
+
+        {futureRound?.proposals.length ? (
+          <div
+            className="futureRound"
+            title={`Pump.fun is already choosing episode ${futureRound.targetEpisode + 1}`}
+          >
+            <div className="futureRoundHead">
+              <span>{futureRound.targetEpisode + 1}</span>
+              {futureRound.votingStartedAtMs &&
+              futureRound.closesAtMs > liveNowMs() ? (
+                <b data-future-vote-countdown>
+                  {formatClock(futureRound.closesAtMs - liveNowMs())}
+                </b>
+              ) : (
+                <b>○</b>
+              )}
+            </div>
+            <CandidateRows round={futureRound} limit={3} />
+          </div>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function CurrentPrompt({ clip }: { clip: Clip | null }) {
+  return (
+    <div
+      className="currentPrompt"
+      data-current-prompt
+      data-empty={clip ? undefined : ""}
+      title={clip ? `Episode ${clip.episode + 1} · ${clipAuthor(clip)}` : ""}
+    >
+      <span data-current-prompt-text>{clip?.directive || ""}</span>
+      <i data-current-prompt-author>{clip ? clipAuthor(clip) : ""}</i>
+    </div>
   );
 }
 
 function TactileTV({ clip }: { clip: Clip | null }) {
   const state = engineState();
   const isReplay = replayClipId != null;
-  const prompt = nextPrompt();
-  const poster = clipPoster(clip);
 
   return (
     <div className="tvShell">
@@ -498,27 +1349,8 @@ function TactileTV({ clip }: { clip: Clip | null }) {
       <div className="tvScrew screwB" />
       <div className="tvScrew screwC" />
       <div className="tvScrew screwD" />
-
       <div className="tvScreenFrame">
         <div className="tvGlass">
-          {poster ? (
-            <img className="tvPosterFallback" src={poster} alt="" />
-          ) : null}
-          <video
-            className="tvVideoLayer"
-            data-slot="0"
-            preload="auto"
-            playsInline
-            aria-hidden="true"
-          />
-          <video
-            className="tvVideoLayer"
-            data-slot="1"
-            preload="auto"
-            playsInline
-            aria-hidden="true"
-          />
-
           {!clip ? (
             <div className="tvIdle" title={tooltipStatus()}>
               <div className={`idleOrb ${state}`}>
@@ -526,47 +1358,19 @@ function TactileTV({ clip }: { clip: Clip | null }) {
               </div>
             </div>
           ) : null}
-
           <div className="glassGlow" />
-
-          {clip && captionsEnabled ? (
-            <div
-              className="currentPrompt"
-              title={`Episode ${clip.episode + 1} · ${clipAuthor(clip)}`}
-            >
-              <span className="promptText">{clip.directive}</span>
-              <span className="promptAuthor">{clipAuthor(clip)}</span>
-            </div>
-          ) : null}
-
+          <LiveProgramOverlay />
+          <CurrentPrompt clip={clip} />
           {isReplay ? (
             <button
               className="liveReturn"
               type="button"
-              onClick={returnLive}
+              data-action="live"
               title="Return to live"
               aria-label="Return to live"
             >
               ●
             </button>
-          ) : null}
-
-          {nextCueEnabled && prompt ? (
-            <div
-              className={`nextChip ${prompt.generating ? "working" : ""}`}
-              title="Next prompt from Pump.fun chat"
-            >
-              <span className="nextArrow">↗</span>
-              <span className="nextText">{prompt.text}</span>
-              <span className="nextAuthor">{prompt.author}</span>
-            </div>
-          ) : nextCueEnabled ? (
-            <div
-              className="nextEmpty"
-              title="Waiting for the next Pump.fun prompt"
-            >
-              •••
-            </div>
           ) : null}
         </div>
       </div>
@@ -577,45 +1381,171 @@ function TactileTV({ clip }: { clip: Clip | null }) {
           title={tooltipStatus()}
           aria-label={tooltipStatus()}
         />
-        <button
-          className={`knob ${soundEnabled ? "on" : ""}`}
-          type="button"
-          onClick={toggleSound}
-          title={soundEnabled ? "Mute" : "Unmute"}
-          aria-label={soundEnabled ? "Mute" : "Unmute"}
-          aria-pressed={soundEnabled}
-        >
-          <span />
-        </button>
-
-        <div className="hardwareControls">
-          <ControlButton
+        <div className="knobStack">
+          <KnobControl
+            active={soundEnabled}
+            title={soundEnabled ? "Mute" : "Unmute"}
+            icon="sound"
+            action="sound"
+          />
+          <KnobControl
             active={captionsEnabled}
             title={
-              captionsEnabled ? "Hide prompt caption" : "Show prompt caption"
+              captionsEnabled ? "Hide prompt captions" : "Show prompt captions"
             }
-            glyph="▤"
-            onClick={toggleCaptions}
+            icon="captions"
+            action="captions"
           />
-          <ControlButton
-            active={nextCueEnabled}
-            title={nextCueEnabled ? "Hide next prompt" : "Show next prompt"}
-            glyph="↗"
-            onClick={toggleNextCue}
+          <KnobControl
+            active={liveOverlayEnabled}
+            title={
+              liveOverlayEnabled
+                ? "Hide intermission status"
+                : "Show intermission status"
+            }
+            icon="overlay"
+            action="overlay"
           />
-          <ControlButton
+          <KnobControl
+            active={infoOpen}
+            title="Info and world state"
+            icon="info"
+            action="info"
+          />
+          <KnobControl
             title="Fullscreen"
-            glyph="⛶"
-            onClick={toggleFullscreen}
+            icon="fullscreen"
+            action="fullscreen"
           />
         </div>
-
         <div className="speaker" aria-hidden="true">
           {Array.from({ length: 18 }, (_, i) => (
             <i key={i} />
           ))}
         </div>
       </div>
+    </div>
+  );
+}
+
+function InfoModal() {
+  const voteSeconds = Math.max(
+    1,
+    Math.round((room?.voteWindowMs || 15_000) / 1000),
+  );
+  const infoRound = program?.votingRound || program?.decisionRound || null;
+  const infoCandidates = sortedCandidates(infoRound);
+  return (
+    <div
+      className="infoShade"
+      role="dialog"
+      aria-modal="true"
+      aria-label="PumpTV information"
+    >
+      <div className="infoModal">
+        <button
+          className="infoClose"
+          type="button"
+          data-action="close-info"
+          aria-label="Close"
+        >
+          ×
+        </button>
+        <section className="howPanel">
+          <div className="infoGlyph">$</div>
+          <code>!next your idea</code>
+          <code>!vote @handle</code>
+          <p>
+            Posting the same or a near-duplicate idea counts as another vote for
+            the same suggestion. Voting begins with the first suggestion and
+            auto-locks after {voteSeconds}s.
+          </p>
+          <p>
+            The browser is watch-only. Pump.fun chat controls what happens next.
+          </p>
+          {infoCandidates.length ? (
+            <div className="modalCandidates">
+              {infoCandidates.map((item, index) => (
+                <div key={item.id}>
+                  <em>{index + 1}</em>
+                  <span>
+                    {item.text}
+                    <small>
+                      {authorLabel(item.author, item.authorAddress)}
+                    </small>
+                  </span>
+                  <b>{item.voteCount}</b>
+                </div>
+              ))}
+            </div>
+          ) : null}
+        </section>
+        <section className="worldPanel">
+          <div className="infoGlyph">◎</div>
+          <h2>{worldState?.location || "—"}</h2>
+          <p>{worldState?.locationDetails || ""}</p>
+          {worldState?.characters.length ? (
+            <div className="worldGroup">
+              {worldState.characters.map((item) => (
+                <article key={item.id}>
+                  <b>{item.name}</b>
+                  <span>{item.status}</span>
+                  <small>{item.position}</small>
+                </article>
+              ))}
+            </div>
+          ) : null}
+          {worldState?.props.length ? (
+            <div className="worldGroup">
+              {worldState.props.map((item) => (
+                <article key={item.id}>
+                  <b>{item.name}</b>
+                  <span>{item.status}</span>
+                  <small>{item.position}</small>
+                </article>
+              ))}
+            </div>
+          ) : null}
+          {worldState?.openThreads.length ? (
+            <div className="threadGroup">
+              {worldState.openThreads.map((item) => (
+                <span key={item}>{item}</span>
+              ))}
+            </div>
+          ) : null}
+        </section>
+      </div>
+    </div>
+  );
+}
+
+function ProgramShelfSlot() {
+  if (!program) return null;
+  const round = program.votingRound || program.decisionRound;
+  const candidateCount = round?.proposals.length || 0;
+  const phase = program.phase;
+  const title =
+    program.reason ||
+    (phase === "voting"
+      ? `Voting for episode ${program.targetEpisode + 1}`
+      : phase === "planning" || phase === "rendering" || phase === "finalizing"
+        ? `Generating episode ${program.targetEpisode + 1}`
+        : phase === "locked"
+          ? `Episode ${program.targetEpisode + 1} locked`
+          : phase === "ready"
+            ? `Episode ${program.targetEpisode + 1} ready`
+            : `Waiting for episode ${program.targetEpisode + 1}`);
+  return (
+    <div
+      className={`programShelfSlot phase-${phase}`}
+      title={title}
+      aria-label={title}
+    >
+      <span className="programShelfVisual">
+        <i className="programShelfPulse" />
+        {candidateCount > 0 ? <small>{candidateCount}</small> : null}
+      </span>
+      <b>{program.targetEpisode + 1}</b>
     </div>
   );
 }
@@ -630,20 +1560,29 @@ function EpisodeShelf() {
       <div className="brandStamp" title="PumpTV">
         <span>P</span>
       </div>
-      <div className="viewerBadge" title="Watching now">
-        <span>◉</span>
+      <button
+        className={`liveCap ${replayClipId == null ? "active" : ""}`}
+        type="button"
+        data-action="live"
+        title="Live"
+        aria-label="Live"
+      >
+        <span>●</span>
         <b>{room?.viewerCount ?? 0}</b>
-      </div>
+      </button>
       <div className="episodeList">
+        <ProgramShelfSlot />
         {published.map((clip) => {
           const active = shown?.id === clip.id;
           const isLive = live?.id === clip.id && replayClipId == null;
-          const thumb = clip.startFrameUrl || clip.endFrameUrl;
+          const thumb =
+            clip.startFrameUrl || clip.endFrameUrl || clip.anchorFrameUrl;
           return (
             <button
               className={`episodeCard ${active ? "active" : ""} ${isLive ? "live" : ""}`}
               type="button"
-              onClick={() => jumpToEpisode(clip.id)}
+              data-action="episode"
+              data-episode-id={clip.id}
               title={`Episode ${clip.episode + 1} · ${clip.directive}`}
               aria-label={`Episode ${clip.episode + 1}`}
             >
@@ -673,7 +1612,6 @@ function EpisodeShelf() {
 function App() {
   const clip = visibleClip();
   const state = engineState();
-
   return (
     <main className="viewerApp">
       <section className="watchDeck">
@@ -689,11 +1627,10 @@ function App() {
             ) : null}
           </div>
         </div>
-
         <div className="tvCenter">
           <TactileTV clip={clip} />
         </div>
-
+        <InfoModal />
         {error ? (
           <div className="fatalBadge" title={error}>
             !

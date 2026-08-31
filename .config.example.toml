@@ -1,25 +1,23 @@
-# PumpTV runtime config. bgrun reads this file from the repo root.
+# PumpTV runtime config. bgrun reads this file from the repo root and flattens
+# TOML sections into environment variables.
 
 [fal]
 key = ""
 
-# Passed directly into jsx-ai native Codex mode.
-[codex]
+# jsx-ai owns runtime selection and authentication.
+# bgrun flattens these to JSX_AI_RUNTIME / JSX_AI_MODEL.
+[jsx_ai]
+runtime = "codex"
 model = "gpt-5.6"
-model_reasoning_effort = "medium"
-sandbox_mode = "read-only"
-approval_policy = "never"
 
 [pumptv]
 db_path = ".data/pumptv.sqlite"
 room = "main"
 resolution = "480P"
-admin_token = ""
 
-# One opening episode is generated automatically. After that, PumpTV waits for
-# real Pump.fun prompts; there is no autopilot generation.
 min_generation_interval_ms = 0
 lease_ttl_ms = 30000
+web_heartbeat_ttl_ms = 6000
 timeline_window = 96
 idle_poll_ms = 500
 error_backoff_ms = 2000
@@ -27,6 +25,9 @@ error_backoff_ms = 2000
 # Pump.fun is the only prompt source. Leave mint blank to disable ingress.
 pumpfun_mint = ""
 pumpfun_prefix = "!next"
+pumpfun_vote_prefix = "!vote"
+vote_window_ms = 15000
+max_proposals_per_round = 40
 pumpfun_lease_ttl_ms = 30000
 pumpfun_lease_poll_ms = 1000
 pumpfun_max_prompt_length = 500

@@ -2,6 +2,7 @@ export type Resolution = "480P" | "768P";
 export type DirectiveStatus = "queued" | "generating" | "used";
 export type DirectiveSource = "web" | "pumpfun";
 export type WorkerState = "idle" | "generating" | "error";
+export type GenerationStage = "idle" | "planning" | "rendering" | "finalizing";
 export type GenerationMode = "full" | "fast" | "emergency";
 export type BufferHealthState = "healthy" | "tight" | "critical" | "empty";
 export type PumpChatState =
@@ -73,6 +74,8 @@ export type PromptProposal = {
   authorAddress: string | null;
   sourceRoom: string | null;
   voteCount: number;
+  realVoteCount: number;
+  operatorVoteOverride: number | null;
 };
 
 export type PromptRound = {
@@ -80,6 +83,7 @@ export type PromptRound = {
   targetEpisode: number;
   status: PromptRoundStatus;
   openedAtMs: number;
+  votingStartedAtMs: number | null;
   closesAtMs: number;
   closedAtMs: number | null;
   winnerProposalId: number | null;
@@ -182,13 +186,43 @@ export type RoomState = {
   workerState: WorkerState;
   workerOnline: boolean;
   workerHeartbeatAtMs: number | null;
+  webOwnerPid: number | null;
+  webHeartbeatAtMs: number | null;
+  generationStage: GenerationStage;
+  generationStartedAtMs: number | null;
   lastError: string | null;
   bufferedUntilMs: number | null;
   buffer: BufferHealth;
   pumpfun: PumpfunChatStatus;
   generation: GenerationAvailability;
   viewerCount: number;
+  voteWindowMs: number;
   workerProcess: ManagedWorkerStatus;
+};
+
+export type LiveProgramPhase =
+  | "setup"
+  | "starting"
+  | "offline"
+  | "paused"
+  | "idle"
+  | "voting"
+  | "locked"
+  | "planning"
+  | "rendering"
+  | "finalizing"
+  | "ready";
+
+export type LiveProgramState = {
+  phase: LiveProgramPhase;
+  liveEpisode: number | null;
+  targetEpisode: number;
+  reason: string | null;
+  countdownEndsAtMs: number | null;
+  generationStartedAtMs: number | null;
+  directive: Directive | null;
+  decisionRound: PromptRound | null;
+  votingRound: PromptRound | null;
 };
 
 export type StreamState = {
@@ -199,6 +233,8 @@ export type StreamState = {
   latestClip: Clip | null;
   currentDirective: Directive | null;
   nextDirective: Directive | null;
+  program: LiveProgramState;
+  worldState: WorldState;
   timeline: Clip[];
   queuedCount: number;
 };

@@ -12,6 +12,7 @@ import {
   recentStory,
   releaseDirective,
   saveClipWithWorldState,
+  setGenerationStage,
 } from "./repository.ts";
 
 const CLIP_SECONDS = 5;
@@ -56,6 +57,7 @@ export async function generateNextClip(input: {
     ]);
     const anchorFrameUrl = await continuityFrame(input.previousClip);
 
+    await setGenerationStage("planning");
     const showrunnerStartedAt = performance.now();
     const showrunner = await planNextShot({
       directive,
@@ -96,6 +98,7 @@ export async function generateNextClip(input: {
           prompt_expansion_mode: "balanced" as const,
         };
 
+    await setGenerationStage("rendering");
     const h3StartedAt = performance.now();
     const result = await falMeasure.measure.assert(
       { label: "Generate H3 Max clip", episode, endpoint, mode },
@@ -113,6 +116,7 @@ export async function generateNextClip(input: {
 
     // Vision/canon auditing is intentionally disabled for now. We only sample
     // the first/end frames needed for thumbnails and seamless I2V continuity.
+    await setGenerationStage("finalizing");
     const frameStartedAt = performance.now();
     const frames = await sampleClipFrames({
       videoUrl: data.video.url,

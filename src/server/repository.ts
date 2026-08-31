@@ -2,8 +2,11 @@ import type {
   Clip,
   Directive,
   GenerationMode,
+  GenerationStage,
   GenerationTimingSample,
   PumpChatState,
+  PromptProposal,
+  PromptRound,
   Resolution,
   RoomState,
   StreamState,
@@ -17,9 +20,18 @@ import { ROOM_NAME } from "./lease.ts";
 import { dbMeasure } from "./observability.ts";
 import { EMPTY_WORLD_STATE, parseWorldStateJson } from "./world-state.ts";
 import { getViewerCount } from "./presence.ts";
+import { deriveLiveProgramState } from "./program-state.ts";
 
 const PUMPFUN_MINT = (process.env.PUMPTV_PUMPFUN_MINT || "").trim();
 const PUMPFUN_PREFIX = process.env.PUMPTV_PUMPFUN_PREFIX ?? "!next";
+const VOTE_WINDOW_MS = Math.max(
+  1_000,
+  Number(process.env.PUMPTV_VOTE_WINDOW_MS || 15_000),
+);
+const MAX_PROPOSALS_PER_ROUND = Math.max(
+  2,
+  Number(process.env.PUMPTV_MAX_PROPOSALS_PER_ROUND || 40),
+);
 
 function toClip(row: any): Clip {
   return {
@@ -83,7 +95,7 @@ function directiveWithVotesById(id: number) {
       db.raw<any>(
         `SELECT d.*,
               CASE WHEN d.proposalId IS NULL THEN NULL
-                   ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
+                   ELSE (SELECT COALESCE(p.operatorVoteOverride, (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)) FROM proposals p WHERE p.id = d.proposalId)
               END AS voteCount
        FROM directives d
        WHERE d.id = ?
@@ -100,7 +112,7 @@ function nextPendingDirectiveWithVotes() {
       db.raw<any>(
         `SELECT d.*,
               CASE WHEN d.proposalId IS NULL THEN NULL
-                   ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
+                   ELSE (SELECT COALESCE(p.operatorVoteOverride, (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)) FROM proposals p WHERE p.id = d.proposalId)
               END AS voteCount
        FROM directives d
        WHERE d.status IN ('generating', 'queued') AND d.source = 'pumpfun'
@@ -124,6 +136,13 @@ function toRoom(
       Number(row.heartbeatAtMs || 0) > 0 &&
       Date.now() - Number(row.heartbeatAtMs || 0) < 5_000,
     workerHeartbeatAtMs: Number(row.heartbeatAtMs || 0) || null,
+    webOwnerPid: row.webOwnerPid == null ? null : Number(row.webOwnerPid),
+    webHeartbeatAtMs: Number(row.webHeartbeatAtMs || 0) || null,
+    generationStage: row.generationStage || "idle",
+    generationStartedAtMs:
+      row.generationStartedAtMs == null
+        ? null
+        : Number(row.generationStartedAtMs),
     lastError: row.lastError ?? null,
     bufferedUntilMs,
     buffer:
@@ -152,6 +171,7 @@ function toRoom(
       failureCount: Number(row.generationFailureCount || 0),
     },
     viewerCount: getViewerCount(),
+    voteWindowMs: VOTE_WINDOW_MS,
     workerProcess: {
       name: "pumptv-worker",
       state: "unknown",
@@ -225,6 +245,37 @@ export async function touchWorkerHeartbeat() {
   );
 }
 
+export async function touchWebHeartbeat(pid = process.pid) {
+  const room = await getRoomRow();
+  return dbMeasure.measureSync("Touch web heartbeat", () =>
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({ webOwnerPid: pid, webHeartbeatAtMs: Date.now() }),
+  );
+}
+
+export async function clearWebHeartbeat(pid = process.pid) {
+  const room = await getRoomRow();
+  if (Number(room.webOwnerPid || 0) !== pid) return;
+  return dbMeasure.measureSync("Clear web heartbeat", () =>
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({ webOwnerPid: null, webHeartbeatAtMs: 0 }),
+  );
+}
+
+export async function setGenerationStage(stage: GenerationStage) {
+  const room = await getRoomRow();
+  return dbMeasure.measureSync("Set generation stage", () =>
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({ generationStage: stage }),
+  );
+}
+
 export async function setWorkerState(
   state: WorkerState,
   error: string | null = null,
@@ -240,6 +291,9 @@ export async function setWorkerState(
         lastError: error
           ? error.replace(/\s+/g, " ").trim().slice(0, 600)
           : null,
+        ...(state === "generating"
+          ? { generationStartedAtMs: Date.now() }
+          : { generationStartedAtMs: null, generationStage: "idle" }),
         ...(generationMode ? { generationMode } : {}),
       }),
   );
@@ -266,6 +320,8 @@ export async function setGenerationPause(input: {
         generationFailureCount:
           input.failureCount ?? Number(room.generationFailureCount || 0),
         workerState: "idle",
+        generationStage: "idle",
+        generationStartedAtMs: null,
         lastError: null,
       }),
   );
@@ -305,37 +361,549 @@ export async function setPumpChatState(
   );
 }
 
-export async function enqueuePumpfunDirective(input: {
+function normalizeProposalText(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 500);
+}
+
+function proposalTokens(value: string) {
+  return new Set(
+    normalizeProposalText(value)
+      .split(" ")
+      .filter((token) => token.length > 1),
+  );
+}
+
+function textSimilarity(a: string, b: string) {
+  const left = normalizeProposalText(a);
+  const right = normalizeProposalText(b);
+  if (!left || !right) return 0;
+  if (left === right) return 1;
+  if (left.includes(right) || right.includes(left)) {
+    const ratio =
+      Math.min(left.length, right.length) / Math.max(left.length, right.length);
+    if (ratio >= 0.68) return 0.95;
+  }
+
+  const aTokens = proposalTokens(left);
+  const bTokens = proposalTokens(right);
+  let intersection = 0;
+  for (const token of aTokens) if (bTokens.has(token)) intersection += 1;
+  const union = aTokens.size + bTokens.size - intersection;
+  const jaccard = union ? intersection / union : 0;
+
+  const trigrams = (value: string) => {
+    const compact = `  ${value} `;
+    const out = new Set<string>();
+    for (let i = 0; i <= compact.length - 3; i += 1)
+      out.add(compact.slice(i, i + 3));
+    return out;
+  };
+  const a3 = trigrams(left);
+  const b3 = trigrams(right);
+  let shared = 0;
+  for (const tri of a3) if (b3.has(tri)) shared += 1;
+  const dice = a3.size + b3.size ? (2 * shared) / (a3.size + b3.size) : 0;
+  return Math.max(jaccard, dice);
+}
+
+function similarProposal(roundId: number, text: string) {
+  const rows = db.raw<any>(
+    `SELECT * FROM proposals WHERE roundId = ? AND status = 'open' ORDER BY id ASC`,
+    roundId,
+  );
+  let best: any = null;
+  let bestScore = 0;
+  for (const row of rows) {
+    const score = textSimilarity(text, row.text);
+    if (score > bestScore) {
+      best = row;
+      bestScore = score;
+    }
+  }
+  return bestScore >= 0.66 ? best : null;
+}
+
+function normalizedHandle(value: string) {
+  return value.trim().replace(/^@+/, "").toLowerCase();
+}
+
+function proposalFromRow(row: any): PromptProposal {
+  const realVoteCount = Number(row.realVoteCount ?? row.voteCount ?? 0);
+  const override =
+    row.operatorVoteOverride == null ? null : Number(row.operatorVoteOverride);
+  return {
+    id: Number(row.id),
+    roundId: Number(row.roundId),
+    text: row.text,
+    status: row.status,
+    source: row.source || "pumpfun",
+    sourceId: row.sourceId ?? null,
+    author: row.author ?? null,
+    authorAddress: row.authorAddress ?? null,
+    sourceRoom: row.sourceRoom ?? null,
+    realVoteCount,
+    operatorVoteOverride: override,
+    voteCount: override ?? realVoteCount,
+  };
+}
+
+function loadRoundById(id: number): PromptRound | null {
+  const row =
+    db.raw<any>(`SELECT * FROM promptRounds WHERE id = ? LIMIT 1`, id)[0] ||
+    null;
+  if (!row) return null;
+  const proposals = db
+    .raw<any>(
+      `SELECT p.*, (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = p.id) AS realVoteCount
+     FROM proposals p WHERE p.roundId = ?
+     ORDER BY COALESCE(p.operatorVoteOverride, (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = p.id)) DESC, p.id ASC`,
+      id,
+    )
+    .map(proposalFromRow);
+  return {
+    id: Number(row.id),
+    targetEpisode: Number(row.targetEpisode),
+    status: row.status,
+    openedAtMs: Number(row.openedAtMs),
+    votingStartedAtMs:
+      row.votingStartedAtMs == null ? null : Number(row.votingStartedAtMs),
+    closesAtMs: Number(row.closesAtMs || 0),
+    closedAtMs: row.closedAtMs == null ? null : Number(row.closedAtMs),
+    winnerProposalId:
+      row.winnerProposalId == null ? null : Number(row.winnerProposalId),
+    proposals,
+  };
+}
+
+export async function getOpenPromptRound(): Promise<PromptRound | null> {
+  return dbMeasure.measureSync("Load open Pump.fun round", () => {
+    const row =
+      db.raw<any>(
+        `SELECT id FROM promptRounds WHERE status = 'open' ORDER BY id DESC LIMIT 1`,
+      )[0] || null;
+    return row ? loadRoundById(Number(row.id)) : null;
+  });
+}
+
+export async function getLatestPromptRound(): Promise<PromptRound | null> {
+  return dbMeasure.measureSync("Load latest Pump.fun round", () => {
+    const row =
+      db.raw<any>(`SELECT id FROM promptRounds ORDER BY id DESC LIMIT 1`)[0] ||
+      null;
+    return row ? loadRoundById(Number(row.id)) : null;
+  });
+}
+
+export async function getPromptRoundForProposal(
+  proposalId: number,
+): Promise<PromptRound | null> {
+  return dbMeasure.measureSync("Load proposal round", () => {
+    const row =
+      db.raw<any>(
+        `SELECT roundId FROM proposals WHERE id = ? LIMIT 1`,
+        proposalId,
+      )[0] || null;
+    return row ? loadRoundById(Number(row.roundId)) : null;
+  });
+}
+
+export async function ensureOpenPromptRound(
+  targetEpisode?: number,
+): Promise<PromptRound> {
+  const existing = await getOpenPromptRound();
+  if (existing) return existing;
+  const next = targetEpisode ?? (await nextEpisode());
+  return dbMeasure.measureSync.assert("Open Pump.fun prompt round", () => {
+    const row = db.promptRounds.insert({
+      targetEpisode: next,
+      status: "open",
+      openedAtMs: Date.now(),
+      votingStartedAtMs: null,
+      closesAtMs: 0,
+      closedAtMs: null,
+      winnerProposalId: null,
+    });
+    if (!row) throw new Error("Could not open prompt round");
+    const loaded = loadRoundById(Number((row as any).id));
+    if (!loaded) throw new Error("Could not reload prompt round");
+    return loaded;
+  });
+}
+
+async function roundForNewSuggestion() {
+  const open = await getOpenPromptRound();
+  if (open) return open;
+  const latest = await getLatestPromptRound();
+  const base = await nextEpisode();
+  const target =
+    latest?.status === "closed"
+      ? Math.max(base, latest.targetEpisode + 1)
+      : base;
+  return ensureOpenPromptRound(target);
+}
+
+export async function submitPumpfunProposal(input: {
   text: string;
   sourceId: string;
   author: string | null;
   authorAddress: string | null;
   sourceRoom: string | null;
+  voterKey: string;
+  voterHandle?: string | null;
 }) {
-  return dbMeasure.measureSync("Queue Pump.fun directive", () => {
+  const round = await roundForNewSuggestion();
+  return dbMeasure.measureSync.assert("Submit Pump.fun proposal", () => {
+    db.exec("BEGIN IMMEDIATE");
     try {
-      const row = db.directives.insert({
-        text: input.text,
-        status: "queued",
-        usedEpisode: null,
+      let proposal =
+        db.raw<any>(
+          `SELECT * FROM proposals WHERE roundId = ? AND normalizedText = ? AND status = 'open' LIMIT 1`,
+          round.id,
+          normalizeProposalText(input.text),
+        )[0] || null;
+      if (!proposal) proposal = similarProposal(round.id, input.text);
+      if (!proposal) {
+        const count = Number(
+          (
+            db.raw<any>(
+              `SELECT COUNT(*) AS count FROM proposals WHERE roundId = ?`,
+              round.id,
+            )[0] || {}
+          ).count || 0,
+        );
+        if (count >= MAX_PROPOSALS_PER_ROUND) {
+          db.exec("COMMIT");
+          return null;
+        }
+        proposal = db.proposals.insert({
+          roundId: round.id,
+          text: input.text,
+          normalizedText: normalizeProposalText(input.text),
+          status: "open",
+          source: "pumpfun",
+          sourceId: input.sourceId,
+          author: input.author,
+          authorAddress: input.authorAddress,
+          sourceRoom: input.sourceRoom,
+          operatorVoteOverride: null,
+        });
+      }
+      if (!proposal) throw new Error("Could not create proposal");
+      db.exec(
+        `DELETE FROM proposalVotes WHERE roundId = ? AND voterKey = ?`,
+        round.id,
+        input.voterKey,
+      );
+      db.proposalVotes.insert({
+        roundId: round.id,
+        proposalId: Number((proposal as any).id),
+        voterKey: input.voterKey,
+        voterHandle: input.voterHandle ?? null,
         source: "pumpfun",
         sourceId: input.sourceId,
-        author: input.author,
-        authorAddress: input.authorAddress,
-        sourceRoom: input.sourceRoom,
-        proposalId: null,
       });
-      return row ? toDirective(row) : null;
+      const row = db.raw<any>(
+        `SELECT * FROM promptRounds WHERE id = ? LIMIT 1`,
+        round.id,
+      )[0];
+      if (row && !row.votingStartedAtMs) {
+        const now = Date.now();
+        db.exec(
+          `UPDATE promptRounds SET votingStartedAtMs = ?, closesAtMs = ? WHERE id = ?`,
+          now,
+          now + VOTE_WINDOW_MS,
+          round.id,
+        );
+      }
+      db.exec("COMMIT");
+      const loaded = loadRoundById(round.id);
+      if (!loaded) throw new Error("Could not reload proposal round");
+      return (
+        loaded.proposals.find((p) => p.id === Number((proposal as any).id)) ||
+        null
+      );
     } catch (error) {
-      const existing =
-        db.raw<any>(
-          `SELECT * FROM directives WHERE source = 'pumpfun' AND sourceId = ? LIMIT 1`,
-          input.sourceId,
-        )[0] || null;
-      if (existing) return toDirective(existing);
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
       throw error;
     }
   });
+}
+
+export async function castPumpfunVote(input: {
+  proposalId: number;
+  voterKey: string;
+  voterHandle?: string | null;
+  sourceId: string;
+}) {
+  const round = await getOpenPromptRound();
+  if (!round) return null;
+  if (!round.proposals.some((p) => p.id === input.proposalId)) return null;
+  return dbMeasure.measureSync.assert("Cast Pump.fun vote", () => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.exec(
+        `DELETE FROM proposalVotes WHERE roundId = ? AND voterKey = ?`,
+        round.id,
+        input.voterKey,
+      );
+      db.proposalVotes.insert({
+        roundId: round.id,
+        proposalId: input.proposalId,
+        voterKey: input.voterKey,
+        voterHandle: input.voterHandle ?? null,
+        source: "pumpfun",
+        sourceId: input.sourceId,
+      });
+      db.exec("COMMIT");
+      return loadRoundById(round.id);
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  });
+}
+
+export async function castPumpfunVoteByHandle(input: {
+  handle: string;
+  voterKey: string;
+  voterHandle?: string | null;
+  sourceId: string;
+}) {
+  const round = await getOpenPromptRound();
+  if (!round) return null;
+  const handle = normalizedHandle(input.handle);
+  if (!handle) return null;
+
+  // Resolve the handle to the suggestion they authored. If their suggestion was
+  // merged into an earlier near-duplicate, resolve the proposal they voted for
+  // when they submitted it. Chat never needs to know an internal proposal id.
+  const proposal = dbMeasure.measureSync("Resolve Pump.fun vote handle", () => {
+    const authored =
+      db.raw<any>(
+        `SELECT * FROM proposals
+       WHERE roundId = ? AND status = 'open' AND lower(ltrim(COALESCE(author, ''), '@')) = ?
+       ORDER BY id DESC LIMIT 1`,
+        round.id,
+        handle,
+      )[0] || null;
+    if (authored) return authored;
+    return (
+      db.raw<any>(
+        `SELECT p.* FROM proposalVotes v
+       JOIN proposals p ON p.id = v.proposalId
+       WHERE v.roundId = ? AND p.status = 'open' AND lower(ltrim(COALESCE(v.voterHandle, ''), '@')) = ?
+       ORDER BY v.id DESC LIMIT 1`,
+        round.id,
+        handle,
+      )[0] || null
+    );
+  });
+  if (!proposal) return null;
+  return castPumpfunVote({
+    proposalId: Number(proposal.id),
+    voterKey: input.voterKey,
+    voterHandle: input.voterHandle ?? null,
+    sourceId: input.sourceId,
+  });
+}
+
+export async function setProposalVoteOverride(
+  proposalId: number,
+  value: number | null,
+) {
+  return dbMeasure.measureSync.assert("Override proposal votes", () => {
+    const proposal =
+      db.raw<any>(
+        `SELECT * FROM proposals WHERE id = ? LIMIT 1`,
+        proposalId,
+      )[0] || null;
+    if (!proposal) throw new Error(`Proposal #${proposalId} not found`);
+    db.exec(
+      `UPDATE proposals SET operatorVoteOverride = ? WHERE id = ?`,
+      value == null ? null : Math.max(0, Math.floor(value)),
+      proposalId,
+    );
+    return loadRoundById(Number(proposal.roundId));
+  });
+}
+
+export async function closePromptRound(
+  winnerProposalId?: number,
+): Promise<Directive | null> {
+  const round = await getOpenPromptRound();
+  if (!round || round.proposals.length === 0) return null;
+  const winner =
+    winnerProposalId == null
+      ? round.proposals[0]
+      : round.proposals.find((p) => p.id === winnerProposalId);
+  if (!winner)
+    throw new Error(`Proposal #${winnerProposalId} is not in the open round`);
+  return dbMeasure.measureSync.assert("Close Pump.fun round", () => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const now = Date.now();
+      db.exec(
+        `UPDATE promptRounds SET status = 'closed', closedAtMs = ?, winnerProposalId = ? WHERE id = ? AND status = 'open'`,
+        now,
+        winner.id,
+        round.id,
+      );
+      db.exec(
+        `UPDATE proposals SET status = CASE WHEN id = ? THEN 'selected' ELSE 'lost' END WHERE roundId = ?`,
+        winner.id,
+        round.id,
+      );
+      let directive =
+        db.raw<any>(
+          `SELECT * FROM directives WHERE proposalId = ? LIMIT 1`,
+          winner.id,
+        )[0] || null;
+      if (!directive) {
+        directive = db.directives.insert({
+          text: winner.text,
+          status: "queued",
+          usedEpisode: null,
+          source: "pumpfun",
+          sourceId: `round:${round.id}:proposal:${winner.id}`,
+          author: winner.author,
+          authorAddress: winner.authorAddress,
+          sourceRoom: winner.sourceRoom,
+          proposalId: winner.id,
+        });
+      }
+      if (!directive) throw new Error("Could not create winning directive");
+      db.exec("COMMIT");
+      const hydrated = directiveWithVotesById(Number((directive as any).id));
+      return hydrated ? toDirective(hydrated) : toDirective(directive);
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  });
+}
+
+export async function forceProposalAsNext(
+  proposalId: number,
+): Promise<Directive> {
+  const proposal = dbMeasure.measureSync(
+    "Load forced proposal",
+    () =>
+      db.raw<any>(
+        `SELECT * FROM proposals WHERE id = ? LIMIT 1`,
+        proposalId,
+      )[0] || null,
+  );
+  if (!proposal) throw new Error(`Proposal #${proposalId} not found`);
+  const round = loadRoundById(Number(proposal.roundId));
+  if (!round) throw new Error(`Round for proposal #${proposalId} not found`);
+  if (round.status === "open") {
+    const directive = await closePromptRound(proposalId);
+    if (!directive) throw new Error("Could not close prompt round");
+    return directive;
+  }
+
+  return dbMeasure.measureSync.assert("Override locked Pump.fun winner", () => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing =
+        db.raw<any>(
+          `SELECT d.* FROM directives d JOIN proposals p ON p.id = d.proposalId WHERE p.roundId = ? ORDER BY d.id ASC LIMIT 1`,
+          round.id,
+        )[0] || null;
+      if (existing && existing.status !== "queued")
+        throw new Error(
+          "The next episode is already generating or published; reset first to change it.",
+        );
+      db.exec(
+        `UPDATE promptRounds SET winnerProposalId = ? WHERE id = ?`,
+        proposalId,
+        round.id,
+      );
+      db.exec(
+        `UPDATE proposals SET status = CASE WHEN id = ? THEN 'selected' ELSE 'lost' END WHERE roundId = ?`,
+        proposalId,
+        round.id,
+      );
+      let directive = existing;
+      if (directive) {
+        db.exec(
+          `UPDATE directives SET text = ?, sourceId = ?, author = ?, authorAddress = ?, sourceRoom = ?, proposalId = ? WHERE id = ?`,
+          proposal.text,
+          `round:${round.id}:proposal:${proposalId}`,
+          proposal.author ?? null,
+          proposal.authorAddress ?? null,
+          proposal.sourceRoom ?? null,
+          proposalId,
+          directive.id,
+        );
+        directive = db.raw<any>(
+          `SELECT * FROM directives WHERE id = ? LIMIT 1`,
+          directive.id,
+        )[0];
+      } else {
+        directive = db.directives.insert({
+          text: proposal.text,
+          status: "queued",
+          usedEpisode: null,
+          source: "pumpfun",
+          sourceId: `round:${round.id}:proposal:${proposalId}`,
+          author: proposal.author ?? null,
+          authorAddress: proposal.authorAddress ?? null,
+          sourceRoom: proposal.sourceRoom ?? null,
+          proposalId,
+        });
+      }
+      if (!directive) throw new Error("Could not persist forced winner");
+      db.exec("COMMIT");
+      const hydrated = directiveWithVotesById(Number(directive.id));
+      return hydrated ? toDirective(hydrated) : toDirective(directive);
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  });
+}
+
+export async function closePromptRoundIfDue(now = Date.now()) {
+  const round = await getOpenPromptRound();
+  if (
+    !round ||
+    !round.proposals.length ||
+    !round.votingStartedAtMs ||
+    round.closesAtMs > now
+  )
+    return null;
+  return closePromptRound();
+}
+
+export async function operatorInjectAndForce(text: string) {
+  const round = await roundForNewSuggestion();
+  const sourceId = `operator:${Date.now()}:${crypto.randomUUID()}`;
+  const proposal = await submitPumpfunProposal({
+    text,
+    sourceId,
+    author: "operator",
+    authorAddress: null,
+    sourceRoom: "cli",
+    voterKey: sourceId,
+    voterHandle: "operator",
+  });
+  if (!proposal) throw new Error("Could not inject operator proposal");
+  return closePromptRound(proposal.id);
 }
 
 export async function claimQueuedDirective(episode: number) {
@@ -654,7 +1222,7 @@ export async function getTimeline(
               d.authorAddress AS directiveAuthorAddress,
               d.proposalId AS directiveProposalId,
               CASE WHEN d.proposalId IS NULL THEN NULL
-                   ELSE (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)
+                   ELSE (SELECT COALESCE(p.operatorVoteOverride, (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)) FROM proposals p WHERE p.id = d.proposalId)
               END AS directiveVoteCount
        FROM clips c
        LEFT JOIN directives d ON d.id = c.directiveId
@@ -671,17 +1239,19 @@ export async function getTimeline(
 
 export async function getStreamState(): Promise<StreamState> {
   const serverNowMs = Date.now();
-  const [roomRow, timeline, queuedCount, timings] = await Promise.all([
-    getRoomRow(),
-    getTimeline(),
-    dbMeasure.measureSync("Count queued Pump.fun prompts", () =>
-      db.directives
-        .select()
-        .where({ status: "queued", source: "pumpfun" })
-        .count(),
-    ),
-    getRecentGenerationTimings(),
-  ]);
+  const [roomRow, timeline, queuedCount, timings, promptRound] =
+    await Promise.all([
+      getRoomRow(),
+      getTimeline(),
+      dbMeasure.measureSync("Count queued Pump.fun prompts", () =>
+        db.directives
+          .select()
+          .where({ status: "queued", source: "pumpfun" })
+          .count(),
+      ),
+      getRecentGenerationTimings(),
+      getOpenPromptRound(),
+    ]);
 
   const latestClip = timeline.length ? timeline[timeline.length - 1] : null;
   const currentClip =
@@ -690,6 +1260,9 @@ export async function getStreamState(): Promise<StreamState> {
         clip.startsAtMs <= serverNowMs &&
         serverNowMs < clip.startsAtMs + clip.durationSeconds * 1000,
     ) || null;
+  const publishedLatest =
+    [...timeline].reverse().find((clip) => clip.startsAtMs <= serverNowMs) ||
+    null;
   const nextClip =
     timeline.find((clip) => clip.startsAtMs > serverNowMs) || null;
   const bufferedUntilMs = latestClip
@@ -713,17 +1286,37 @@ export async function getStreamState(): Promise<StreamState> {
       ? directiveWithVotesById(nextClip.directiveId)
       : null
     : nextPendingDirectiveWithVotes();
+  const nextDirective = nextDirectiveRow ? toDirective(nextDirectiveRow) : null;
+  const decisionRound = nextDirective?.proposalId
+    ? await getPromptRoundForProposal(nextDirective.proposalId)
+    : null;
+  const worldState = publishedLatest
+    ? (await getWorldStateForEpisode(publishedLatest.episode)) ||
+      EMPTY_WORLD_STATE
+    : EMPTY_WORLD_STATE;
+  const room = toRoom(roomRow, bufferedUntilMs, buffer);
+  const program = deriveLiveProgramState({
+    room,
+    serverNowMs,
+    publishedLatest,
+    nextClip,
+    nextDirective,
+    promptRound,
+    decisionRound,
+  });
 
   return {
     serverNowMs,
-    room: toRoom(roomRow, bufferedUntilMs, buffer),
+    room,
     currentClip,
     nextClip,
     latestClip,
     currentDirective: currentDirectiveRow
       ? toDirective(currentDirectiveRow)
       : null,
-    nextDirective: nextDirectiveRow ? toDirective(nextDirectiveRow) : null,
+    nextDirective,
+    program,
+    worldState,
     timeline,
     queuedCount: Number(queuedCount || 0),
   };

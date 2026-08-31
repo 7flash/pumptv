@@ -6,8 +6,11 @@ import { workerMeasure } from "./observability.ts";
 import { dbPath } from "./db.ts";
 import {
   clearGenerationPause,
+  closePromptRoundIfDue,
+  ensureOpenPromptRound,
   getLatestClip,
   getRoomRow,
+  getOpenPromptRound,
   hasQueuedDirective,
   nextEpisode,
   recoverGeneratingDirectives,
@@ -22,6 +25,10 @@ const IDLE_POLL_MS = Math.max(
   Number(process.env.PUMPTV_IDLE_POLL_MS || 500),
 );
 const ERROR_BACKOFF_MS = Number(process.env.PUMPTV_ERROR_BACKOFF_MS || 2_000);
+const WEB_HEARTBEAT_TTL_MS = Math.max(
+  3_000,
+  Number(process.env.PUMPTV_WEB_HEARTBEAT_TTL_MS || 6_000),
+);
 const MIN_GENERATION_INTERVAL_MS = Math.max(
   0,
   Number(process.env.PUMPTV_MIN_GENERATION_INTERVAL_MS || 0),
@@ -34,6 +41,13 @@ let stopping = false;
 async function generationTick() {
   await touchWorkerHeartbeat();
   const room = await getRoomRow();
+
+  const webHeartbeat = Number(room.webHeartbeatAtMs || 0);
+  if (!webHeartbeat || Date.now() - webHeartbeat > WEB_HEARTBEAT_TTL_MS) {
+    console.log(`[worker] web owner heartbeat lost; stopping worker`);
+    stopping = true;
+    return { generated: false, sleepMs: 0 };
+  }
 
   const falKey = (process.env.FAL_KEY || "").trim();
   if (!falKey) {
@@ -75,11 +89,31 @@ async function generationTick() {
   const latest = await getLatestClip();
   const opening = !latest;
 
-  // PumpTV creates one opening episode automatically. After that, every episode
-  // must correspond to a real accepted Pump.fun chat prompt. No autopilot filler.
-  if (!opening && !(await hasQueuedDirective())) {
-    await setWorkerState("idle", null, "full");
-    return { generated: false, sleepMs: IDLE_POLL_MS };
+  if (opening) {
+    // Viewers can start suggesting EP 2 while the opening is still rendering.
+    await ensureOpenPromptRound(1);
+  } else {
+    await closePromptRoundIfDue();
+    if (!(await hasQueuedDirective())) {
+      await ensureOpenPromptRound(await nextEpisode());
+      await setWorkerState("idle", null, "full");
+      const round = await getOpenPromptRound();
+      const untilClose = round?.closesAtMs
+        ? Math.max(80, round.closesAtMs - Date.now())
+        : IDLE_POLL_MS;
+      return { generated: false, sleepMs: Math.min(IDLE_POLL_MS, untilClose) };
+    }
+    // Never render more than one episode ahead of the published/live edge.
+    if (latest.startsAtMs > Date.now()) {
+      await setWorkerState("idle", null, "full");
+      return {
+        generated: false,
+        sleepMs: Math.min(
+          IDLE_POLL_MS,
+          Math.max(80, latest.startsAtMs - Date.now()),
+        ),
+      };
+    }
   }
 
   if (!acquireRoomLease(owner, LEASE_TTL_MS)) {
@@ -100,9 +134,14 @@ async function generationTick() {
     const lockedLatest = await getLatestClip();
     const lockedOpening = !lockedLatest;
     if (!lockedRoom.running) return { generated: false, sleepMs: IDLE_POLL_MS };
-    if (!lockedOpening && !(await hasQueuedDirective())) {
-      await setWorkerState("idle", null, "full");
-      return { generated: false, sleepMs: IDLE_POLL_MS };
+    if (!lockedOpening) {
+      await closePromptRoundIfDue();
+      if (!(await hasQueuedDirective())) {
+        await setWorkerState("idle", null, "full");
+        return { generated: false, sleepMs: IDLE_POLL_MS };
+      }
+      if (lockedLatest.startsAtMs > Date.now())
+        return { generated: false, sleepMs: IDLE_POLL_MS };
     }
 
     const episode = await nextEpisode();
@@ -138,6 +177,7 @@ async function generationTick() {
       `[worker] published EP ${clip.episode + 1} · ${clip.totalGenerationMs ?? 0}ms`,
     );
     const finishedAtMs = Date.now();
+    await ensureOpenPromptRound(clip.episode + 1);
 
     if (MIN_GENERATION_INTERVAL_MS > 0) {
       await setGenerationPause({
@@ -162,6 +202,9 @@ export async function runRoomWorker() {
   console.log(`[worker] PumpTV room worker ${owner}`);
   console.log(
     `[worker] cwd=${process.cwd()} · FAL_KEY=${(process.env.FAL_KEY || "").trim() ? "present" : "missing"} · room=${process.env.PUMPTV_ROOM || "main"}`,
+  );
+  console.log(
+    `[worker] jsx-ai=${process.env.JSX_AI_RUNTIME || "default"}/${process.env.JSX_AI_MODEL || "runtime-default"}`,
   );
   console.log(`[worker] db=${dbPath}`);
 

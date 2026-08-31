@@ -8,14 +8,16 @@ import {
 } from "./pumpfun-lease.ts";
 import { runPumpfunSocket, type PumpfunMessage } from "./pumpfun-socket.ts";
 import {
-  enqueuePumpfunDirective,
+  castPumpfunVoteByHandle,
   getRoomRow,
+  submitPumpfunProposal,
   setPumpChatState,
 } from "./repository.ts";
 import { pumpMeasure } from "./observability.ts";
 
 const MINT = (process.env.PUMPTV_PUMPFUN_MINT || "").trim();
 const PREFIX = process.env.PUMPTV_PUMPFUN_PREFIX ?? "!next";
+const VOTE_PREFIX = process.env.PUMPTV_PUMPFUN_VOTE_PREFIX ?? "!vote";
 const LEASE_TTL_MS = Number(process.env.PUMPTV_PUMPFUN_LEASE_TTL_MS || 30_000);
 const POLL_MS = Number(process.env.PUMPTV_PUMPFUN_LEASE_POLL_MS || 1_000);
 const MAX_TEXT = Number(process.env.PUMPTV_PUMPFUN_MAX_PROMPT_LENGTH || 500);
@@ -29,18 +31,28 @@ const lastAcceptedByUser = new Map<string, number>();
 let stopping = false;
 let activeAbort: AbortController | null = null;
 
-function promptFromMessage(message: PumpfunMessage) {
+function commandFromMessage(
+  message: PumpfunMessage,
+):
+  { kind: "proposal"; text: string } | { kind: "vote"; handle: string } | null {
   const line = sanitizeLine(
     String(message.message || ""),
-    MAX_TEXT + PREFIX.length + 32,
+    MAX_TEXT + Math.max(PREFIX.length, VOTE_PREFIX.length) + 32,
   );
   if (!line) return null;
 
-  if (!PREFIX) return sanitizeLine(line, MAX_TEXT) || null;
-  if (!line.toLowerCase().startsWith(PREFIX.toLowerCase())) return null;
+  if (VOTE_PREFIX && line.toLowerCase().startsWith(VOTE_PREFIX.toLowerCase())) {
+    const handle = sanitizeLine(
+      line.slice(VOTE_PREFIX.length).trim(),
+      80,
+    ).replace(/^@+/, "");
+    return handle ? { kind: "vote", handle } : null;
+  }
 
+  if (!PREFIX) return { kind: "proposal", text: sanitizeLine(line, MAX_TEXT) };
+  if (!line.toLowerCase().startsWith(PREFIX.toLowerCase())) return null;
   const text = sanitizeLine(line.slice(PREFIX.length).trim(), MAX_TEXT);
-  return text || null;
+  return text ? { kind: "proposal", text } : null;
 }
 
 function durableSourceId(message: PumpfunMessage) {
@@ -75,31 +87,55 @@ function cooldownAllows(message: PumpfunMessage) {
 }
 
 async function ingestMessage(message: PumpfunMessage) {
-  const text = promptFromMessage(message);
-  if (!text || !cooldownAllows(message)) return;
+  const command = commandFromMessage(message);
+  if (!command || !cooldownAllows(message)) return;
 
   const sourceId = durableSourceId(message);
-  const directive = await pumpMeasure.measure(
+  const voterKey = userIdentity(message);
+  const author = sanitizeLine(String(message.username || ""), 80) || null;
+  const authorAddress =
+    sanitizeLine(String(message.userAddress || ""), 120) || null;
+  const sourceRoom = sanitizeLine(String(message.roomId || MINT), 160) || MINT;
+
+  if (command.kind === "vote") {
+    const round = await pumpMeasure.measure(
+      { label: "Cast Pump.fun vote", room: MINT, handle: command.handle },
+      () =>
+        castPumpfunVoteByHandle({
+          handle: command.handle,
+          voterKey,
+          voterHandle: author,
+          sourceId,
+        }),
+    );
+    if (round)
+      console.log(
+        `[pumpfun] vote @${command.handle} ← @${author || authorAddress || "anonymous"}`,
+      );
+    return;
+  }
+
+  const proposal = await pumpMeasure.measure(
     {
-      label: "Queue Pump.fun prompt",
+      label: "Submit Pump.fun proposal",
       room: MINT,
       messageId: message.id || null,
     },
     () =>
-      enqueuePumpfunDirective({
-        text,
+      submitPumpfunProposal({
+        text: command.text,
         sourceId,
-        author: sanitizeLine(String(message.username || ""), 80) || null,
-        authorAddress:
-          sanitizeLine(String(message.userAddress || ""), 120) || null,
-        sourceRoom: sanitizeLine(String(message.roomId || MINT), 160) || MINT,
+        author,
+        authorAddress,
+        sourceRoom,
+        voterKey,
+        voterHandle: author,
       }),
   );
-
-  if (directive) {
-    const who = directive.author || directive.authorAddress || "anonymous";
-    console.log(`[pumpfun] queued @${who} → ${directive.text.slice(0, 120)}`);
-  }
+  if (proposal)
+    console.log(
+      `[pumpfun] proposal #${proposal.id} · ${proposal.voteCount} vote(s) · ${proposal.text.slice(0, 120)}`,
+    );
 }
 
 async function runLeasedSession() {
@@ -151,7 +187,7 @@ export async function runPumpfunChatIngestor() {
   }
 
   console.log(
-    `[pumpfun] adapter ${owner} watching ${MINT} · prompts ${PREFIX ? JSON.stringify(PREFIX) : "ALL CHAT"}`,
+    `[pumpfun] adapter ${owner} watching ${MINT} · propose ${PREFIX ? JSON.stringify(PREFIX) : "ALL CHAT"} · vote ${JSON.stringify(VOTE_PREFIX)}`,
   );
 
   while (!stopping) {

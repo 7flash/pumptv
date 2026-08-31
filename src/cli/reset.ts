@@ -112,12 +112,6 @@ try {
           );
           db.exec(`DELETE FROM clips WHERE episode >= ${fromInternal}`);
 
-          // These tables are no longer part of the current viewer-only runtime.
-          // Clearing them keeps an old development DB from carrying stale ballot state.
-          db.exec("DELETE FROM proposalVotes");
-          db.exec("DELETE FROM proposals");
-          db.exec("DELETE FROM promptRounds");
-
           db.exec(
             `UPDATE rooms SET
                workerState = 'idle',
@@ -125,6 +119,8 @@ try {
                leaseOwner = NULL,
                leaseUntilMs = 0,
                generationMode = 'full',
+               generationStage = 'idle',
+               generationStartedAtMs = NULL,
                generationPauseKind = NULL,
                generationPauseReason = NULL,
                generationRetryAtMs = NULL,

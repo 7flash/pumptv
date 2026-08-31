@@ -1,15 +1,17 @@
 {
   "name": "pumptv",
-  "version": "0.19.0",
+  "version": "0.32.0",
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "tradjs serve 3000",
-    "start": "tradjs serve 3000",
+    "dev": "bgrun inline -- tradjs serve 3000",
+    "start": "bgrun inline -- tradjs serve 3000",
     "web": "tradjs serve 3000",
     "worker": "bun src/worker.ts",
     "build": "tradjs build",
-    "reset": "bun src/cli/reset.ts"
+    "reset": "bun src/cli/reset.ts",
+    "control": "bun src/cli/control.ts",
+    "test": "bun test"
   },
   "dependencies": {
     "@fal-ai/client": "^1.6.2",
@@ -18,7 +20,8 @@
     "tradjs": "^4.3.0",
     "ws": "^8.18.0",
     "jsx-ai": "latest",
-    "bgrun": "^3.14.0"
+    "bgrun": "^3.14.0",
+    "@openai/codex-sdk": "latest"
   },
   "devDependencies": {
     "@types/bun": "latest",

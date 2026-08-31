@@ -29,8 +29,8 @@ function ContinuityDoctrine() {
 function ToolPolicy({ opening }: { opening: boolean }) {
   return (
     <system>{`Production protocol:
+- Use the available production tools; do not answer with a prose plan.
 - You MUST call stage_shot exactly once.
-- Do not narrate the plan in prose; commit it through tools.
 - Canon tools are patches, not a full rewrite. Omit unchanged entities/facts.
 - Reuse stable character/prop ids from canon when updating them.
 - Never delete a character or prop merely because it is off camera.
@@ -81,9 +81,10 @@ export function PumpTVShowrunnerPrompt(input: {
   episode: number;
   hasAnchor: boolean;
   worldState: WorldState;
+  maxTokens: number;
 }) {
   return (
-    <>
+    <prompt strategy="hybrid" maxTokens={input.maxTokens}>
       <ShowrunnerIdentity />
       <ContinuityDoctrine />
       <ToolPolicy opening={!input.hasAnchor && input.episode === 0} />
@@ -92,6 +93,6 @@ export function PumpTVShowrunnerPrompt(input: {
       <RecentEpisodes story={input.recentStory} />
       <PumpfunDirective text={input.directive} />
       <ShotRequest episode={input.episode} hasAnchor={input.hasAnchor} />
-    </>
+    </prompt>
   );
 }
