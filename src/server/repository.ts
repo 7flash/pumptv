@@ -108,7 +108,18 @@ function directiveWithVotesById(id: number) {
 
 function nextPendingDirectiveWithVotes() {
   return dbMeasure.measureSync(
-    "Load next pending directive",
+    {
+      start: () => "Load next pending directive",
+      end: (row) =>
+        row
+          ? {
+              id: row.id,
+              status: row.status,
+              proposalId: row.proposalId,
+              text: String(row.text || "").slice(0, 80),
+            }
+          : null,
+    },
     () =>
       db.raw<any>(
         `SELECT d.*,
@@ -189,8 +200,21 @@ export function normalizeResolution(value: unknown): Resolution {
 }
 
 export async function getRoomRow() {
-  let row = await dbMeasure.measureSync("Load room", () =>
-    db.rooms.select().where({ name: ROOM_NAME }).orderBy("id", "ASC").first(),
+  let row = await dbMeasure.measureSync(
+    {
+      start: () => "Load room",
+      end: (value) =>
+        value
+          ? {
+              running: Boolean(value.running),
+              resolution: value.resolution,
+              workerState: value.workerState,
+              stage: value.generationStage,
+            }
+          : null,
+    },
+    () =>
+      db.rooms.select().where({ name: ROOM_NAME }).orderBy("id", "ASC").first(),
   );
 
   if (!row) {
@@ -437,6 +461,7 @@ function normalizedHandle(value: string) {
 
 function proposalFromRow(row: any): PromptProposal {
   const realVoteCount = Number(row.realVoteCount ?? row.voteCount ?? 0);
+  const voterCount = Math.max(0, Number(row.voterCount ?? 0));
   const ownerWeight = Math.max(0, Number(row.ownerWeight ?? 1));
   const override =
     row.operatorVoteOverride == null ? null : Number(row.operatorVoteOverride);
@@ -452,6 +477,7 @@ function proposalFromRow(row: any): PromptProposal {
     sourceRoom: row.sourceRoom ?? null,
     ownerWeight,
     realVoteCount,
+    voterCount,
     operatorVoteOverride: override,
     voteCount: override ?? ownerWeight + realVoteCount,
   };
@@ -464,7 +490,9 @@ function loadRoundById(id: number): PromptRound | null {
   if (!row) return null;
   const proposals = db
     .raw<any>(
-      `SELECT p.*, (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = p.id) AS realVoteCount
+      `SELECT p.*,
+              (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = p.id) AS realVoteCount,
+              (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = p.id) AS voterCount
      FROM proposals p WHERE p.roundId = ?
      ORDER BY COALESCE(p.operatorVoteOverride, COALESCE(p.ownerWeight, 1) + (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = p.id)) DESC, p.id ASC`,
       id,
@@ -486,13 +514,33 @@ function loadRoundById(id: number): PromptRound | null {
 }
 
 export async function getOpenPromptRound(): Promise<PromptRound | null> {
-  return dbMeasure.measureSync("Load open proposal board", () => {
-    const row =
-      db.raw<any>(
-        `SELECT id FROM promptRounds WHERE status = 'open' ORDER BY id DESC LIMIT 1`,
-      )[0] || null;
-    return row ? loadRoundById(Number(row.id)) : null;
-  });
+  return dbMeasure.measureSync(
+    {
+      start: () => "Load open proposal board",
+      end: (round) =>
+        round
+          ? {
+              id: round.id,
+              targetEpisode: round.targetEpisode + 1,
+              proposals: round.proposals.length,
+              leader: round.proposals[0]
+                ? {
+                    id: round.proposals[0].id,
+                    score: round.proposals[0].voteCount,
+                    text: round.proposals[0].text.slice(0, 80),
+                  }
+                : null,
+            }
+          : null,
+    },
+    () => {
+      const row =
+        db.raw<any>(
+          `SELECT id FROM promptRounds WHERE status = 'open' ORDER BY id DESC LIMIT 1`,
+        )[0] || null;
+      return row ? loadRoundById(Number(row.id)) : null;
+    },
+  );
 }
 
 export async function getLatestPromptRound(): Promise<PromptRound | null> {
@@ -600,8 +648,15 @@ export async function upsertWebProposal(input: {
     try {
       const own =
         db.raw<any>(
-          `SELECT * FROM proposals WHERE roundId = ? AND source = 'web' AND sourceId = ? AND status = 'open' LIMIT 1`,
+          `SELECT * FROM proposals
+           WHERE roundId = ? AND source = 'web' AND status = 'open'
+             AND (sourceId = ? OR (? IS NOT NULL AND authorAddress = ?))
+           ORDER BY CASE WHEN sourceId = ? THEN 0 ELSE 1 END, id ASC
+           LIMIT 1`,
           round.id,
+          input.ownerKey,
+          input.walletAddress ?? null,
+          input.walletAddress ?? null,
           input.ownerKey,
         )[0] || null;
       const duplicate =
@@ -617,9 +672,10 @@ export async function upsertWebProposal(input: {
       if (proposal) {
         const changed = proposal.normalizedText !== normalized;
         db.exec(
-          `UPDATE proposals SET text = ?, normalizedText = ?, authorAddress = ?, ownerWeight = ? WHERE id = ?`,
+          `UPDATE proposals SET text = ?, normalizedText = ?, sourceId = ?, authorAddress = ?, ownerWeight = ? WHERE id = ?`,
           text,
           normalized,
+          input.ownerKey,
           input.walletAddress ?? null,
           ownerWeight,
           proposal.id,
@@ -714,31 +770,88 @@ export async function attachWebWallet(input: {
   const round = await getOpenPromptRound();
   if (!round) return null;
   const weight = clampWeight(input.weight);
-  return dbMeasure.measureSync("Apply wallet voting power", () => {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      db.exec(
-        `UPDATE proposals SET authorAddress = ?, ownerWeight = ? WHERE roundId = ? AND source = 'web' AND sourceId = ? AND status = 'open'`,
-        input.walletAddress,
-        weight,
-        round.id,
-        input.ownerKey,
-      );
-      db.exec(
-        `UPDATE proposalVotes SET weight = ? WHERE roundId = ? AND voterKey = ?`,
-        weight,
-        round.id,
-        input.ownerKey,
-      );
-      db.exec("COMMIT");
-      return loadRoundById(round.id);
-    } catch (error) {
+  const walletKey = `wallet:${input.walletAddress}`;
+  return dbMeasure.measureSync(
+    {
+      start: () =>
+        `Attach wallet ${input.walletAddress.slice(0, 5)}…${input.walletAddress.slice(-4)}`,
+      end: (value) => ({ proposals: value?.proposals.length ?? 0, weight }),
+    },
+    () => {
+      db.exec("BEGIN IMMEDIATE");
       try {
-        db.exec("ROLLBACK");
-      } catch {}
-      throw error;
-    }
-  });
+        const anonymousProposal =
+          db.raw<any>(
+            `SELECT * FROM proposals WHERE roundId = ? AND source = 'web' AND sourceId = ? AND status = 'open' LIMIT 1`,
+            round.id,
+            input.ownerKey,
+          )[0] || null;
+        const walletProposal =
+          db.raw<any>(
+            `SELECT * FROM proposals WHERE roundId = ? AND source = 'web' AND (sourceId = ? OR authorAddress = ?) AND status = 'open' ORDER BY id ASC LIMIT 1`,
+            round.id,
+            walletKey,
+            input.walletAddress,
+          )[0] || null;
+
+        if (
+          anonymousProposal &&
+          walletProposal &&
+          anonymousProposal.id !== walletProposal.id
+        ) {
+          // A wallet can own only one active idea across every browser/session.
+          db.exec(
+            `DELETE FROM proposalVotes WHERE proposalId = ?`,
+            anonymousProposal.id,
+          );
+          db.exec(`DELETE FROM proposals WHERE id = ?`, anonymousProposal.id);
+        } else if (anonymousProposal) {
+          db.exec(
+            `UPDATE proposals SET sourceId = ?, authorAddress = ?, ownerWeight = ? WHERE id = ?`,
+            walletKey,
+            input.walletAddress,
+            weight,
+            anonymousProposal.id,
+          );
+        }
+
+        db.exec(
+          `UPDATE proposals SET sourceId = ?, authorAddress = ?, ownerWeight = ?
+           WHERE roundId = ? AND source = 'web' AND (sourceId = ? OR authorAddress = ?) AND status = 'open'`,
+          walletKey,
+          input.walletAddress,
+          weight,
+          round.id,
+          walletKey,
+          input.walletAddress,
+        );
+
+        // One connected wallet gets one vote, even across multiple browser tabs.
+        db.exec(
+          `DELETE FROM proposalVotes WHERE roundId = ? AND voterKey = ?`,
+          round.id,
+          walletKey,
+        );
+        db.exec(
+          `UPDATE proposalVotes SET voterKey = ?, sourceId = ?, weight = ?
+           WHERE roundId = ? AND voterKey = ?`,
+          walletKey,
+          input.walletAddress,
+          weight,
+          round.id,
+          input.ownerKey,
+        );
+
+        db.exec("COMMIT");
+        return loadRoundById(round.id);
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {}
+        throw error;
+      }
+    },
+  );
 }
 
 export async function castWebVote(input: {
@@ -1352,15 +1465,20 @@ export async function recoverGeneratingDirectives() {
 }
 
 export async function recentStory(limit = 6) {
-  const rows = await dbMeasure.measureSync("Load recent reconciled canon", () =>
-    db.raw<any>(
-      `SELECT c.*, w.reconciliationJson
+  const rows = await dbMeasure.measureSync(
+    {
+      start: () => "Load recent reconciled canon",
+      end: (value) => ({ clips: Array.isArray(value) ? value.length : 0 }),
+    },
+    () =>
+      db.raw<any>(
+        `SELECT c.*, w.reconciliationJson
        FROM clips c
        LEFT JOIN worldStateSnapshots w ON w.clipId = c.id
        ORDER BY c.episode DESC
        LIMIT ?`,
-      limit,
-    ),
+        limit,
+      ),
   );
 
   return (rows || []).reverse().map((row: any) => {
@@ -1446,8 +1564,15 @@ function parseWorldStateAudit(row: any): WorldStateAudit {
 }
 
 export async function getLatestWorldState(): Promise<WorldState> {
-  const row = await dbMeasure.measureSync("Load latest world state", () =>
-    db.worldStateSnapshots.select().orderBy("episode", "DESC").first(),
+  const row = await dbMeasure.measureSync(
+    {
+      start: () => "Load latest world state",
+      end: (value) =>
+        value
+          ? { episode: Number(value.episode) + 1, clipId: value.clipId }
+          : null,
+    },
+    () => db.worldStateSnapshots.select().orderBy("episode", "DESC").first(),
   );
   return row
     ? parseWorldStateJson((row as any).stateJson) || EMPTY_WORLD_STATE
@@ -1460,12 +1585,20 @@ export async function getWorldStateSnapshotForEpisode(
   worldState: WorldState;
   audit: WorldStateAudit;
 } | null> {
-  const row = await dbMeasure.measureSync("Load episode world state", () =>
-    db.worldStateSnapshots
-      .select()
-      .where({ episode })
-      .orderBy("id", "DESC")
-      .first(),
+  const row = await dbMeasure.measureSync(
+    {
+      start: () => `Load world state EP ${episode + 1}`,
+      end: (value) =>
+        value
+          ? { episode: Number(value.episode) + 1, clipId: value.clipId }
+          : null,
+    },
+    () =>
+      db.worldStateSnapshots
+        .select()
+        .where({ episode })
+        .orderBy("id", "DESC")
+        .first(),
   );
   if (!row) return null;
   const worldState = parseWorldStateJson((row as any).stateJson);
@@ -1480,8 +1613,15 @@ export async function getWorldStateForEpisode(
 }
 
 export async function nextEpisode() {
-  const row = await dbMeasure.measureSync("Load latest episode", () =>
-    db.clips.select("episode").orderBy("episode", "DESC").first(),
+  const row = await dbMeasure.measureSync(
+    {
+      start: () => "Load latest episode",
+      end: (value) =>
+        value
+          ? { latestEpisode: Number((value as any).episode) + 1 }
+          : { latestEpisode: null },
+    },
+    () => db.clips.select("episode").orderBy("episode", "DESC").first(),
   );
   return row ? Number((row as any).episode) + 1 : 0;
 }
@@ -1554,7 +1694,10 @@ export async function getRecentGenerationTimings(
   limit = 16,
 ): Promise<GenerationTimingSample[]> {
   const rows = await dbMeasure.measureSync(
-    "Load generation timing window",
+    {
+      start: () => "Load generation timing window",
+      end: (value) => ({ samples: Array.isArray(value) ? value.length : 0 }),
+    },
     () => db.clips.select().orderBy("episode", "DESC").limit(limit).all(),
   );
   return (rows || []).map((row: any) => ({
@@ -1568,8 +1711,19 @@ export async function getRecentGenerationTimings(
 }
 
 export async function getLatestClip(): Promise<Clip | null> {
-  const row = await dbMeasure.measureSync("Load latest clip", () =>
-    db.clips.select().orderBy("episode", "DESC").first(),
+  const row = await dbMeasure.measureSync(
+    {
+      start: () => "Load latest clip",
+      end: (value) =>
+        value
+          ? {
+              id: value.id,
+              episode: Number(value.episode) + 1,
+              startsAtMs: value.startsAtMs,
+            }
+          : null,
+    },
+    () => db.clips.select().orderBy("episode", "DESC").first(),
   );
   if (!row) return null;
 
@@ -1588,7 +1742,10 @@ export async function getTimeline(
 ): Promise<Clip[]> {
   const safeLimit = Math.max(8, Math.min(240, Math.floor(limit || 64)));
   const rows = await dbMeasure.measureSync(
-    "Load attributed timeline window",
+    {
+      start: () => "Load attributed timeline window",
+      end: (value) => ({ clips: Array.isArray(value) ? value.length : 0 }),
+    },
     () =>
       db.raw<any>(
         `SELECT c.*,

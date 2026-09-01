@@ -23,6 +23,12 @@ timeline_window = 96
 idle_poll_ms = 500
 error_backoff_ms = 2000
 
+# Browser state transport uses long polling. Only meaningful changes trigger a
+# full measured state query; idle requests return after the timeout.
+long_poll_check_ms = 400
+long_poll_timeout_ms = 25000
+viewer_ttl_ms = 45000
+
 # Token mint used for Phantom holding-weight. This is independent of chat.
 token_mint = ""
 

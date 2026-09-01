@@ -17,7 +17,8 @@ let program: LiveProgramState | null = null;
 let worldState: WorldState | null = null;
 let serverOffsetMs = 0;
 let replayClipId: number | null = null;
-let source: EventSource | null = null;
+let longPollAbort: AbortController | null = null;
+let streamRevision = 0;
 let viewerId = "";
 let proposalOwnerId = "";
 let transport: "connecting" | "live" | "reconnecting" = "connecting";
@@ -345,7 +346,7 @@ async function refreshStreamState() {
 }
 
 function ownerKey() {
-  return `web:${proposalOwnerId}`;
+  return walletAddress ? `wallet:${walletAddress}` : `web:${proposalOwnerId}`;
 }
 
 function currentBoardRound() {
@@ -444,7 +445,11 @@ async function cancelOwnIdea() {
     await json("/api/proposals", {
       method: "DELETE",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ viewerId, ownerId: proposalOwnerId }),
+      body: JSON.stringify({
+        viewerId,
+        ownerId: proposalOwnerId,
+        walletAddress,
+      }),
     });
     ideaDraft = "";
     await refreshStreamState();
@@ -763,6 +768,41 @@ function ensureViewerIdAndPrefs() {
   liveOverlayEnabled = readPref("pumptv-v25-live-overlay", true);
 }
 
+async function runStateLongPoll() {
+  longPollAbort?.abort();
+  const controller = new AbortController();
+  longPollAbort = controller;
+
+  while (!controller.signal.aborted) {
+    try {
+      const response = await fetch(
+        `/api/events?viewerId=${encodeURIComponent(viewerId)}&since=${streamRevision}`,
+        { cache: "no-store", signal: controller.signal },
+      );
+      if (!response.ok)
+        throw new Error(`State poll failed: ${response.status}`);
+      const payload = (await response.json()) as {
+        revision?: number;
+        state?: StreamState | null;
+      };
+      if (Number.isSafeInteger(payload.revision))
+        streamRevision = Number(payload.revision);
+      if (payload.state) applyState(payload.state);
+      else error = null;
+      if (transport !== "live") {
+        transport = "live";
+        redraw();
+      }
+    } catch (cause) {
+      if (controller.signal.aborted) break;
+      transport = "reconnecting";
+      error = cause instanceof Error ? cause.message : "state reconnecting";
+      redraw();
+      await new Promise((resolve) => setTimeout(resolve, 850));
+    }
+  }
+}
+
 async function boot() {
   ensureViewerIdAndPrefs();
   installInteractionLayer();
@@ -773,30 +813,13 @@ async function boot() {
   void connectPhantom(false);
   try {
     applyState(await json<StreamState>("/api/state"));
+    transport = "live";
   } catch (cause) {
     error = cause instanceof Error ? cause.message : "offline";
     redraw();
   }
 
-  source = new EventSource(
-    `/api/events?viewerId=${encodeURIComponent(viewerId)}`,
-  );
-  source.onopen = () => {
-    transport = "live";
-    redraw();
-  };
-  source.onmessage = (event) => {
-    try {
-      applyState(JSON.parse(event.data) as StreamState);
-    } catch {
-      error = "invalid stream state";
-      redraw();
-    }
-  };
-  source.onerror = () => {
-    transport = "reconnecting";
-    redraw();
-  };
+  void runStateLongPoll();
 
   timer = setInterval(() => {
     syncVideoDeck();
@@ -1832,7 +1855,6 @@ function CandidateRows({
             data-proposal-id={interactive ? candidate.id : undefined}
             role={interactive ? "button" : undefined}
             tabIndex={interactive ? 0 : undefined}
-            title={interactive ? "Vote" : undefined}
           >
             <em>{index + 1}</em>
             <div className="rankIdea">
@@ -2371,25 +2393,36 @@ function BoardIcon({ name }: { name: BoardIconName }) {
 function ProposalCard({
   proposal,
   own = false,
+  rank,
 }: {
   proposal: PromptProposal;
   own?: boolean;
+  rank: number;
   key?: unknown;
 }) {
   const pending = votePendingId === proposal.id;
   return (
     <div
       className={`persistentProposal ${own ? "own" : ""} ${pending ? "pending" : ""}`}
+      data-proposal-id={proposal.id}
     >
+      <em className="proposalRank">{rank}</em>
       <div className="persistentProposalText">
         <span>{proposal.text}</span>
-        {proposal.author || proposal.authorAddress ? (
-          <i>{authorLabel(proposal.author, proposal.authorAddress)}</i>
-        ) : null}
+        <i>
+          <code>#{proposal.id}</code>
+          {proposal.author || proposal.authorAddress ? (
+            <>{authorLabel(proposal.author, proposal.authorAddress)}</>
+          ) : null}
+          <small>
+            {formatScore(proposal.ownerWeight)} +{" "}
+            {formatScore(proposal.realVoteCount)} · {proposal.voterCount}↑
+          </small>
+        </i>
       </div>
       {own ? (
         <>
-          <b>{formatScore(proposal.voteCount)}</b>
+          <b className="proposalTotal">{formatScore(proposal.voteCount)}</b>
           <div className="ownIdeaActions">
             <button type="button" data-action="edit-own" aria-label="Edit idea">
               <BoardIcon name="edit" />
@@ -2410,7 +2443,7 @@ function ProposalCard({
           data-action="vote"
           data-proposal-id={proposal.id}
           disabled={pending}
-          aria-label={`Upvote suggestion with your score. Current score ${formatScore(proposal.voteCount)}`}
+          aria-label={`Vote with score ${formatScore(walletPower)}. Current total ${formatScore(proposal.voteCount)}`}
         >
           <BoardIcon name="upvote" />
           <b>{formatScore(proposal.voteCount)}</b>
@@ -2423,9 +2456,7 @@ function ProposalCard({
 function PersistentIdeas() {
   const round = currentBoardRound();
   const own = ownProposal();
-  const others = sortedCandidates(round).filter(
-    (proposal) => proposal.id !== own?.id,
-  );
+  const proposals = sortedCandidates(round);
   return (
     <section className="persistentIdeas" aria-label="Suggestions">
       <form className="persistentIdeaForm" data-idea-form>
@@ -2448,10 +2479,14 @@ function PersistentIdeas() {
           <BoardIcon name="send" />
         </button>
       </form>
-      {own ? <ProposalCard proposal={own} own /> : null}
       <div className="persistentProposalList">
-        {others.map((proposal) => (
-          <ProposalCard key={proposal.id} proposal={proposal} />
+        {proposals.map((proposal, index) => (
+          <ProposalCard
+            key={proposal.id}
+            proposal={proposal}
+            rank={index + 1}
+            own={proposal.id === own?.id}
+          />
         ))}
       </div>
     </section>
@@ -4542,7 +4577,269 @@ function OutsideInterfaceStyles() {
         }
       }
 
+
+      /* v15 — PumpTV brass / silver hardware language. */
+      :root {
+        --pump-gold: #d7a43b;
+        --pump-gold-hi: #f3cc72;
+        --pump-gold-low: #8f661f;
+        --pump-silver: #c8c9cb;
+        --pump-silver-dim: #7d8085;
+        --pump-black: #090a0b;
+        --pump-panel: #111214;
+      }
+
+      .minimalTop .wordmark {
+        width: 76px !important;
+        height: 76px !important;
+        display: block !important;
+        padding: 0 !important;
+        border: 0 !important;
+        border-radius: 0 !important;
+        overflow: hidden !important;
+        background: transparent !important;
+        box-shadow: none !important;
+      }
+      .pumptvLogo {
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        display: block;
+        filter: drop-shadow(0 5px 14px rgba(0,0,0,.35));
+      }
+
+      .statusDot.ready,
+      .powerLamp.ready,
+      .statusDot.work,
+      .powerLamp.work {
+        background: var(--pump-gold-hi) !important;
+        box-shadow: 0 0 0 1px rgba(215,164,59,.22), 0 0 12px rgba(215,164,59,.28) !important;
+      }
+
+      /* These are machined hardware keys now, not glowing arcade knobs. */
+      .knobStack {
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: center !important;
+        gap: 10px !important;
+      }
+      .knobControl {
+        position: relative !important;
+        width: 48px !important;
+        height: 38px !important;
+        min-width: 48px !important;
+        min-height: 38px !important;
+        padding: 0 !important;
+        display: grid !important;
+        place-items: center !important;
+        border: 1px solid rgba(200,201,203,.25) !important;
+        border-radius: 12px !important;
+        outline: 0 !important;
+        color: rgba(200,201,203,.72) !important;
+        background:
+          linear-gradient(180deg, rgba(255,255,255,.07), rgba(255,255,255,.015)),
+          #151719 !important;
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.09),
+          inset 0 -2px rgba(0,0,0,.55),
+          0 5px 12px rgba(0,0,0,.25) !important;
+        cursor: pointer !important;
+        transform: none !important;
+      }
+      .knobControl:hover {
+        border-color: rgba(200,201,203,.42) !important;
+        color: var(--pump-silver) !important;
+        transform: translateY(-1px) !important;
+      }
+      .knobControl:active {
+        transform: translateY(1px) !important;
+        box-shadow: inset 0 2px 5px rgba(0,0,0,.58) !important;
+      }
+      .knobControl.on {
+        color: var(--pump-gold-hi) !important;
+        border-color: rgba(215,164,59,.48) !important;
+        background:
+          linear-gradient(180deg, rgba(215,164,59,.12), rgba(255,255,255,.015)),
+          #171713 !important;
+      }
+      .knobNeedle {
+        position: absolute !important;
+        top: 4px !important;
+        right: 7px !important;
+        width: 11px !important;
+        height: 2px !important;
+        border: 0 !important;
+        border-radius: 999px !important;
+        background: var(--pump-silver-dim) !important;
+        transform: rotate(-48deg) !important;
+        transform-origin: right center !important;
+        opacity: .38 !important;
+        box-shadow: none !important;
+      }
+      .knobControl.on .knobNeedle {
+        background: var(--pump-gold-hi) !important;
+        opacity: .95 !important;
+      }
+      .knobIcon {
+        position: relative !important;
+        inset: auto !important;
+        width: 20px !important;
+        height: 20px !important;
+        display: grid !important;
+        place-items: center !important;
+        border: 0 !important;
+        background: transparent !important;
+      }
+      .knobIcon svg {
+        width: 19px !important;
+        height: 19px !important;
+        fill: currentColor !important;
+      }
+      .knobIcon svg .stroke {
+        fill: none !important;
+        stroke: currentColor !important;
+        stroke-width: 1.7 !important;
+      }
+
+      /* Selected != neon border: a small brass play index plus mechanical lift. */
+      .episodeCard {
+        position: relative !important;
+        opacity: .72;
+        transition: opacity 140ms ease, transform 140ms ease, background 140ms ease !important;
+      }
+      .episodeCard:hover { opacity: .9; }
+      .episodeCard.active {
+        opacity: 1 !important;
+        transform: translateX(-2px) !important;
+        background: linear-gradient(90deg, rgba(215,164,59,.09), rgba(200,201,203,.025)) !important;
+      }
+      .episodeCard.active > b::before {
+        content: "▶";
+        color: var(--pump-gold-hi);
+        font-size: 7px;
+        margin-right: 4px;
+        vertical-align: 1px;
+      }
+      .episodeCard.live .episodeThumb > em {
+        color: var(--pump-gold-hi) !important;
+        text-shadow: 0 0 8px rgba(215,164,59,.45) !important;
+      }
+      .episodeCard.active .episodeThumb {
+        border-color: rgba(215,164,59,.32) !important;
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.07),
+          0 7px 20px rgba(0,0,0,.30),
+          -3px 0 0 rgba(215,164,59,.72) !important;
+      }
+      .liveCap.active { color: var(--pump-gold-hi) !important; }
+
+      .programShelfSlot {
+        border-color: rgba(215,164,59,.24) !important;
+        background: linear-gradient(180deg, rgba(215,164,59,.07), rgba(255,255,255,.012)) !important;
+      }
+      .programShelfPulse { color: var(--pump-gold-hi) !important; }
+
+      /* The persistent board is a true ranking. Own ideas remain editable but are
+         no longer artificially pinned above higher-scoring proposals. */
+      .persistentProposalList {
+        display: grid !important;
+        gap: 8px !important;
+      }
+      .persistentProposal {
+        display: grid !important;
+        grid-template-columns: 24px minmax(0, 1fr) auto auto !important;
+        align-items: center !important;
+        gap: 9px !important;
+        min-width: 0 !important;
+        padding: 10px 11px !important;
+        border: 1px solid rgba(200,201,203,.10) !important;
+        border-radius: 13px !important;
+        background: linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.014)) !important;
+      }
+      .persistentProposal:not(.own) {
+        grid-template-columns: 24px minmax(0, 1fr) auto !important;
+      }
+      .persistentProposal:first-child {
+        border-color: rgba(215,164,59,.26) !important;
+        background: linear-gradient(180deg, rgba(215,164,59,.055), rgba(255,255,255,.015)) !important;
+      }
+      .persistentProposal.own {
+        border-color: rgba(200,201,203,.24) !important;
+        background: linear-gradient(180deg, rgba(200,201,203,.055), rgba(255,255,255,.014)) !important;
+      }
+      .proposalRank {
+        font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+        font-style: normal !important;
+        color: var(--pump-silver-dim) !important;
+        text-align: center;
+      }
+      .persistentProposal:first-child .proposalRank { color: var(--pump-gold-hi) !important; }
+      .persistentProposalText { min-width: 0 !important; display: grid !important; gap: 4px !important; }
+      .persistentProposalText > span {
+        font-size: 13px !important;
+        line-height: 1.35 !important;
+        white-space: normal !important;
+      }
+      .persistentProposalText > i {
+        min-width: 0;
+        display: flex !important;
+        align-items: center !important;
+        flex-wrap: wrap !important;
+        gap: 7px !important;
+        font: 600 9px/1.2 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+        font-style: normal !important;
+        color: rgba(200,201,203,.46) !important;
+      }
+      .persistentProposalText > i > code {
+        color: rgba(243,204,114,.72) !important;
+        font: inherit !important;
+      }
+      .persistentProposalText > i > small {
+        font: inherit !important;
+        color: rgba(200,201,203,.52) !important;
+      }
+      .proposalTotal {
+        min-width: 34px;
+        text-align: right;
+        color: var(--pump-gold-hi) !important;
+        font: 750 12px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace !important;
+      }
+      .proposalVote,
+      .ownIdeaActions > button,
+      .persistentIdeaForm > button,
+      .boardToggle,
+      .walletMetric {
+        border-color: rgba(200,201,203,.16) !important;
+        color: var(--pump-silver) !important;
+        background: linear-gradient(180deg, rgba(255,255,255,.045), rgba(255,255,255,.015)) !important;
+        box-shadow: inset 0 1px rgba(255,255,255,.05) !important;
+      }
+      .proposalVote:hover,
+      .persistentIdeaForm > button:hover,
+      .boardToggle:hover,
+      .walletMetric:hover {
+        border-color: rgba(215,164,59,.38) !important;
+        color: var(--pump-gold-hi) !important;
+      }
+      .proposalVote > b { color: var(--pump-gold-hi) !important; }
+
+      .participationBoard,
+      .participationSheet,
+      .participationDock {
+        --tray-accent: var(--pump-gold);
+      }
+      .participationDock,
+      .participationSheet {
+        border-color: rgba(200,201,203,.12) !important;
+        background-color: rgba(13,14,15,.95) !important;
+      }
+      .drawerGrab > i { background: linear-gradient(90deg, var(--pump-silver-dim), var(--pump-gold), var(--pump-silver-dim)) !important; }
+      .dockIdeaSummary > b,
+      .walletMetric.connected { color: var(--pump-gold-hi) !important; }
+
       @media (max-width: 820px) {
+        .minimalTop .wordmark { width: 58px !important; height: 58px !important; }
+        .knobControl { width: 44px !important; height: 36px !important; min-width: 44px !important; min-height: 36px !important; }
         .participationBoard {
           width: calc(100vw - 24px);
         }
@@ -4583,8 +4880,8 @@ function App() {
       <OutsideInterfaceStyles />
       <section className="watchDeck">
         <div className="minimalTop">
-          <div className="wordmark" aria-label="PumpTV">
-            <span>P</span>
+          <div className="wordmark">
+            <img className="pumptvLogo" src="/api/logo" alt="PumpTV" />
           </div>
           <div className="tinyStatus">
             <i

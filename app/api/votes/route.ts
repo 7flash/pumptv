@@ -10,10 +10,14 @@ import {
   walletVotingPower,
 } from "../../../src/server/wallet-score.ts";
 
-function voterKey(value: unknown) {
+function anonymousKey(value: unknown) {
   const id = sanitizeLine(String(value || ""), 180);
   if (!id) throw new Error("Missing voter id");
   return `web:${id}`;
+}
+
+function voterKey(value: unknown, walletAddress: string | null) {
+  return walletAddress ? `wallet:${walletAddress}` : anonymousKey(value);
 }
 
 export function POST(request: Request) {
@@ -29,18 +33,22 @@ export function POST(request: Request) {
       if (!Number.isSafeInteger(proposalId) || proposalId <= 0)
         throw new Error("Invalid proposal id");
       const walletAddress = normalizeSolanaAddress(body.walletAddress);
-      const { power } = await httpMeasure.measure("Resolve vote score", () =>
-        walletVotingPower(walletAddress),
+      const { power } = await httpMeasure.measure(
+        {
+          start: () => "Resolve vote score",
+          end: (score) => score,
+        },
+        () => walletVotingPower(walletAddress),
       );
       const round = await httpMeasure.measure(
         {
-          start: () => `Vote #${proposalId}`,
+          start: () => `Vote #${proposalId} with weight ${power}`,
           end: (value) => ({ proposals: value?.proposals.length ?? 0 }),
         },
         () =>
           castWebVote({
             proposalId,
-            voterKey: voterKey(body.ownerId ?? body.viewerId),
+            voterKey: voterKey(body.ownerId ?? body.viewerId, walletAddress),
             weight: power,
             walletAddress,
           }),

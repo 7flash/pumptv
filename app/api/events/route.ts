@@ -1,15 +1,22 @@
 import { measuredRoute } from "../../../src/server/observability.ts";
-import { streamState } from "../../../src/server/state-stream.ts";
+import { longPollState } from "../../../src/server/state-long-poll.ts";
 
 export function GET(request: Request) {
-  return measuredRoute(request, () => {
-    const viewerId = new URL(request.url).searchParams.get("viewerId") || "";
-    return new Response(streamState(request.signal, viewerId), {
+  return measuredRoute(request, async () => {
+    const url = new URL(request.url);
+    const viewerId = url.searchParams.get("viewerId") || "";
+    const rawSince = Number(url.searchParams.get("since") || 0);
+    const since =
+      Number.isSafeInteger(rawSince) && rawSince >= 0 ? rawSince : 0;
+    const result = await longPollState({
+      viewerId,
+      since,
+      signal: request.signal,
+    });
+    return Response.json(result, {
       headers: {
-        "Content-Type": "text/event-stream; charset=utf-8",
-        "Cache-Control": "no-cache, no-transform",
-        Connection: "keep-alive",
-        "X-Accel-Buffering": "no",
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        "X-PumpTV-Transport": "long-poll",
       },
     });
   });

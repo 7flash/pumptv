@@ -76,6 +76,7 @@ export type PromptProposal = {
   ownerWeight: number;
   voteCount: number;
   realVoteCount: number;
+  voterCount: number;
   operatorVoteOverride: number | null;
 };
 

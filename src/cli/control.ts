@@ -52,7 +52,7 @@ function roundLines(
   ];
   for (const p of round.proposals) {
     lines.push(
-      `${p.status === "selected" ? ">" : " "} #${p.id}  ${p.voteCount}${p.operatorVoteOverride == null ? "" : "*"}  @${p.author || p.authorAddress || "anon"}  ${p.text}`,
+      `${p.status === "selected" ? ">" : " "} #${p.id}  ${p.voteCount}${p.operatorVoteOverride == null ? "" : "*"}  [${p.ownerWeight}+${p.realVoteCount}; ${p.voterCount} voter${p.voterCount === 1 ? "" : "s"}]  @${p.author || p.authorAddress || "anon"}  ${p.text}`,
     );
   }
   return lines;

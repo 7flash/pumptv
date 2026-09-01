@@ -13,10 +13,14 @@ import {
   walletVotingPower,
 } from "../../../src/server/wallet-score.ts";
 
-function ownerKey(value: unknown) {
+function anonymousKey(value: unknown) {
   const id = sanitizeLine(String(value || ""), 180);
   if (!id) throw new Error("Missing proposal owner id");
   return `web:${id}`;
+}
+
+function ownerKey(value: unknown, walletAddress: string | null) {
+  return walletAddress ? `wallet:${walletAddress}` : anonymousKey(value);
 }
 
 export function POST(request: Request) {
@@ -58,7 +62,7 @@ export function POST(request: Request) {
         () =>
           upsertWebProposal({
             text,
-            ownerKey: ownerKey(identity),
+            ownerKey: ownerKey(identity, walletAddress),
             walletAddress,
             ownerWeight: power,
           }),
@@ -88,10 +92,11 @@ export function DELETE(request: Request) {
           return raw as Record<string, unknown>;
         },
       );
+      const walletAddress = normalizeSolanaAddress(body.walletAddress);
       const identity = body.ownerId ?? body.viewerId;
       const removed = await httpMeasure.measure(
         "Cancel persistent proposal",
-        () => cancelWebProposal(ownerKey(identity)),
+        () => cancelWebProposal(ownerKey(identity, walletAddress)),
       );
       return Response.json({ ok: true, removed: Boolean(removed) });
     } catch (error) {

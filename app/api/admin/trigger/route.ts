@@ -43,6 +43,7 @@ function boardPayload(round: Awaited<ReturnType<typeof getOpenPromptRound>>) {
       authorAddress: proposal.authorAddress,
       ownerScore: proposal.ownerWeight,
       voteScore: proposal.realVoteCount,
+      voterCount: proposal.voterCount,
     })),
   };
 }
@@ -82,6 +83,9 @@ export function POST(request: Request) {
 
       const rawProposalId =
         body.proposalId ?? url.searchParams.get("proposalId") ?? null;
+      const rawText = String(
+        body.text ?? url.searchParams.get("text") ?? "",
+      ).trim();
       const proposalId =
         rawProposalId == null || rawProposalId === ""
           ? undefined
@@ -91,37 +95,53 @@ export function POST(request: Request) {
         (!Number.isSafeInteger(proposalId) || proposalId <= 0)
       )
         throw new Error("proposalId must be a positive integer");
+      if (proposalId !== undefined && rawText)
+        throw new Error("Use proposalId or text, not both");
 
       const before = await httpMeasure.measure("Load trigger candidates", () =>
         getOpenPromptRound(),
       );
       if (!before || !before.proposals.length)
         throw new Error("There are no active proposals to trigger");
-      const selected =
-        proposalId === undefined
-          ? before.proposals[0]
-          : before.proposals.find((proposal) => proposal.id === proposalId);
-      if (!selected) throw new Error(`Proposal #${proposalId} is not active`);
 
+      const normalizedText = rawText.replace(/\s+/g, " ").toLowerCase();
+      const selected =
+        proposalId !== undefined
+          ? before.proposals.find((proposal) => proposal.id === proposalId)
+          : normalizedText
+            ? before.proposals.find(
+                (proposal) =>
+                  proposal.text.replace(/\s+/g, " ").trim().toLowerCase() ===
+                  normalizedText,
+              )
+            : before.proposals[0];
+      if (!selected)
+        throw new Error(
+          proposalId !== undefined
+            ? `Proposal #${proposalId} is not active`
+            : `No active proposal exactly matches: ${rawText}`,
+        );
+
+      const override = proposalId !== undefined || Boolean(normalizedText);
       const directive = await httpMeasure.measure(
         {
           start: () =>
-            proposalId === undefined
-              ? `Trigger highest score #${selected.id}`
-              : `Trigger override #${selected.id}`,
+            override
+              ? `Trigger override #${selected.id}`
+              : `Trigger highest score #${selected.id}`,
           end: (value) => ({
             directiveId: value?.id ?? null,
             text: value?.text ?? null,
           }),
         },
-        () => triggerPromptRound(proposalId),
+        () => triggerPromptRound(override ? selected.id : undefined),
       );
       if (!directive) throw new Error("Could not lock a proposal");
 
       return Response.json(
         {
           ok: true,
-          selection: proposalId === undefined ? "highest-score" : "override",
+          selection: override ? "override" : "highest-score",
           proposal: {
             id: selected.id,
             score: selected.voteCount,
