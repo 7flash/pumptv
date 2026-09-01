@@ -4,7 +4,9 @@ import {
   isProcessRunning,
   terminateProcess,
 } from "bgrun";
+import { existsSync } from "node:fs";
 import { PROJECT_ROOT } from "./project-paths.ts";
+import { lifecycleMeasure } from "./observability.ts";
 import { clearWebHeartbeat, touchWebHeartbeat } from "./repository.ts";
 
 export type ManagedWorkerState = "unknown" | "starting" | "running" | "error";
@@ -18,9 +20,13 @@ export type ManagedWorkerStatus = {
 };
 
 const WORKER_NAME = "pumptv-worker";
-const workerCommand = () => `bun src/worker.ts --owner-pid=${process.pid}`;
-const CONFIG_PATH = ".config.toml";
+const WORKER_CONFIG_PATH = ".worker.toml";
 const CHECK_INTERVAL_MS = 2_000;
+const START_ATTEMPTS = 30;
+const START_POLL_MS = 100;
+
+const workerCommand = () => `bun src/worker.ts --owner-pid=${process.pid}`;
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let status: ManagedWorkerStatus = {
   name: WORKER_NAME,
@@ -34,13 +40,11 @@ let firstEnsure = true;
 let lifecycleTimer: ReturnType<typeof setInterval> | null = null;
 let shuttingDown = false;
 
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
-
 function cleanError(error: unknown) {
   return (
     error instanceof Error
       ? error.message
-      : String(error || "Unknown bgrun error")
+      : String(error || "Unknown bgrun worker error")
   )
     .replace(/\s+/g, " ")
     .trim()
@@ -63,35 +67,63 @@ async function processIsAlive(proc: any) {
 
 function startWebLifecycle() {
   if (lifecycleTimer) return;
-  console.log(
-    `[pumptv] web owner pid=${process.pid}; worker lifetime is coupled to this process`,
-  );
-  void touchWebHeartbeat(process.pid);
+  lifecycleMeasure.measureSync("Web owns generation worker", () => ({
+    pid: process.pid,
+    heartbeatMs: 1_000,
+  }));
+  void touchWebHeartbeat(process.pid).catch(() => {});
   lifecycleTimer = setInterval(() => {
-    void touchWebHeartbeat(process.pid);
+    void touchWebHeartbeat(process.pid).catch(() => {});
   }, 1_000);
+}
+
+async function stopWorkerPid(pid: number) {
+  try {
+    await terminateProcess(pid);
+  } catch (error) {
+    lifecycleMeasure.measureSync("Worker terminate failed", () => ({
+      pid,
+      error: cleanError(error),
+    }));
+  }
+
+  // Do not use bgrun force cleanup here. force cleanup is allowed to chase ports,
+  // and this worker intentionally owns no port. A PID-only stop is sufficient.
+  for (let attempt = 0; attempt < 30; attempt += 1) {
+    try {
+      if (!(await isProcessRunning(pid))) return;
+    } catch {
+      return;
+    }
+    await sleep(50);
+  }
 }
 
 async function stopOwnedWorker() {
   if (shuttingDown) return;
   shuttingDown = true;
+
   if (lifecycleTimer) {
     clearInterval(lifecycleTimer);
     lifecycleTimer = null;
   }
+
   try {
     await clearWebHeartbeat(process.pid);
   } catch {}
+
   try {
     const proc = getProcess(WORKER_NAME) as any;
     if (proc?.pid && (await processIsAlive(proc))) {
-      console.log(`[pumptv] stopping owned ${WORKER_NAME} (pid ${proc.pid})`);
-      await terminateProcess(Number(proc.pid));
+      lifecycleMeasure.measureSync("Stop owned worker", () => ({
+        pid: Number(proc.pid),
+      }));
+      await stopWorkerPid(Number(proc.pid));
     }
   } catch (error) {
-    console.warn(
-      `[pumptv] could not stop worker cleanly: ${cleanError(error)}`,
-    );
+    lifecycleMeasure.measureSync("Owned worker stop failed", () => ({
+      error: cleanError(error),
+    }));
   }
 }
 
@@ -103,14 +135,62 @@ function installShutdownHooks() {
   process.once("SIGTERM", () => stopAndExit(0));
 }
 
+async function startWorkerWithBgrun(): Promise<ManagedWorkerStatus> {
+  if (!existsSync(`${PROJECT_ROOT}/${WORKER_CONFIG_PATH}`)) {
+    throw new Error(
+      `Missing ${WORKER_CONFIG_PATH}. Copy example.worker.toml to ${WORKER_CONFIG_PATH} and configure the worker runtime.`,
+    );
+  }
+
+  const command = workerCommand();
+  const started = await lifecycleMeasure.measure(
+    {
+      start: () => `Start ${WORKER_NAME} via bgrun SDK`,
+      end: () => ({ config: WORKER_CONFIG_PATH, cwd: PROJECT_ROOT }),
+    },
+    async () => {
+      await handleRun({
+        action: "run",
+        name: WORKER_NAME,
+        command,
+        directory: PROJECT_ROOT,
+        configPath: WORKER_CONFIG_PATH,
+        force: false,
+        remoteName: "",
+      });
+      return true;
+    },
+  );
+
+  if (!started) throw new Error(`bgrun failed to start ${WORKER_NAME}`);
+
+  for (let attempt = 0; attempt < START_ATTEMPTS; attempt += 1) {
+    const proc = getProcess(WORKER_NAME) as any;
+    if (await processIsAlive(proc)) {
+      firstEnsure = false;
+      lifecycleMeasure.measureSync("Worker running", () => ({
+        name: WORKER_NAME,
+        pid: Number(proc.pid),
+      }));
+      return snapshot({
+        state: "running",
+        pid: Number(proc.pid),
+        error: null,
+      });
+    }
+    await sleep(START_POLL_MS);
+  }
+
+  throw new Error(
+    "bgrun created the worker record, but the process did not stay alive. Check `bgrun pumptv-worker --logs`.",
+  );
+}
+
 async function ensureOnce(): Promise<ManagedWorkerStatus> {
   try {
     const existing = getProcess(WORKER_NAME) as any;
     const alive = await processIsAlive(existing);
 
-    // A freshly-started web process refreshes an existing worker once so an edited
-    // .config.toml is applied. There is no nested `bgrun inline`: handleRun itself
-    // loads CONFIG_PATH relative to PROJECT_ROOT and injects the flattened env.
     if (alive && !firstEnsure) {
       return snapshot({
         state: "running",
@@ -124,47 +204,24 @@ async function ensureOnce(): Promise<ManagedWorkerStatus> {
       pid: alive ? Number(existing.pid) : null,
       error: null,
     });
-    console.log(
-      `[pumptv] ${alive ? "refreshing" : "starting"} ${WORKER_NAME} via bgrun SDK`,
-    );
-    const command = workerCommand();
-    console.log(
-      `[pumptv] worker cwd=${PROJECT_ROOT} config=${CONFIG_PATH} command=${command}`,
-    );
 
-    await handleRun({
-      action: "run",
-      name: WORKER_NAME,
-      command,
-      directory: PROJECT_ROOT,
-      configPath: CONFIG_PATH,
-      force: Boolean(existing),
-      remoteName: "",
-    });
-    firstEnsure = false;
-
-    for (let attempt = 0; attempt < 30; attempt += 1) {
-      const proc = getProcess(WORKER_NAME) as any;
-      if (await processIsAlive(proc)) {
-        console.log(
-          `[pumptv] ${WORKER_NAME} running via bgrun (pid ${proc.pid})`,
-        );
-        return snapshot({
-          state: "running",
-          pid: Number(proc.pid),
-          error: null,
-        });
-      }
-      await sleep(100);
+    // A new web owner must own a fresh worker because src/worker.ts watches its
+    // --owner-pid. Refresh it by PID only; never use bgrun force/port cleanup.
+    if (alive) {
+      lifecycleMeasure.measureSync("Refresh worker owner", () => ({
+        workerPid: Number(existing.pid),
+        webPid: process.pid,
+      }));
+      await stopWorkerPid(Number(existing.pid));
     }
 
-    throw new Error(
-      "bgrun created the worker record, but the process did not stay alive. Check `bunx bgrun pumptv-worker --logs`.",
-    );
+    return await startWorkerWithBgrun();
   } catch (error) {
     firstEnsure = false;
     const message = cleanError(error);
-    console.error(`[pumptv] worker manager error: ${message}`);
+    lifecycleMeasure.measureSync("Worker manager error", () => ({
+      error: message,
+    }));
     return snapshot({ state: "error", pid: null, error: message });
   }
 }

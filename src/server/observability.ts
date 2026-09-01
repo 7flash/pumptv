@@ -25,6 +25,8 @@ export const workerMeasure = createMeasure("worker");
 export const pumpMeasure = createMeasure("pumpfun");
 export const walletMeasure = createMeasure("wallet");
 export const arbitrationMeasure = createMeasure("arbitration");
+export const lifecycleMeasure = createMeasure("lifecycle");
+export const webMeasure = createMeasure("web");
 
 function requestTag() {
   return `req_${Math.random().toString(36).slice(2, 8)}`;

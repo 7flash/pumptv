@@ -1,0 +1,33 @@
+# PumpTV web/runtime config.
+# Copy to .config.toml for the web process.
+# Keep web-only launcher/server settings here. Do not copy a web port into
+# .worker.toml; bgrun manages the worker as a separate portless process.
+
+# Example web launcher values. bgrun flattens TOML sections to env vars.
+# If your TradJS deployment uses a different port variable/section, keep that
+# web-only setting in this file.
+[server]
+port = 3006
+
+[pumptv]
+db_path = ".data/pumptv.sqlite"
+room = "main"
+admin_token = ""
+resolution = "480P"
+
+# Browser state transport.
+long_poll_check_ms = 400
+long_poll_timeout_ms = 25000
+viewer_ttl_ms = 45000
+
+# Phantom/token-weighted proposal score.
+token_mint = ""
+solana_rpc_url = "https://api.mainnet-beta.solana.com"
+wallet_score_cache_ms = 20000
+
+# Shared worker ownership/health settings used by the web process.
+web_heartbeat_ttl_ms = 6000
+
+[measure]
+silent = 0
+timestamps = 1

@@ -35,7 +35,10 @@ async function safeExtract(videoUrl: string, frameType: VideoFrameType) {
   try {
     return await extractVideoFrame(videoUrl, frameType);
   } catch (error) {
-    console.error(`[frames] ${frameType} extraction failed`, error);
+    falMeasure.measureSync("Frame extraction fallback", () => ({
+      frameType,
+      error: error instanceof Error ? error.message : String(error),
+    }));
     return null;
   }
 }

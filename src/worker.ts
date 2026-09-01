@@ -3,6 +3,7 @@ import {
   stopPumpfunChatIngestor,
 } from "./server/pumpfun.ts";
 import { runRoomWorker, stopRoomWorker } from "./server/worker.ts";
+import { lifecycleMeasure } from "./server/observability.ts";
 
 function numericArg(name: string): number | null {
   const prefix = `--${name}=`;
@@ -35,13 +36,16 @@ function stop(reason = "signal") {
     clearInterval(ownerWatchdog);
     ownerWatchdog = null;
   }
-  console.log(`[worker] stopping · ${reason}`);
+  lifecycleMeasure.measureSync("Worker stopping", () => ({ reason }));
   stopPumpfunChatIngestor();
   stopRoomWorker();
 }
 
 if (ownerPid) {
-  console.log(`[worker] owned by web pid ${ownerPid}`);
+  lifecycleMeasure.measureSync("Worker owner attached", () => ({
+    webPid: ownerPid,
+    workerPid: process.pid,
+  }));
   ownerWatchdog = setInterval(() => {
     if (pidIsAlive(ownerPid)) return;
     stop(`web owner pid ${ownerPid} exited`);
@@ -50,9 +54,9 @@ if (ownerPid) {
     setTimeout(() => process.exit(0), 25);
   }, 500);
 } else {
-  console.warn(
-    "[worker] no --owner-pid supplied; refusing detached worker lifetime",
-  );
+  lifecycleMeasure.measureSync("Worker refused detached lifetime", () => ({
+    workerPid: process.pid,
+  }));
   setTimeout(() => {
     stop("missing web owner pid");
     process.exit(2);

@@ -7,5 +7,6 @@ dist/
 .DS_Store
 
 .config.toml
+.worker.toml
 bun.lock
 package-lock.json

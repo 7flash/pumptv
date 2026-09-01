@@ -1,0 +1,9 @@
+# PumpTV generation worker bgrun config.
+#
+# Deliberately contains no server/port settings. The worker inherits the
+# already-flattened PumpTV/FAL/JSX-AI environment from the web owner process.
+# Keeping this separate from .config.toml prevents a nested SDK start from
+# treating the web server's declared port as a worker port.
+
+[worker]
+managed = true

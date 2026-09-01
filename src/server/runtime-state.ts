@@ -5,13 +5,18 @@ import {
   getManagedWorkerStatus,
 } from "./worker-manager.ts";
 import { dbPath } from "./db.ts";
+import { webMeasure } from "./observability.ts";
 
 let announcedDbPath = false;
 
 export async function getRuntimeStreamState(): Promise<StreamState> {
   if (!announcedDbPath) {
     announcedDbPath = true;
-    console.log(`[pumptv] web db=${dbPath}`);
+    webMeasure.measureSync("PumpTV web runtime", () => ({
+      pid: process.pid,
+      db: dbPath,
+      room: process.env.PUMPTV_ROOM || "main",
+    }));
   }
   await ensureGenerationWorker();
   const state = await getStreamState();

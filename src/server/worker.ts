@@ -47,7 +47,7 @@ async function generationTick() {
 
   const webHeartbeat = Number(room.webHeartbeatAtMs || 0);
   if (!webHeartbeat || Date.now() - webHeartbeat > WEB_HEARTBEAT_TTL_MS) {
-    console.log(`[worker] web owner heartbeat lost; stopping worker`);
+    workerMeasure.measureSync("Web owner heartbeat lost; stopping worker");
     stopping = true;
     return { generated: false, sleepMs: 0 };
   }
@@ -169,9 +169,11 @@ async function generationTick() {
     } catch (error) {
       const failures = Number(lockedRoom.generationFailureCount || 0) + 1;
       const recovery = classifyGenerationFailure(error, failures);
-      console.error(
-        `[worker] generation paused · ${recovery.kind} · ${recovery.reason}`,
-      );
+      workerMeasure.measureSync("Generation paused", () => ({
+        kind: recovery.kind,
+        reason: recovery.reason,
+        retryAtMs: recovery.retryAtMs,
+      }));
       await setGenerationPause({ ...recovery, failureCount: failures });
       return {
         generated: false,
@@ -229,7 +231,9 @@ export async function runRoomWorker() {
         error instanceof Error
           ? error.message
           : String(error || "Unknown worker error");
-      console.error(`[worker] tick failed · ${message}`);
+      workerMeasure.measureSync("Worker tick failed", () => ({
+        error: message,
+      }));
       await setWorkerState("error", message);
       await sleep(ERROR_BACKOFF_MS);
     }

@@ -112,9 +112,11 @@ async function ingestMessage(message: PumpfunMessage) {
         }),
     );
     if (round)
-      console.log(
-        `[pumpfun] vote @${command.handle} ← @${author || authorAddress || "anonymous"}`,
-      );
+      pumpMeasure.measureSync("Chat vote accepted", () => ({
+        handle: command.handle,
+        voter: author || authorAddress || "anonymous",
+        round: round.id,
+      }));
     return;
   }
 
@@ -135,9 +137,11 @@ async function ingestMessage(message: PumpfunMessage) {
       }),
   );
   if (proposal)
-    console.log(
-      `[pumpfun] proposal #${proposal.id} · ${proposal.voteCount} vote(s) · ${proposal.text.slice(0, 120)}`,
-    );
+    pumpMeasure.measureSync("Chat proposal accepted", () => ({
+      id: proposal.id,
+      score: proposal.voteCount,
+      text: proposal.text.slice(0, 120),
+    }));
 }
 
 async function runLeasedSession() {
@@ -157,14 +161,14 @@ async function runLeasedSession() {
       signal: abort.signal,
       onMessage(message) {
         void ingestMessage(message).catch((error) => {
-          console.warn(
-            "[pumpfun] ignored chat prompt",
-            error instanceof Error ? error.message : error,
-          );
+          pumpMeasure.measureSync("Chat prompt ignored", () => ({
+            error: error instanceof Error ? error.message : String(error),
+          }));
         });
       },
       onState(state, error) {
-        if (state === "live") console.log(`[pumpfun] connected to ${MINT}`);
+        if (state === "live")
+          pumpMeasure.measureSync("Pump.fun connected", () => ({ mint: MINT }));
         setPumpChatLeaseState(owner, state, error || null);
       },
     });
@@ -187,9 +191,12 @@ export async function runPumpfunChatIngestor() {
     return;
   }
 
-  console.log(
-    `[pumpfun] adapter ${owner} watching ${MINT} · propose ${PREFIX ? JSON.stringify(PREFIX) : "ALL CHAT"} · vote ${JSON.stringify(VOTE_PREFIX)}`,
-  );
+  pumpMeasure.measureSync("Pump.fun adapter ready", () => ({
+    owner,
+    mint: MINT,
+    proposalPrefix: PREFIX || null,
+    votePrefix: VOTE_PREFIX || null,
+  }));
 
   while (!stopping) {
     const owned = await pumpMeasure.measure(
