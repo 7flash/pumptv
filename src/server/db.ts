@@ -81,6 +81,7 @@ const openedDb = dbMeasure.measureSync(
           authorAddress: z.string().nullable().default(null),
           sourceRoom: z.string().nullable().default(null),
           operatorVoteOverride: z.number().nullable().default(null),
+          ownerWeight: z.number().default(1),
         }),
         proposalVotes: z.object({
           roundId: z.number(),
@@ -89,6 +90,7 @@ const openedDb = dbMeasure.measureSync(
           voterHandle: z.string().nullable().default(null),
           source: z.enum(["web", "pumpfun"]).default("web"),
           sourceId: z.string().nullable().default(null),
+          weight: z.number().default(1),
         }),
         worldStateSnapshots: z.object({
           episode: z.number(),
@@ -138,6 +140,17 @@ const openedDb = dbMeasure.measureSync(
 if (!openedDb) throw new Error("Could not open SQLite database");
 export const db = openedDb;
 
+function ensureColumn(table: string, column: string, sqlType: string) {
+  const columns = db.raw<any>(`PRAGMA table_info(${table})`);
+  if (columns.some((row: any) => String(row.name) === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${sqlType}`);
+}
+
+dbMeasure.measureSync("Migrate weighted proposal board", () => {
+  ensureColumn("proposals", "ownerWeight", "REAL NOT NULL DEFAULT 1");
+  ensureColumn("proposalVotes", "weight", "REAL NOT NULL DEFAULT 1");
+});
+
 dbMeasure.measureSync("Create directive source index", () =>
   db.exec(
     `CREATE UNIQUE INDEX IF NOT EXISTS directives_source_source_id_unique
@@ -172,6 +185,14 @@ dbMeasure.measureSync("Create proposal voter handle index", () =>
   db.exec(
     `CREATE INDEX IF NOT EXISTS proposal_votes_round_handle_idx
      ON proposalVotes(roundId, voterHandle)`,
+  ),
+);
+
+dbMeasure.measureSync("Create one web proposal per identity index", () =>
+  db.exec(
+    `CREATE UNIQUE INDEX IF NOT EXISTS proposals_round_web_owner_unique
+     ON proposals(roundId, sourceId)
+     WHERE source = 'web' AND sourceId IS NOT NULL AND status = 'open'`,
   ),
 );
 

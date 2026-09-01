@@ -163,7 +163,7 @@ if (command === "status") {
   const before = Number(
     (
       db.raw<any>(
-        "SELECT COUNT(*) AS count FROM directives WHERE source = 'pumpfun' AND status IN ('queued', 'generating')",
+        "SELECT COUNT(*) AS count FROM directives WHERE status IN ('queued', 'generating')",
       )[0] || {}
     ).count || 0,
   );
@@ -174,7 +174,7 @@ if (command === "status") {
     db.exec(
       `UPDATE directives
        SET status = 'used', usedEpisode = NULL
-       WHERE source = 'pumpfun' AND status IN ('queued', 'generating')`,
+       WHERE status IN ('queued', 'generating')`,
     );
     db.exec(
       `UPDATE proposals SET status = 'lost'

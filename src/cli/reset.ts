@@ -101,7 +101,7 @@ try {
             db.exec(
               `UPDATE directives
                SET status = 'queued', usedEpisode = NULL
-               WHERE source = 'pumpfun' AND usedEpisode >= ${fromInternal}`,
+               WHERE usedEpisode >= ${fromInternal}`,
             );
           } else {
             // Default reset is a clean rewind. Removed episodes do not silently create
@@ -109,7 +109,7 @@ try {
             db.exec(
               `UPDATE directives
                SET status = 'used', usedEpisode = NULL
-               WHERE source = 'pumpfun' AND usedEpisode >= ${fromInternal}`,
+               WHERE usedEpisode >= ${fromInternal}`,
             );
           }
 
@@ -149,7 +149,7 @@ try {
         const queued = Number(
           (
             db.raw<any>(
-              "SELECT COUNT(*) AS count FROM directives WHERE source = 'pumpfun' AND status = 'queued'",
+              "SELECT COUNT(*) AS count FROM directives WHERE status = 'queued'",
             )[0] || {}
           ).count || 0,
         );

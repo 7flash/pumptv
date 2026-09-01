@@ -1,12 +1,15 @@
 import { httpMeasure } from "../../../src/server/observability.ts";
 import { sanitizeLine } from "../../../src/server/prompt.ts";
-import { castPumpfunVote } from "../../../src/server/repository.ts";
+import { castWebVote } from "../../../src/server/repository.ts";
+import {
+  normalizeSolanaAddress,
+  walletVotingPower,
+} from "../../../src/server/wallet-score.ts";
 
-function walletAddress(value: unknown) {
-  const address = sanitizeLine(String(value || ""), 64);
-  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address))
-    throw new Error("Connect a valid Solana wallet");
-  return address;
+function voterKey(value: unknown) {
+  const id = sanitizeLine(String(value || ""), 160);
+  if (!id) throw new Error("Missing viewer id");
+  return `web:${id}`;
 }
 
 export async function POST(request: Request) {
@@ -17,14 +20,14 @@ export async function POST(request: Request) {
     const proposalId = Number(body.proposalId);
     if (!Number.isSafeInteger(proposalId) || proposalId <= 0)
       throw new Error("Invalid proposal id");
-    const address = walletAddress(body.walletAddress);
+    const walletAddress = normalizeSolanaAddress(body.walletAddress);
+    const { power } = await walletVotingPower(walletAddress);
 
-    return castPumpfunVote({
+    return castWebVote({
       proposalId,
-      voterKey: `wallet:${address}`,
-      voterHandle: null,
-      sourceId: `web-vote:${address}:${crypto.randomUUID()}`,
-      source: "web",
+      voterKey: voterKey(body.viewerId),
+      weight: power,
+      walletAddress,
     });
   });
 

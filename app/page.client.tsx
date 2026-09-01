@@ -27,6 +27,8 @@ let soundEnabled = false;
 let captionsEnabled = true;
 let liveOverlayEnabled = true;
 let infoOpen = false;
+let playbackPaused = false;
+let pausedClipId: number | null = null;
 
 type TrayView = "ideas" | "world";
 type WalletState = "idle" | "connecting" | "connected" | "missing" | "error";
@@ -35,10 +37,15 @@ let trayOpen = false;
 let trayView: TrayView = "ideas";
 let walletState: WalletState = "idle";
 let walletAddress: string | null = null;
+let walletTokenBalance = 0;
+let walletPower = 1;
+let walletScoreLoading = false;
 let ideaDraft = "";
 let ideaSubmitting = false;
 let votePendingId: number | null = null;
 let participationError: string | null = null;
+let worldDetailId: string | null = null;
+let worldDetailKind: "location" | "character" | "prop" | null = null;
 
 type PhantomPublicKey = { toString(): string };
 type PhantomProvider = {
@@ -100,6 +107,12 @@ function replayClip() {
 }
 
 function desiredClip() {
+  if (playbackPaused && pausedClipId != null)
+    return (
+      timeline.find((clip) => clip.id === pausedClipId) ||
+      replayClip() ||
+      latestPublishedClip()
+    );
   return replayClip() || latestPublishedClip();
 }
 
@@ -272,6 +285,7 @@ function installPhantomEvents() {
     walletFromPublicKey(publicKey || provider.publicKey || null);
     participationError = null;
     redraw();
+    void refreshWalletScore();
   });
   provider.on("disconnect", () => {
     walletAddress = null;
@@ -280,7 +294,10 @@ function installPhantomEvents() {
   });
   provider.on("accountChanged", (publicKey) => {
     walletFromPublicKey(publicKey || provider.publicKey || null);
+    walletTokenBalance = 0;
+    walletPower = 1;
     redraw();
+    if (walletAddress) void refreshWalletScore();
   });
 }
 
@@ -305,6 +322,7 @@ async function connectPhantom(interactive: boolean) {
     );
     walletFromPublicKey(result?.publicKey || provider.publicKey || null);
     redraw();
+    if (walletAddress) await refreshWalletScore();
     return Boolean(walletAddress);
   } catch (cause: any) {
     walletAddress = null;
@@ -324,18 +342,55 @@ async function refreshStreamState() {
   } catch {}
 }
 
-async function ensureWallet() {
-  if (walletAddress) return walletAddress;
-  const connected = await connectPhantom(true);
-  return connected ? walletAddress : null;
+function ownerKey() {
+  return `web:${viewerId}`;
+}
+
+function currentBoardRound() {
+  return program?.votingRound || null;
+}
+
+function ownProposal() {
+  return (
+    currentBoardRound()?.proposals.find(
+      (proposal) =>
+        proposal.source === "web" && proposal.sourceId === ownerKey(),
+    ) || null
+  );
+}
+
+async function refreshWalletScore() {
+  if (!walletAddress || walletScoreLoading) return;
+  walletScoreLoading = true;
+  participationError = null;
+  redraw();
+  try {
+    const result = await json<{ tokenBalance: number; power: number }>(
+      "/api/wallet/score",
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ viewerId, walletAddress }),
+      },
+    );
+    walletTokenBalance = Number(result.tokenBalance || 0);
+    walletPower = Math.max(1, Number(result.power || 1));
+    await refreshStreamState();
+  } catch (cause) {
+    walletTokenBalance = 0;
+    walletPower = 1;
+    participationError =
+      cause instanceof Error ? cause.message : "Could not read token balance";
+  } finally {
+    walletScoreLoading = false;
+    redraw();
+  }
 }
 
 async function submitIdea() {
   if (ideaSubmitting) return;
   const text = ideaDraft.replace(/\s+/g, " ").trim().slice(0, 500);
   if (!text) return;
-  const address = await ensureWallet();
-  if (!address) return;
 
   ideaSubmitting = true;
   participationError = null;
@@ -344,15 +399,47 @@ async function submitIdea() {
     await json("/api/proposals", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text, walletAddress: address }),
+      body: JSON.stringify({ text, viewerId, walletAddress }),
     });
     ideaDraft = "";
-    trayOpen = true;
-    trayView = "ideas";
     await refreshStreamState();
   } catch (cause) {
     participationError =
-      cause instanceof Error ? cause.message : "Could not submit idea";
+      cause instanceof Error ? cause.message : "Could not save idea";
+  } finally {
+    ideaSubmitting = false;
+    redraw();
+  }
+}
+
+function editOwnIdea() {
+  const own = ownProposal();
+  if (!own) return;
+  ideaDraft = own.text;
+  redraw();
+  queueMicrotask(() => {
+    const input = document.querySelector<HTMLInputElement>("[data-idea-input]");
+    input?.focus();
+    input?.select();
+  });
+}
+
+async function cancelOwnIdea() {
+  if (ideaSubmitting || !ownProposal()) return;
+  ideaSubmitting = true;
+  participationError = null;
+  redraw();
+  try {
+    await json("/api/proposals", {
+      method: "DELETE",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ viewerId }),
+    });
+    ideaDraft = "";
+    await refreshStreamState();
+  } catch (cause) {
+    participationError =
+      cause instanceof Error ? cause.message : "Could not cancel idea";
   } finally {
     ideaSubmitting = false;
     redraw();
@@ -362,8 +449,6 @@ async function submitIdea() {
 async function voteForProposal(proposalId: number) {
   if (!Number.isSafeInteger(proposalId) || proposalId <= 0 || votePendingId)
     return;
-  const address = await ensureWallet();
-  if (!address) return;
 
   votePendingId = proposalId;
   participationError = null;
@@ -372,7 +457,7 @@ async function voteForProposal(proposalId: number) {
     await json("/api/votes", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ proposalId, walletAddress: address }),
+      body: JSON.stringify({ proposalId, viewerId, walletAddress }),
     });
     await refreshStreamState();
   } catch (cause) {
@@ -398,6 +483,146 @@ function openTray(view: TrayView) {
   redraw();
 }
 
+let richTooltipNode: HTMLDivElement | null = null;
+let richTooltipTarget: HTMLElement | null = null;
+let richTooltipInstalled = false;
+
+function ensureRichTooltip() {
+  if (richTooltipNode?.isConnected) return richTooltipNode;
+  const node = document.createElement("div");
+  node.className = "richHoverTooltip";
+  node.setAttribute("role", "tooltip");
+  node.setAttribute("aria-hidden", "true");
+  node.innerHTML = `
+    <img class="richTooltipImage" alt="" />
+    <div class="richTooltipCopy">
+      <strong class="richTooltipKicker"></strong>
+      <div class="richTooltipBody"></div>
+      <small class="richTooltipMeta"></small>
+    </div>`;
+  document.body.appendChild(node);
+  richTooltipNode = node;
+  return node;
+}
+
+function positionRichTooltip(target: HTMLElement) {
+  const tooltip = ensureRichTooltip();
+  const targetRect = target.getBoundingClientRect();
+  const tipRect = tooltip.getBoundingClientRect();
+  const gap = 12;
+  const edge = 10;
+  const preferred = target.dataset.tooltipSide || "auto";
+  const canLeft = targetRect.left - gap - tipRect.width >= edge;
+  const canRight =
+    targetRect.right + gap + tipRect.width <= window.innerWidth - edge;
+  const side =
+    preferred === "left" && canLeft
+      ? "left"
+      : preferred === "right" && canRight
+        ? "right"
+        : canLeft
+          ? "left"
+          : canRight
+            ? "right"
+            : "above";
+
+  let left = targetRect.left;
+  let top = targetRect.top;
+  if (side === "left") {
+    left = targetRect.left - tipRect.width - gap;
+    top = targetRect.top + targetRect.height / 2 - tipRect.height / 2;
+  } else if (side === "right") {
+    left = targetRect.right + gap;
+    top = targetRect.top + targetRect.height / 2 - tipRect.height / 2;
+  } else {
+    left = targetRect.left + targetRect.width / 2 - tipRect.width / 2;
+    top = targetRect.top - tipRect.height - gap;
+    if (top < edge) {
+      top = targetRect.bottom + gap;
+      tooltip.dataset.side = "below";
+    }
+  }
+  left = Math.max(
+    edge,
+    Math.min(window.innerWidth - tipRect.width - edge, left),
+  );
+  top = Math.max(
+    edge,
+    Math.min(window.innerHeight - tipRect.height - edge, top),
+  );
+  tooltip.style.left = `${Math.round(left)}px`;
+  tooltip.style.top = `${Math.round(top)}px`;
+  if (tooltip.dataset.side !== "below") tooltip.dataset.side = side;
+}
+
+function showRichTooltip(target: HTMLElement) {
+  const tooltip = ensureRichTooltip();
+  richTooltipTarget = target;
+  const image = tooltip.querySelector<HTMLImageElement>(".richTooltipImage");
+  const kicker = tooltip.querySelector<HTMLElement>(".richTooltipKicker");
+  const body = tooltip.querySelector<HTMLElement>(".richTooltipBody");
+  const meta = tooltip.querySelector<HTMLElement>(".richTooltipMeta");
+  const imageUrl = target.dataset.tooltipImage || "";
+  if (image) {
+    image.src = imageUrl;
+    image.style.display = imageUrl ? "block" : "none";
+  }
+  if (kicker) kicker.textContent = target.dataset.tooltipKicker || "";
+  if (body) body.textContent = target.dataset.tooltipBody || "";
+  if (meta) meta.textContent = target.dataset.tooltipMeta || "";
+  tooltip.classList.toggle("hasImage", Boolean(imageUrl));
+  tooltip.classList.add("visible");
+  tooltip.setAttribute("aria-hidden", "false");
+  requestAnimationFrame(() => {
+    if (richTooltipTarget === target && target.isConnected)
+      positionRichTooltip(target);
+  });
+}
+
+function hideRichTooltip(target?: HTMLElement | null) {
+  if (target && richTooltipTarget && target !== richTooltipTarget) return;
+  richTooltipTarget = null;
+  const tooltip = richTooltipNode;
+  if (!tooltip) return;
+  tooltip.classList.remove("visible");
+  tooltip.setAttribute("aria-hidden", "true");
+}
+
+function installRichTooltips() {
+  if (richTooltipInstalled) return;
+  richTooltipInstalled = true;
+  const tooltipTarget = (value: EventTarget | null) =>
+    value instanceof Element
+      ? value.closest<HTMLElement>("[data-rich-tooltip]")
+      : null;
+
+  document.addEventListener("pointerover", (event) => {
+    const target = tooltipTarget(event.target);
+    if (target) showRichTooltip(target);
+  });
+  document.addEventListener("pointerout", (event) => {
+    const target = tooltipTarget(event.target);
+    if (!target) return;
+    const related =
+      event.relatedTarget instanceof Element ? event.relatedTarget : null;
+    if (related && target.contains(related)) return;
+    hideRichTooltip(target);
+  });
+  document.addEventListener("focusin", (event) => {
+    const target = tooltipTarget(event.target);
+    if (target) showRichTooltip(target);
+  });
+  document.addEventListener("focusout", (event) => {
+    const target = tooltipTarget(event.target);
+    if (target) hideRichTooltip(target);
+  });
+  window.addEventListener("resize", () => {
+    if (richTooltipTarget?.isConnected) positionRichTooltip(richTooltipTarget);
+    else hideRichTooltip();
+  });
+  window.addEventListener("scroll", () => hideRichTooltip(), true);
+}
+
 function readPref(key: string, fallback: boolean) {
   const value = localStorage.getItem(key);
   return value == null ? fallback : value === "1";
@@ -413,6 +638,7 @@ function syncLocalUiState() {
   html.dataset.pumptvCaptions = captionsEnabled ? "on" : "off";
   html.dataset.pumptvOverlay = liveOverlayEnabled ? "on" : "off";
   html.dataset.pumptvInfo = infoOpen ? "open" : "closed";
+  html.dataset.pumptvPlayback = playbackPaused ? "paused" : "playing";
   html.dataset.pumptvMode = replayClipId == null ? "live" : "replay";
   html.dataset.pumptvSlot = replayClipId == null ? liveSlotState : "replay";
 
@@ -421,15 +647,17 @@ function syncLocalUiState() {
     .forEach((control) => {
       const name = control.dataset.control;
       const active =
-        name === "sound"
-          ? soundEnabled
-          : name === "captions"
-            ? captionsEnabled
-            : name === "overlay"
-              ? liveOverlayEnabled
-              : name === "info"
-                ? infoOpen
-                : false;
+        name === "playback"
+          ? !playbackPaused
+          : name === "sound"
+            ? soundEnabled
+            : name === "captions"
+              ? captionsEnabled
+              : name === "overlay"
+                ? liveOverlayEnabled
+                : name === "info"
+                  ? infoOpen
+                  : false;
       control.classList.toggle("on", active);
       if (name !== "fullscreen")
         control.setAttribute("aria-pressed", String(active));
@@ -478,10 +706,17 @@ function syncCurrentPromptDom() {
   else prompt.setAttribute("data-empty", "");
   if (text) text.textContent = clip?.directive || "";
   if (author) author.textContent = clip ? clipAuthor(clip) : "";
-  prompt.setAttribute(
-    "title",
-    clip ? `Episode ${clip.episode + 1} · ${clipAuthor(clip)}` : "",
-  );
+  if (clip) {
+    prompt.dataset.richTooltip = "1";
+    prompt.dataset.tooltipKicker = `EP ${clip.episode + 1}`;
+    prompt.dataset.tooltipBody = clip.directive || "";
+    prompt.dataset.tooltipMeta = clipAuthor(clip);
+  } else {
+    delete prompt.dataset.richTooltip;
+    delete prompt.dataset.tooltipKicker;
+    delete prompt.dataset.tooltipBody;
+    delete prompt.dataset.tooltipMeta;
+  }
 }
 
 function syncLocalPresentation() {
@@ -505,6 +740,7 @@ function ensureViewerIdAndPrefs() {
 async function boot() {
   ensureViewerIdAndPrefs();
   installInteractionLayer();
+  installRichTooltips();
   installPhantomEvents();
   syncLocalUiState();
   redraw();
@@ -743,6 +979,10 @@ async function activateVideoSlot(
     // the 100ms media synchronizer runs again.
     const parkedAtLiveEdge =
       replayClipId == null && liveSlotState === "intermission";
+    if (playbackPaused) {
+      if (!video.paused) video.pause();
+      return;
+    }
     if (
       !parkedAtLiveEdge &&
       video.paused &&
@@ -1062,6 +1302,28 @@ function handleDeckEnded(slot: number, clipId: number) {
   }
 }
 
+function togglePlayback() {
+  if (!playbackPaused) {
+    playbackPaused = true;
+    pausedClipId = visibleClip()?.id ?? desiredClip()?.id ?? null;
+    const active = videoNodes()[activeVideoSlot];
+    if (active && !active.paused) active.pause();
+    syncLocalUiState();
+    redraw();
+    return;
+  }
+
+  playbackPaused = false;
+  pausedClipId = null;
+  if (replayClipId == null) liveSlotState = "playing";
+  switchSerial += 1;
+  pendingActivation = null;
+  syncLocalUiState();
+  primeDesiredPlaybackFromGesture();
+  syncVideoDeck();
+  redraw();
+}
+
 function toggleSound() {
   soundEnabled = !soundEnabled;
   writePref("pumptv-v25-sound", soundEnabled);
@@ -1122,6 +1384,8 @@ function updateLiveMeters() {
 
 function jumpToEpisode(id: number) {
   if (!timeline.some((clip) => clip.id === id)) return;
+  playbackPaused = false;
+  pausedClipId = null;
   const live = latestPublishedClip();
   replayClipId = live?.id === id ? null : id;
   if (replayClipId == null) liveSlotState = "playing";
@@ -1135,6 +1399,8 @@ function jumpToEpisode(id: number) {
 }
 
 function returnLive() {
+  playbackPaused = false;
+  pausedClipId = null;
   replayClipId = null;
   // Returning to live starts the latest archive episode cleanly. The ended
   // edge will switch back to intermission when that episode actually finishes.
@@ -1165,7 +1431,8 @@ function installInteractionLayer() {
       if (!action) return;
       event.preventDefault();
 
-      if (action === "sound") toggleSound();
+      if (action === "playback") togglePlayback();
+      else if (action === "sound") toggleSound();
       else if (action === "captions") toggleCaptions();
       else if (action === "overlay") toggleLiveOverlay();
       else if (action === "info") toggleInfo();
@@ -1179,7 +1446,19 @@ function installInteractionLayer() {
       else if (action === "tray-world") openTray("world");
       else if (action === "wallet") void connectPhantom(true);
       else if (action === "submit-idea") void submitIdea();
-      else if (action === "vote") {
+      else if (action === "edit-own") editOwnIdea();
+      else if (action === "cancel-own") void cancelOwnIdea();
+      else if (action === "world-detail") {
+        const kind = control.dataset.worldKind as
+          "location" | "character" | "prop" | undefined;
+        worldDetailKind = kind || null;
+        worldDetailId = control.dataset.worldId || null;
+        redraw();
+      } else if (action === "close-world-detail") {
+        worldDetailKind = null;
+        worldDetailId = null;
+        redraw();
+      } else if (action === "vote") {
         const id = Number(control.dataset.proposalId);
         if (Number.isSafeInteger(id)) void voteForProposal(id);
       } else if (action === "fullscreen") void toggleFullscreen();
@@ -1216,7 +1495,14 @@ function installInteractionLayer() {
   );
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape" && infoOpen) {
+    if (event.key !== "Escape") return;
+    if (worldDetailKind) {
+      worldDetailKind = null;
+      worldDetailId = null;
+      redraw();
+      return;
+    }
+    if (infoOpen) {
       infoOpen = false;
       syncLocalUiState();
     }
@@ -1287,10 +1573,25 @@ function tooltipStatus() {
   return "Waiting for Pump.fun suggestions";
 }
 
-type ControlIconName = "sound" | "captions" | "overlay" | "info" | "fullscreen";
-type ControlAction = "sound" | "captions" | "overlay" | "info" | "fullscreen";
+type ControlIconName =
+  "playback" | "sound" | "captions" | "overlay" | "info" | "fullscreen";
+type ControlAction =
+  "playback" | "sound" | "captions" | "overlay" | "info" | "fullscreen";
 
 function ControlIcon({ name }: { name: ControlIconName }) {
+  if (name === "playback")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        {playbackPaused ? (
+          <path d="M8 5v14l11-7-11-7Z" />
+        ) : (
+          <>
+            <rect x="7" y="5" width="3.5" height="14" rx="1" />
+            <rect x="13.5" y="5" width="3.5" height="14" rx="1" />
+          </>
+        )}
+      </svg>
+    );
   if (name === "sound")
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -1348,7 +1649,10 @@ function KnobControl(props: {
       type="button"
       data-action={props.action}
       data-control={props.action}
-      title={props.title}
+      data-rich-tooltip="1"
+      data-tooltip-kicker="CONTROL"
+      data-tooltip-body={props.title}
+      data-tooltip-side="left"
       aria-label={props.title}
       aria-pressed={Boolean(props.active)}
     >
@@ -1523,7 +1827,9 @@ function OutsideTool(props: {
       type="button"
       data-action={props.action}
       data-control={props.action}
-      title={props.title}
+      data-rich-tooltip="1"
+      data-tooltip-kicker="CONTROL"
+      data-tooltip-body={props.title}
       aria-label={props.title}
       aria-pressed={Boolean(props.active)}
     >
@@ -1883,11 +2189,371 @@ function CurrentPrompt({ clip }: { clip: Clip | null }) {
       className="currentPrompt"
       data-current-prompt
       data-empty={clip ? undefined : ""}
-      title={clip ? `Episode ${clip.episode + 1} · ${clipAuthor(clip)}` : ""}
+      data-rich-tooltip={clip ? "1" : undefined}
+      data-tooltip-kicker={clip ? `EP ${clip.episode + 1}` : undefined}
+      data-tooltip-body={clip?.directive || undefined}
+      data-tooltip-meta={clip ? clipAuthor(clip) : undefined}
     >
       <span data-current-prompt-text>{clip?.directive || ""}</span>
       <i data-current-prompt-author>{clip ? clipAuthor(clip) : ""}</i>
     </div>
+  );
+}
+
+function formatScore(value: number) {
+  const score = Math.max(0, Number(value || 0));
+  if (score < 1_000)
+    return score < 10 && score % 1
+      ? score.toFixed(1)
+      : Math.round(score).toString();
+  if (score < 1_000_000)
+    return `${(score / 1_000).toFixed(score < 10_000 ? 1 : 0)}K`;
+  if (score < 1_000_000_000)
+    return `${(score / 1_000_000).toFixed(score < 10_000_000 ? 1 : 0)}M`;
+  return `${(score / 1_000_000_000).toFixed(score < 10_000_000_000 ? 1 : 0)}B`;
+}
+
+type BoardIconName = "viewer" | "wallet" | "send" | "edit" | "cancel" | "world";
+
+function BoardIcon({ name }: { name: BoardIconName }) {
+  if (name === "viewer")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path
+          className="stroke"
+          d="M3.5 12s3.2-5 8.5-5 8.5 5 8.5 5-3.2 5-8.5 5-8.5-5-8.5-5Z"
+        />
+        <circle className="stroke" cx="12" cy="12" r="2.2" />
+      </svg>
+    );
+  if (name === "wallet") return <TrayIcon name="wallet" />;
+  if (name === "send") return <TrayIcon name="send" />;
+  if (name === "edit")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path className="stroke" d="m5 17-.7 3.7L8 20l10.5-10.5-3-3L5 17Z" />
+      </svg>
+    );
+  if (name === "cancel")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path className="stroke" d="m7 7 10 10M17 7 7 17" />
+      </svg>
+    );
+  return <TrayIcon name="world" />;
+}
+
+function ProposalCard({
+  proposal,
+  own = false,
+}: {
+  proposal: PromptProposal;
+  own?: boolean;
+  key?: unknown;
+}) {
+  const pending = votePendingId === proposal.id;
+  return (
+    <div
+      className={`persistentProposal ${own ? "own" : ""} ${pending ? "pending" : ""}`}
+      data-action={own ? undefined : "vote"}
+      data-proposal-id={own ? undefined : proposal.id}
+      role={own ? undefined : "button"}
+      tabIndex={own ? undefined : 0}
+      data-rich-tooltip="1"
+      data-tooltip-kicker={own ? "YOUR IDEA" : "SUGGESTION"}
+      data-tooltip-body={proposal.text}
+      data-tooltip-meta={`${authorLabel(proposal.author, proposal.authorAddress)} · ${formatScore(proposal.voteCount)} pts${own ? " · edit or cancel" : " · click to vote"}`}
+    >
+      <div className="persistentProposalText">
+        <span>{proposal.text}</span>
+        {proposal.author || proposal.authorAddress ? (
+          <i>{authorLabel(proposal.author, proposal.authorAddress)}</i>
+        ) : null}
+      </div>
+      <b>{formatScore(proposal.voteCount)}</b>
+      {own ? (
+        <div className="ownIdeaActions">
+          <button
+            type="button"
+            data-action="edit-own"
+            data-rich-tooltip="1"
+            data-tooltip-kicker="IDEA"
+            data-tooltip-body="Edit"
+            aria-label="Edit idea"
+          >
+            <BoardIcon name="edit" />
+          </button>
+          <button
+            type="button"
+            data-action="cancel-own"
+            data-rich-tooltip="1"
+            data-tooltip-kicker="IDEA"
+            data-tooltip-body="Cancel"
+            aria-label="Cancel idea"
+          >
+            <BoardIcon name="cancel" />
+          </button>
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function PersistentIdeas() {
+  const round = currentBoardRound();
+  const own = ownProposal();
+  const others = sortedCandidates(round).filter(
+    (proposal) => proposal.id !== own?.id,
+  );
+  return (
+    <section className="persistentIdeas" aria-label="Suggestions">
+      <form className="persistentIdeaForm" data-idea-form>
+        <input
+          data-idea-input
+          value={ideaDraft}
+          maxLength={500}
+          autoComplete="off"
+          spellCheck="true"
+          placeholder={own ? "edit your idea" : "what happens next?"}
+          aria-label="Your idea"
+          disabled={ideaSubmitting}
+        />
+        <button
+          type="submit"
+          data-action="submit-idea"
+          disabled={ideaSubmitting || !ideaDraft.trim()}
+          data-rich-tooltip="1"
+          data-tooltip-kicker="IDEA"
+          data-tooltip-body={own ? "Save changes" : "Submit suggestion"}
+          aria-label={own ? "Save idea" : "Submit idea"}
+        >
+          <BoardIcon name="send" />
+        </button>
+      </form>
+      {own ? <ProposalCard proposal={own} own /> : null}
+      <div className="persistentProposalList">
+        {others.map((proposal) => (
+          <ProposalCard key={proposal.id} proposal={proposal} />
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function worldDetail() {
+  if (!worldState || !worldDetailKind) return null;
+  if (worldDetailKind === "location")
+    return {
+      title: worldState.location,
+      lines: [worldState.locationDetails, worldState.lastEndingBeat].filter(
+        Boolean,
+      ),
+    };
+  if (worldDetailKind === "character") {
+    const item = worldState.characters.find(
+      (character) => character.id === worldDetailId,
+    );
+    return item
+      ? {
+          title: item.name,
+          lines: [
+            item.appearance,
+            item.wardrobe,
+            item.status,
+            item.position,
+          ].filter(Boolean),
+        }
+      : null;
+  }
+  const item = worldState.props.find((prop) => prop.id === worldDetailId);
+  return item
+    ? {
+        title: item.name,
+        lines: [item.description, item.status, item.position].filter(Boolean),
+      }
+    : null;
+}
+
+function WorldDetailModal() {
+  const detail = worldDetail();
+  if (!detail) return null;
+  return (
+    <div className="worldDetailShade" role="presentation">
+      <article
+        className="worldDetailModal"
+        role="dialog"
+        aria-modal="true"
+        aria-label={detail.title || "World detail"}
+      >
+        <button
+          type="button"
+          data-action="close-world-detail"
+          aria-label="Close"
+          data-rich-tooltip="1"
+          data-tooltip-kicker="WORLD"
+          data-tooltip-body="Close"
+        >
+          ×
+        </button>
+        <b>{detail.title || "—"}</b>
+        {detail.lines.map((line, index) => (
+          <p key={`${index}:${line}`}>{line}</p>
+        ))}
+      </article>
+    </div>
+  );
+}
+
+function PersistentWorld() {
+  if (!worldState) return <section className="persistentWorld" />;
+  return (
+    <section className="persistentWorld" aria-label="World state">
+      <button
+        type="button"
+        className="worldLocationCard"
+        data-action="world-detail"
+        data-world-kind="location"
+        data-world-id="location"
+        data-rich-tooltip="1"
+        data-tooltip-kicker={worldState.location || "WORLD"}
+        data-tooltip-body={
+          worldState.locationDetails || worldState.lastEndingBeat || ""
+        }
+        data-tooltip-meta={worldState.lastEndingBeat || ""}
+      >
+        <b>{worldState.location || "—"}</b>
+        {worldState.lastEndingBeat ? (
+          <span>{worldState.lastEndingBeat}</span>
+        ) : null}
+      </button>
+      {worldState.characters.length ? (
+        <div className="persistentWorldItems">
+          {worldState.characters.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              data-action="world-detail"
+              data-world-kind="character"
+              data-world-id={item.id}
+              data-rich-tooltip="1"
+              data-tooltip-kicker={item.name}
+              data-tooltip-body={[item.appearance, item.wardrobe]
+                .filter(Boolean)
+                .join("\n")}
+              data-tooltip-meta={[item.status, item.position]
+                .filter(Boolean)
+                .join(" · ")}
+            >
+              <b>{item.name}</b>
+              <span>{item.status}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {worldState.props.length ? (
+        <div className="persistentWorldItems props">
+          {worldState.props.map((item) => (
+            <button
+              key={item.id}
+              type="button"
+              data-action="world-detail"
+              data-world-kind="prop"
+              data-world-id={item.id}
+              data-rich-tooltip="1"
+              data-tooltip-kicker={item.name}
+              data-tooltip-body={item.description}
+              data-tooltip-meta={[item.status, item.position]
+                .filter(Boolean)
+                .join(" · ")}
+            >
+              <b>{item.name}</b>
+              <span>{item.status}</span>
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {worldState.openThreads.length ? (
+        <div className="persistentThreads">
+          {worldState.openThreads.slice(0, 8).map((thread) => (
+            <span key={thread}>{thread}</span>
+          ))}
+        </div>
+      ) : null}
+    </section>
+  );
+}
+
+function ParticipationBoard() {
+  const round = currentBoardRound();
+  const targetEpisode = round?.targetEpisode ?? program?.targetEpisode ?? 0;
+  const walletTitle = walletAddress
+    ? `${shortAddress(walletAddress)} · ${walletTokenBalance} tokens · score ${walletPower}`
+    : "Connect Phantom";
+  return (
+    <section className="participationBoard">
+      <div className="participationMeta">
+        <span
+          className="viewerMetric"
+          data-rich-tooltip="1"
+          data-tooltip-kicker="LIVE"
+          data-tooltip-body={`${room?.viewerCount ?? 0} viewers`}
+        >
+          <BoardIcon name="viewer" />
+          <b>{room?.viewerCount ?? 0}</b>
+        </span>
+        <span
+          className="episodeMetric"
+          data-rich-tooltip="1"
+          data-tooltip-kicker={`EP ${targetEpisode + 1}`}
+          data-tooltip-body="Next episode"
+        >
+          <b>{targetEpisode + 1}</b>
+          {round?.votingStartedAtMs && round.closesAtMs > liveNowMs() ? (
+            <strong data-vote-countdown>
+              {formatClock(round.closesAtMs - liveNowMs())}
+            </strong>
+          ) : null}
+        </span>
+        <button
+          type="button"
+          className={`walletMetric ${walletAddress ? "connected" : ""}`}
+          data-action="wallet"
+          data-rich-tooltip="1"
+          data-tooltip-kicker={walletAddress ? "PHANTOM" : "WALLET"}
+          data-tooltip-body={
+            walletAddress
+              ? shortAddress(walletAddress) || "Connected"
+              : "Connect Phantom"
+          }
+          data-tooltip-meta={
+            walletAddress
+              ? `${formatScore(walletTokenBalance)} tokens · ${formatScore(walletPower)} score`
+              : "Optional score boost"
+          }
+          aria-label={walletTitle}
+        >
+          <BoardIcon name="wallet" />
+          {walletAddress ? (
+            <b>{walletScoreLoading ? "…" : formatScore(walletPower)}</b>
+          ) : null}
+        </button>
+        {participationError ? (
+          <i
+            className="participationError"
+            data-rich-tooltip="1"
+            data-tooltip-kicker="ERROR"
+            data-tooltip-body={participationError}
+          >
+            !
+          </i>
+        ) : null}
+      </div>
+      <div className="participationColumns">
+        <PersistentWorld />
+        <PersistentIdeas />
+      </div>
+      <WorldDetailModal />
+    </section>
   );
 }
 
@@ -1904,7 +2570,12 @@ function TactileTV({ clip }: { clip: Clip | null }) {
       <div className="tvScreenFrame">
         <div className="tvGlass">
           {!clip ? (
-            <div className="tvIdle" title={tooltipStatus()}>
+            <div
+              className="tvIdle"
+              data-rich-tooltip="1"
+              data-tooltip-kicker="PUMPTV"
+              data-tooltip-body={tooltipStatus()}
+            >
               <div className={`idleOrb ${state}`}>
                 <span>●</span>
               </div>
@@ -1917,7 +2588,9 @@ function TactileTV({ clip }: { clip: Clip | null }) {
               className="liveReturn"
               type="button"
               data-action="live"
-              title="Return to live"
+              data-rich-tooltip="1"
+              data-tooltip-kicker="LIVE"
+              data-tooltip-body="Return to live"
               aria-label="Return to live"
             >
               ●
@@ -1929,10 +2602,19 @@ function TactileTV({ clip }: { clip: Clip | null }) {
       <div className="tvHardware">
         <button
           className={`powerLamp ${state}`}
-          title={tooltipStatus()}
+          data-rich-tooltip="1"
+          data-tooltip-kicker="STATUS"
+          data-tooltip-body={tooltipStatus()}
+          data-tooltip-side="left"
           aria-label={tooltipStatus()}
         />
         <div className="knobStack">
+          <KnobControl
+            active={!playbackPaused}
+            title={playbackPaused ? "Play" : "Pause"}
+            icon="playback"
+            action="playback"
+          />
           <KnobControl
             active={soundEnabled}
             title={soundEnabled ? "Mute" : "Unmute"}
@@ -1982,7 +2664,13 @@ function ProgramShelfSlot() {
   return (
     <div
       className={`programShelfSlot phase-${phase}`}
-      title={title}
+      data-rich-tooltip="1"
+      data-tooltip-kicker={`EP ${program.targetEpisode + 1}`}
+      data-tooltip-body={title}
+      data-tooltip-meta={
+        candidateCount > 0 ? `${candidateCount} suggestions` : ""
+      }
+      data-tooltip-side="left"
       aria-label={title}
     >
       <span className="programShelfVisual">
@@ -2001,18 +2689,29 @@ function EpisodeShelf() {
 
   return (
     <aside className="episodeShelf" aria-label="Episodes">
-      <div className="brandStamp" title="PumpTV">
+      <div
+        className="brandStamp"
+        data-rich-tooltip="1"
+        data-tooltip-kicker="PUMPTV"
+        data-tooltip-body="Live generative television"
+        data-tooltip-side="left"
+      >
         <span>P</span>
       </div>
       <button
         className={`liveCap ${replayClipId == null ? "active" : ""}`}
         type="button"
         data-action="live"
-        title="Live"
+        data-rich-tooltip="1"
+        data-tooltip-kicker="LIVE"
+        data-tooltip-body={live?.directive || "Current episode"}
+        data-tooltip-meta={
+          live ? `EP ${live.episode + 1} · ${clipAuthor(live)}` : ""
+        }
+        data-tooltip-side="left"
         aria-label="Live"
       >
         <span>●</span>
-        <b>{room?.viewerCount ?? 0}</b>
       </button>
       <div className="episodeList">
         <ProgramShelfSlot />
@@ -2027,7 +2726,24 @@ function EpisodeShelf() {
               type="button"
               data-action="episode"
               data-episode-id={clip.id}
-              title={`Episode ${clip.episode + 1} · ${clip.directive}`}
+              data-rich-tooltip="1"
+              data-tooltip-kicker={`EP ${clip.episode + 1}${isLive ? " · LIVE" : ""}`}
+              data-tooltip-body={clip.directive}
+              data-tooltip-meta={[
+                clipAuthor(clip),
+                clip.directiveVoteCount == null
+                  ? null
+                  : `${formatScore(clip.directiveVoteCount)} pts`,
+                clip.resolution,
+                clip.generationMode,
+                clip.totalGenerationMs == null
+                  ? null
+                  : `${(clip.totalGenerationMs / 1000).toFixed(1)}s gen`,
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+              data-tooltip-image={thumb || undefined}
+              data-tooltip-side="left"
               aria-label={`Episode ${clip.episode + 1}`}
             >
               <span className="episodeThumb">
@@ -2041,11 +2757,17 @@ function EpisodeShelf() {
       </div>
       <div
         className={`pumpLink ${room?.pumpfun.state || "disabled"}`}
-        title={
+        data-rich-tooltip="1"
+        data-tooltip-kicker="PUMP.FUN"
+        data-tooltip-body={
           room?.pumpfun.enabled
-            ? `Pump.fun chat: ${room.pumpfun.state}`
-            : "Pump.fun mint not configured"
+            ? `Chat ${room.pumpfun.state}`
+            : "Chat not configured"
         }
+        data-tooltip-meta={
+          room?.pumpfun.mint ? shortAddress(room.pumpfun.mint) || "" : ""
+        }
+        data-tooltip-side="left"
       >
         $
       </div>
@@ -2056,6 +2778,116 @@ function EpisodeShelf() {
 function OutsideInterfaceStyles() {
   return (
     <style>{`
+      .richHoverTooltip {
+        position: fixed;
+        z-index: 9999;
+        width: min(350px, calc(100vw - 20px));
+        min-height: 54px;
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 0;
+        padding: 9px;
+        border: 1px solid rgba(255,255,255,.16);
+        border-radius: 14px;
+        background:
+          linear-gradient(180deg, rgba(34,36,43,.96), rgba(13,14,18,.96));
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.08),
+          0 18px 60px rgba(0,0,0,.5),
+          0 0 0 1px rgba(0,0,0,.2);
+        color: rgba(255,255,255,.94);
+        backdrop-filter: blur(22px) saturate(1.2);
+        pointer-events: none;
+        opacity: 0;
+        visibility: hidden;
+        transform: translateY(3px) scale(.985);
+        transform-origin: center;
+        transition: opacity 110ms ease, transform 110ms ease, visibility 110ms linear;
+      }
+
+      .richHoverTooltip.visible {
+        opacity: 1;
+        visibility: visible;
+        transform: translateY(0) scale(1);
+      }
+
+      .richHoverTooltip.hasImage {
+        grid-template-columns: 112px minmax(0,1fr);
+        gap: 10px;
+      }
+
+      .richTooltipImage {
+        width: 112px;
+        height: 70px;
+        object-fit: cover;
+        border-radius: 9px;
+        background: rgba(255,255,255,.035);
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,.08);
+      }
+
+      .richTooltipCopy {
+        min-width: 0;
+        display: grid;
+        align-content: center;
+        gap: 5px;
+        padding: 1px 2px;
+      }
+
+      .richTooltipKicker {
+        font: 780 9px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        letter-spacing: .11em;
+        color: rgba(255,255,255,.52);
+      }
+
+      .richTooltipBody {
+        white-space: pre-line;
+        overflow-wrap: anywhere;
+        font-size: 12px;
+        line-height: 1.4;
+        color: rgba(255,255,255,.94);
+      }
+
+      .richTooltipMeta {
+        white-space: pre-line;
+        overflow-wrap: anywhere;
+        font: 650 9px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        color: rgba(255,255,255,.46);
+      }
+
+      .richHoverTooltip::after {
+        content: "";
+        position: absolute;
+        width: 9px;
+        height: 9px;
+        background: rgba(22,23,28,.96);
+        border: solid rgba(255,255,255,.13);
+        transform: rotate(45deg);
+      }
+
+      .richHoverTooltip[data-side="left"]::after {
+        right: -5px;
+        top: calc(50% - 5px);
+        border-width: 1px 1px 0 0;
+      }
+
+      .richHoverTooltip[data-side="right"]::after {
+        left: -5px;
+        top: calc(50% - 5px);
+        border-width: 0 0 1px 1px;
+      }
+
+      .richHoverTooltip[data-side="above"]::after {
+        left: calc(50% - 5px);
+        bottom: -5px;
+        border-width: 0 1px 1px 0;
+      }
+
+      .richHoverTooltip[data-side="below"]::after {
+        left: calc(50% - 5px);
+        top: -5px;
+        border-width: 1px 0 0 1px;
+      }
+
       .outsideConsole {
         width: min(980px, calc(100vw - 150px));
         margin: 12px auto 0;
@@ -2694,7 +3526,349 @@ function OutsideInterfaceStyles() {
         opacity: .7;
       }
 
+      .participationBoard {
+        width: min(1040px, calc(100vw - 150px));
+        margin: 12px auto 0;
+        position: relative;
+        z-index: 8;
+        border: 1px solid rgba(255,255,255,.11);
+        border-radius: 18px;
+        background: rgba(9,10,13,.72);
+        box-shadow: inset 0 1px rgba(255,255,255,.035), 0 15px 45px rgba(0,0,0,.2);
+        backdrop-filter: blur(18px);
+      }
+
+      .participationMeta {
+        min-height: 42px;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 6px 9px;
+        border-bottom: 1px solid rgba(255,255,255,.07);
+      }
+
+      .participationMeta svg,
+      .persistentIdeaForm svg,
+      .ownIdeaActions svg {
+        width: 17px;
+        height: 17px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.7;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .viewerMetric,
+      .episodeMetric,
+      .walletMetric {
+        height: 30px;
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+        color: rgba(255,255,255,.62);
+        font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      .viewerMetric svg,
+      .walletMetric svg { width: 16px; height: 16px; }
+
+      .episodeMetric {
+        margin-left: auto;
+        gap: 8px;
+      }
+
+      .episodeMetric > strong { opacity: .88; }
+
+      .walletMetric {
+        border: 1px solid transparent;
+        border-radius: 10px;
+        padding: 0 8px;
+        background: transparent;
+        cursor: pointer;
+      }
+
+      .walletMetric:hover,
+      .walletMetric.connected {
+        border-color: rgba(255,255,255,.1);
+        background: rgba(255,255,255,.04);
+        color: rgba(255,255,255,.84);
+      }
+
+      .participationError {
+        width: 20px;
+        height: 20px;
+        display: grid;
+        place-items: center;
+        border-radius: 50%;
+        background: rgba(255,255,255,.08);
+        font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-style: normal;
+      }
+
+      .participationColumns {
+        display: grid;
+        grid-template-columns: minmax(0, .92fr) minmax(0, 1.08fr);
+        min-height: 230px;
+      }
+
+      .persistentWorld,
+      .persistentIdeas {
+        min-width: 0;
+        padding: 12px;
+      }
+
+      .persistentWorld {
+        border-right: 1px solid rgba(255,255,255,.07);
+        display: grid;
+        align-content: start;
+        gap: 8px;
+      }
+
+      .worldLocationCard,
+      .persistentWorldItems > button {
+        width: 100%;
+        text-align: left;
+        border: 1px solid transparent;
+        color: inherit;
+        background: rgba(255,255,255,.025);
+        cursor: pointer;
+      }
+
+      .worldLocationCard {
+        display: grid;
+        gap: 5px;
+        padding: 10px 11px;
+        border-radius: 12px;
+      }
+
+      .worldLocationCard:hover,
+      .persistentWorldItems > button:hover {
+        border-color: rgba(255,255,255,.1);
+        background: rgba(255,255,255,.05);
+      }
+
+      .worldLocationCard > b { font-size: 13px; }
+      .worldLocationCard > span {
+        font-size: 11px;
+        line-height: 1.4;
+        opacity: .66;
+      }
+
+      .persistentWorldItems {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0,1fr));
+        gap: 6px;
+      }
+
+      .persistentWorldItems > button {
+        display: grid;
+        gap: 3px;
+        padding: 8px 9px;
+        border-radius: 10px;
+      }
+
+      .persistentWorldItems > button > b { font-size: 11px; }
+      .persistentWorldItems > button > span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 10px;
+        opacity: .58;
+      }
+
+      .persistentWorldItems.props > button { opacity: .86; }
+
+      .persistentThreads {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+      }
+
+      .persistentThreads > span {
+        max-width: 46ch;
+        padding: 5px 7px;
+        border: 1px solid rgba(255,255,255,.065);
+        border-radius: 999px;
+        font-size: 9px;
+        line-height: 1.25;
+        opacity: .58;
+      }
+
+      .persistentIdeas {
+        display: grid;
+        align-content: start;
+        gap: 7px;
+      }
+
+      .persistentIdeaForm {
+        display: grid;
+        grid-template-columns: minmax(0,1fr) 38px;
+        gap: 7px;
+      }
+
+      .persistentIdeaForm > input {
+        min-width: 0;
+        width: 100%;
+        height: 38px;
+        border: 1px solid rgba(255,255,255,.1);
+        border-radius: 11px;
+        outline: none;
+        padding: 0 11px;
+        background: rgba(255,255,255,.03);
+        color: inherit;
+        font: inherit;
+        font-size: 12px;
+      }
+
+      .persistentIdeaForm > input:focus {
+        border-color: rgba(255,255,255,.22);
+        background: rgba(255,255,255,.05);
+      }
+
+      .persistentIdeaForm > input::placeholder { color: rgba(255,255,255,.27); }
+
+      .persistentIdeaForm > button,
+      .ownIdeaActions > button {
+        border: 1px solid rgba(255,255,255,.09);
+        border-radius: 10px;
+        background: rgba(255,255,255,.035);
+        color: rgba(255,255,255,.65);
+        cursor: pointer;
+      }
+
+      .persistentIdeaForm > button {
+        width: 38px;
+        height: 38px;
+        display: grid;
+        place-items: center;
+      }
+
+      .persistentIdeaForm > button:disabled { opacity: .28; cursor: default; }
+
+      .persistentProposalList {
+        display: grid;
+        gap: 6px;
+      }
+
+      .persistentProposal {
+        min-width: 0;
+        display: grid;
+        grid-template-columns: minmax(0,1fr) auto;
+        align-items: center;
+        gap: 9px;
+        padding: 9px 10px;
+        border: 1px solid transparent;
+        border-radius: 11px;
+        background: rgba(255,255,255,.028);
+        cursor: pointer;
+      }
+
+      .persistentProposal:hover {
+        border-color: rgba(255,255,255,.1);
+        background: rgba(255,255,255,.05);
+      }
+
+      .persistentProposal.own {
+        grid-template-columns: minmax(0,1fr) auto auto;
+        border-color: rgba(255,255,255,.11);
+        background: rgba(255,255,255,.055);
+        cursor: default;
+      }
+
+      .persistentProposal.pending { opacity: .45; }
+
+      .persistentProposalText {
+        min-width: 0;
+        display: grid;
+        gap: 3px;
+      }
+
+      .persistentProposalText > span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+      }
+
+      .persistentProposalText > i {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 9px;
+        font-style: normal;
+        opacity: .4;
+      }
+
+      .persistentProposal > b {
+        font: 760 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        opacity: .78;
+      }
+
+      .ownIdeaActions { display: flex; gap: 4px; }
+      .ownIdeaActions > button {
+        width: 27px;
+        height: 27px;
+        display: grid;
+        place-items: center;
+      }
+      .ownIdeaActions svg { width: 13px; height: 13px; }
+
+      .worldDetailShade {
+        position: fixed;
+        inset: 0;
+        z-index: 90;
+        display: grid;
+        place-items: center;
+        padding: 20px;
+        background: rgba(0,0,0,.58);
+        backdrop-filter: blur(8px);
+      }
+
+      .worldDetailModal {
+        width: min(520px, 92vw);
+        max-height: min(70vh, 620px);
+        overflow: auto;
+        position: relative;
+        display: grid;
+        gap: 9px;
+        padding: 18px;
+        border: 1px solid rgba(255,255,255,.13);
+        border-radius: 16px;
+        background: rgba(13,14,18,.96);
+        box-shadow: 0 30px 90px rgba(0,0,0,.45);
+      }
+
+      .worldDetailModal > button {
+        position: absolute;
+        top: 8px;
+        right: 8px;
+        width: 28px;
+        height: 28px;
+        border: 0;
+        border-radius: 50%;
+        background: rgba(255,255,255,.06);
+        color: inherit;
+        cursor: pointer;
+      }
+
+      .worldDetailModal > b { padding-right: 30px; font-size: 15px; }
+      .worldDetailModal > p {
+        margin: 0;
+        font-size: 12px;
+        line-height: 1.5;
+        opacity: .72;
+      }
+
       @media (max-width: 760px) {
+        .participationBoard {
+          width: min(94vw, 680px);
+          margin-top: 8px;
+        }
+
+        .participationColumns { grid-template-columns: 1fr; }
+        .persistentWorld { border-right: 0; border-bottom: 1px solid rgba(255,255,255,.07); }
+        .persistentWorldItems { grid-template-columns: 1fr 1fr; }
         .participationTray {
           width: min(94vw, 680px);
           margin-top: 8px;
@@ -2735,29 +3909,52 @@ function App() {
       <OutsideInterfaceStyles />
       <section className="watchDeck">
         <div className="minimalTop">
-          <div className="wordmark" title="PumpTV" aria-label="PumpTV">
+          <div
+            className="wordmark"
+            data-rich-tooltip="1"
+            data-tooltip-kicker="PUMPTV"
+            data-tooltip-body="Live generative television"
+            aria-label="PumpTV"
+          >
             <span>P</span>
           </div>
           <div className="tinyStatus">
-            <i className={`statusDot ${state}`} title={tooltipStatus()} />
+            <i
+              className={`statusDot ${state}`}
+              data-rich-tooltip="1"
+              data-tooltip-kicker="STATUS"
+              data-tooltip-body={tooltipStatus()}
+            />
             {transport !== "live" ? (
-              <i className="transportDot" title={transport} />
+              <i
+                className="transportDot"
+                data-rich-tooltip="1"
+                data-tooltip-kicker="NETWORK"
+                data-tooltip-body={transport}
+              />
             ) : null}
           </div>
         </div>
         <div className="tvCenter">
           <TactileTV clip={clip} />
         </div>
-        <ParticipationTray />
+        <ParticipationBoard />
         {error ? (
-          <div className="fatalBadge" title={error}>
+          <div
+            className="fatalBadge"
+            data-rich-tooltip="1"
+            data-tooltip-kicker="ERROR"
+            data-tooltip-body={error}
+          >
             !
           </div>
         ) : null}
         {room?.generation.paused ? (
           <div
             className="fatalBadge warning"
-            title={room.generation.reason || "Generation paused"}
+            data-rich-tooltip="1"
+            data-tooltip-kicker="GENERATION"
+            data-tooltip-body={room.generation.reason || "Generation paused"}
           >
             !
           </div>

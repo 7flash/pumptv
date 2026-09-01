@@ -73,6 +73,7 @@ export type PromptProposal = {
   author: string | null;
   authorAddress: string | null;
   sourceRoom: string | null;
+  ownerWeight: number;
   voteCount: number;
   realVoteCount: number;
   operatorVoteOverride: number | null;

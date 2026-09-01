@@ -96,7 +96,7 @@ function directiveWithVotesById(id: number) {
       db.raw<any>(
         `SELECT d.*,
               CASE WHEN d.proposalId IS NULL THEN NULL
-                   ELSE (SELECT COALESCE(p.operatorVoteOverride, (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)) FROM proposals p WHERE p.id = d.proposalId)
+                   ELSE (SELECT COALESCE(p.operatorVoteOverride, (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = d.proposalId) + COALESCE(p.ownerWeight, 1)) FROM proposals p WHERE p.id = d.proposalId)
               END AS voteCount
        FROM directives d
        WHERE d.id = ?
@@ -113,10 +113,10 @@ function nextPendingDirectiveWithVotes() {
       db.raw<any>(
         `SELECT d.*,
               CASE WHEN d.proposalId IS NULL THEN NULL
-                   ELSE (SELECT COALESCE(p.operatorVoteOverride, (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)) FROM proposals p WHERE p.id = d.proposalId)
+                   ELSE (SELECT COALESCE(p.operatorVoteOverride, (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = d.proposalId) + COALESCE(p.ownerWeight, 1)) FROM proposals p WHERE p.id = d.proposalId)
               END AS voteCount
        FROM directives d
-       WHERE d.status IN ('generating', 'queued') AND d.source = 'pumpfun'
+       WHERE d.status IN ('generating', 'queued')
        ORDER BY CASE d.status WHEN 'generating' THEN 0 ELSE 1 END, d.id ASC
        LIMIT 1`,
       )[0] || null,
@@ -436,6 +436,7 @@ function normalizedHandle(value: string) {
 
 function proposalFromRow(row: any): PromptProposal {
   const realVoteCount = Number(row.realVoteCount ?? row.voteCount ?? 0);
+  const ownerWeight = Math.max(0, Number(row.ownerWeight ?? 1));
   const override =
     row.operatorVoteOverride == null ? null : Number(row.operatorVoteOverride);
   return {
@@ -448,9 +449,10 @@ function proposalFromRow(row: any): PromptProposal {
     author: row.author ?? null,
     authorAddress: row.authorAddress ?? null,
     sourceRoom: row.sourceRoom ?? null,
+    ownerWeight,
     realVoteCount,
     operatorVoteOverride: override,
-    voteCount: override ?? realVoteCount,
+    voteCount: override ?? ownerWeight + realVoteCount,
   };
 }
 
@@ -461,9 +463,9 @@ function loadRoundById(id: number): PromptRound | null {
   if (!row) return null;
   const proposals = db
     .raw<any>(
-      `SELECT p.*, (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = p.id) AS realVoteCount
+      `SELECT p.*, (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = p.id) AS realVoteCount
      FROM proposals p WHERE p.roundId = ?
-     ORDER BY COALESCE(p.operatorVoteOverride, (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = p.id)) DESC, p.id ASC`,
+     ORDER BY COALESCE(p.operatorVoteOverride, COALESCE(p.ownerWeight, 1) + (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = p.id)) DESC, p.id ASC`,
       id,
     )
     .map(proposalFromRow);
@@ -549,6 +551,223 @@ async function roundForNewSuggestion() {
   return ensureOpenPromptRound(target);
 }
 
+function clampWeight(value: number) {
+  return Math.max(1, Number.isFinite(value) ? value : 1);
+}
+
+export async function upsertWebProposal(input: {
+  text: string;
+  ownerKey: string;
+  walletAddress?: string | null;
+  ownerWeight?: number;
+}) {
+  const round = await roundForNewSuggestion();
+  const text = input.text.replace(/\s+/g, " ").trim().slice(0, 500);
+  if (!text) throw new Error("Idea cannot be empty");
+  const normalized = normalizeProposalText(text);
+  const ownerWeight = clampWeight(input.ownerWeight ?? 1);
+
+  return dbMeasure.measureSync.assert("Upsert persistent web proposal", () => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const own =
+        db.raw<any>(
+          `SELECT * FROM proposals WHERE roundId = ? AND source = 'web' AND sourceId = ? AND status = 'open' LIMIT 1`,
+          round.id,
+          input.ownerKey,
+        )[0] || null;
+      const duplicate =
+        db.raw<any>(
+          `SELECT id FROM proposals WHERE roundId = ? AND normalizedText = ? AND status = 'open' AND id != ? LIMIT 1`,
+          round.id,
+          normalized,
+          own?.id ?? -1,
+        )[0] || null;
+      if (duplicate) throw new Error("That idea is already on the board");
+
+      let proposal = own;
+      if (proposal) {
+        const changed = proposal.normalizedText !== normalized;
+        db.exec(
+          `UPDATE proposals SET text = ?, normalizedText = ?, authorAddress = ?, ownerWeight = ? WHERE id = ?`,
+          text,
+          normalized,
+          input.walletAddress ?? null,
+          ownerWeight,
+          proposal.id,
+        );
+        // Editing changes the proposition people voted for, so outside votes are
+        // cleared. The author's own score remains attached to the edited idea.
+        if (changed)
+          db.exec(
+            `DELETE FROM proposalVotes WHERE proposalId = ?`,
+            proposal.id,
+          );
+        proposal = db.raw<any>(
+          `SELECT * FROM proposals WHERE id = ? LIMIT 1`,
+          proposal.id,
+        )[0];
+      } else {
+        const count = Number(
+          (
+            db.raw<any>(
+              `SELECT COUNT(*) AS count FROM proposals WHERE roundId = ? AND status = 'open'`,
+              round.id,
+            )[0] || {}
+          ).count || 0,
+        );
+        if (count >= MAX_PROPOSALS_PER_ROUND)
+          throw new Error("The proposal board is full");
+        proposal = db.proposals.insert({
+          roundId: round.id,
+          text,
+          normalizedText: normalized,
+          status: "open",
+          source: "web",
+          sourceId: input.ownerKey,
+          author: null,
+          authorAddress: input.walletAddress ?? null,
+          sourceRoom: "web",
+          operatorVoteOverride: null,
+          ownerWeight,
+        });
+      }
+      if (!proposal) throw new Error("Could not save idea");
+
+      const roundRow = db.raw<any>(
+        `SELECT votingStartedAtMs FROM promptRounds WHERE id = ? LIMIT 1`,
+        round.id,
+      )[0];
+      if (roundRow && !roundRow.votingStartedAtMs) {
+        const now = Date.now();
+        db.exec(
+          `UPDATE promptRounds SET votingStartedAtMs = ?, closesAtMs = ? WHERE id = ?`,
+          now,
+          now + VOTE_WINDOW_MS,
+          round.id,
+        );
+      }
+      db.exec("COMMIT");
+      const loaded = loadRoundById(round.id);
+      return (
+        loaded?.proposals.find((item) => item.id === Number(proposal.id)) ||
+        null
+      );
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  });
+}
+
+export async function cancelWebProposal(ownerKey: string) {
+  const round = await getOpenPromptRound();
+  if (!round) return false;
+  return dbMeasure.measureSync.assert("Cancel persistent web proposal", () => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const proposal =
+        db.raw<any>(
+          `SELECT id FROM proposals WHERE roundId = ? AND source = 'web' AND sourceId = ? AND status = 'open' LIMIT 1`,
+          round.id,
+          ownerKey,
+        )[0] || null;
+      if (!proposal) {
+        db.exec("COMMIT");
+        return false;
+      }
+      db.exec(`DELETE FROM proposalVotes WHERE proposalId = ?`, proposal.id);
+      db.exec(`DELETE FROM proposals WHERE id = ?`, proposal.id);
+      db.exec("COMMIT");
+      return true;
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  });
+}
+
+export async function attachWebWallet(input: {
+  ownerKey: string;
+  walletAddress: string;
+  weight: number;
+}) {
+  const round = await getOpenPromptRound();
+  if (!round) return null;
+  const weight = clampWeight(input.weight);
+  return dbMeasure.measureSync.assert("Apply wallet voting power", () => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.exec(
+        `UPDATE proposals SET authorAddress = ?, ownerWeight = ? WHERE roundId = ? AND source = 'web' AND sourceId = ? AND status = 'open'`,
+        input.walletAddress,
+        weight,
+        round.id,
+        input.ownerKey,
+      );
+      db.exec(
+        `UPDATE proposalVotes SET weight = ? WHERE roundId = ? AND voterKey = ?`,
+        weight,
+        round.id,
+        input.ownerKey,
+      );
+      db.exec("COMMIT");
+      return loadRoundById(round.id);
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  });
+}
+
+export async function castWebVote(input: {
+  proposalId: number;
+  voterKey: string;
+  weight: number;
+  walletAddress?: string | null;
+}) {
+  const round = await getOpenPromptRound();
+  if (!round) return null;
+  const target = round.proposals.find((item) => item.id === input.proposalId);
+  if (!target) throw new Error("Idea is no longer active");
+  if (target.source === "web" && target.sourceId === input.voterKey)
+    throw new Error("Your own idea already carries your score");
+  const weight = clampWeight(input.weight);
+
+  return dbMeasure.measureSync.assert("Cast persistent web vote", () => {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      db.exec(
+        `DELETE FROM proposalVotes WHERE roundId = ? AND voterKey = ?`,
+        round.id,
+        input.voterKey,
+      );
+      db.proposalVotes.insert({
+        roundId: round.id,
+        proposalId: input.proposalId,
+        voterKey: input.voterKey,
+        voterHandle: null,
+        source: "web",
+        sourceId: input.walletAddress ?? input.voterKey,
+        weight,
+      });
+      db.exec("COMMIT");
+      return loadRoundById(round.id);
+    } catch (error) {
+      try {
+        db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  });
+}
+
 export async function submitPumpfunProposal(input: {
   text: string;
   sourceId: string;
@@ -594,6 +813,7 @@ export async function submitPumpfunProposal(input: {
           authorAddress: input.authorAddress,
           sourceRoom: input.sourceRoom,
           operatorVoteOverride: null,
+          ownerWeight: input.source === "web" ? 1 : 0,
         });
       }
       if (!proposal) throw new Error("Could not create proposal");
@@ -609,6 +829,7 @@ export async function submitPumpfunProposal(input: {
         voterHandle: input.voterHandle ?? null,
         source: input.source ?? "pumpfun",
         sourceId: input.sourceId,
+        weight: 1,
       });
       const row = db.raw<any>(
         `SELECT * FROM promptRounds WHERE id = ? LIMIT 1`,
@@ -664,6 +885,7 @@ export async function castPumpfunVote(input: {
         voterHandle: input.voterHandle ?? null,
         source: input.source ?? "pumpfun",
         sourceId: input.sourceId,
+        weight: 1,
       });
       db.exec("COMMIT");
       return loadRoundById(round.id);
@@ -740,11 +962,75 @@ export async function setProposalVoteOverride(
   });
 }
 
+function carryProposalBoardForward(input: {
+  roundId: number;
+  winnerProposalId: number;
+  targetEpisode: number;
+  now: number;
+}) {
+  const survivors = db.raw<any>(
+    `SELECT * FROM proposals WHERE roundId = ? AND id != ? ORDER BY id ASC`,
+    input.roundId,
+    input.winnerProposalId,
+  );
+  const nextRound = db.promptRounds.insert({
+    targetEpisode: input.targetEpisode,
+    status: "open",
+    openedAtMs: input.now,
+    votingStartedAtMs: survivors.length ? input.now : null,
+    closesAtMs: survivors.length ? input.now + VOTE_WINDOW_MS : 0,
+    closedAtMs: null,
+    winnerProposalId: null,
+  });
+  if (!nextRound) throw new Error("Could not open persistent proposal board");
+  const nextRoundId = Number((nextRound as any).id);
+
+  for (const proposal of survivors) {
+    const cloned = db.proposals.insert({
+      roundId: nextRoundId,
+      text: proposal.text,
+      normalizedText: proposal.normalizedText,
+      status: "open",
+      source: proposal.source,
+      sourceId: proposal.sourceId ?? null,
+      author: proposal.author ?? null,
+      authorAddress: proposal.authorAddress ?? null,
+      sourceRoom: proposal.sourceRoom ?? null,
+      operatorVoteOverride: proposal.operatorVoteOverride ?? null,
+      ownerWeight: Math.max(0, Number(proposal.ownerWeight ?? 1)),
+    });
+    if (!cloned) throw new Error("Could not carry proposal forward");
+
+    const votes = db.raw<any>(
+      `SELECT * FROM proposalVotes WHERE roundId = ? AND proposalId = ? ORDER BY id ASC`,
+      input.roundId,
+      proposal.id,
+    );
+    for (const vote of votes) {
+      db.proposalVotes.insert({
+        roundId: nextRoundId,
+        proposalId: Number((cloned as any).id),
+        voterKey: vote.voterKey,
+        voterHandle: vote.voterHandle ?? null,
+        source: vote.source,
+        sourceId: vote.sourceId ?? null,
+        weight: Math.max(1, Number(vote.weight ?? 1)),
+      });
+    }
+  }
+
+  return nextRoundId;
+}
+
 export async function closePromptRound(
   winnerProposalId?: number,
 ): Promise<Directive | null> {
   const round = await getOpenPromptRound();
   if (!round || round.proposals.length === 0) return null;
+  const nextTargetEpisode = Math.max(
+    round.targetEpisode + 1,
+    await nextEpisode(),
+  );
   const winner =
     winnerProposalId == null
       ? round.proposals[0]
@@ -776,7 +1062,7 @@ export async function closePromptRound(
           text: winner.text,
           status: "queued",
           usedEpisode: null,
-          source: "pumpfun",
+          source: winner.source,
           sourceId: `round:${round.id}:proposal:${winner.id}`,
           author: winner.author,
           authorAddress: winner.authorAddress,
@@ -785,6 +1071,12 @@ export async function closePromptRound(
         });
       }
       if (!directive) throw new Error("Could not create winning directive");
+      carryProposalBoardForward({
+        roundId: round.id,
+        winnerProposalId: winner.id,
+        targetEpisode: nextTargetEpisode,
+        now,
+      });
       db.exec("COMMIT");
       const hydrated = directiveWithVotesById(Number((directive as any).id));
       return hydrated ? toDirective(hydrated) : toDirective(directive);
@@ -860,7 +1152,7 @@ export async function forceProposalAsNext(
           text: proposal.text,
           status: "queued",
           usedEpisode: null,
-          source: "pumpfun",
+          source: proposal.source || "pumpfun",
           sourceId: `round:${round.id}:proposal:${proposalId}`,
           author: proposal.author ?? null,
           authorAddress: proposal.authorAddress ?? null,
@@ -933,6 +1225,7 @@ export async function operatorInjectProposal(text: string) {
           authorAddress: null,
           sourceRoom: "cli",
           operatorVoteOverride: null,
+          ownerWeight: 0,
         });
       }
 
@@ -949,6 +1242,7 @@ export async function operatorInjectProposal(text: string) {
         voterHandle: "operator",
         source: "pumpfun",
         sourceId,
+        weight: 1,
       });
 
       db.exec("COMMIT");
@@ -977,7 +1271,7 @@ export async function claimQueuedDirective(episode: number) {
   const queued = await dbMeasure.measureSync("Get queued directive", () =>
     db.directives
       .select()
-      .where({ status: "queued", source: "pumpfun" })
+      .where({ status: "queued" })
       .orderBy("id", "ASC")
       .first(),
   );
@@ -998,7 +1292,7 @@ export async function hasQueuedDirective() {
   const row = await dbMeasure.measureSync("Check queued directive", () =>
     db.directives
       .select("id")
-      .where({ status: "queued", source: "pumpfun" })
+      .where({ status: "queued" })
       .orderBy("id", "ASC")
       .first(),
   );
@@ -1289,7 +1583,7 @@ export async function getTimeline(
               d.authorAddress AS directiveAuthorAddress,
               d.proposalId AS directiveProposalId,
               CASE WHEN d.proposalId IS NULL THEN NULL
-                   ELSE (SELECT COALESCE(p.operatorVoteOverride, (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = d.proposalId)) FROM proposals p WHERE p.id = d.proposalId)
+                   ELSE (SELECT COALESCE(p.operatorVoteOverride, (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = d.proposalId) + COALESCE(p.ownerWeight, 1)) FROM proposals p WHERE p.id = d.proposalId)
               END AS directiveVoteCount
        FROM clips c
        LEFT JOIN directives d ON d.id = c.directiveId
@@ -1311,10 +1605,7 @@ export async function getStreamState(): Promise<StreamState> {
       getRoomRow(),
       getTimeline(),
       dbMeasure.measureSync("Count queued Pump.fun prompts", () =>
-        db.directives
-          .select()
-          .where({ status: "queued", source: "pumpfun" })
-          .count(),
+        db.directives.select().where({ status: "queued" }).count(),
       ),
       getRecentGenerationTimings(),
       getOpenPromptRound(),
