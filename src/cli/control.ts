@@ -13,7 +13,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function usage() {
   console.log(
-    `PumpTV control\n\n  bun run control -- status\n  bun run control -- watch\n  bun run control -- json\n  bun run control -- resolve [--refresh] [--force] <prompt...>\n  bun run control -- set-votes <proposalId> <count|auto>\n  bun run control -- trigger\n  bun run control -- force <proposalId>\n  bun run control -- inject <prompt...>\n  bun run control -- inject-force <prompt...>\n  bun run control -- clear-queue\n`,
+    `PumpTV control\n\n  bun run control -- status\n  bun run control -- watch\n  bun run control -- json\n  bun run control -- resolve [--refresh] [--force] <prompt...>\n  bun run control -- prompt <episode|latest> [--json]\n  bun run control -- set-votes <proposalId> <count|auto>\n  bun run control -- trigger\n  bun run control -- force <proposalId>\n  bun run control -- inject <prompt...>\n  bun run control -- inject-force <prompt...>\n  bun run control -- clear-queue\n`,
   );
 }
 
@@ -100,6 +100,116 @@ if (command === "status") {
   }
 } else if (command === "json") {
   console.log(JSON.stringify(await repo.getStreamState(), null, 2));
+} else if (command === "prompt" || command === "episode") {
+  const jsonOutput = args.includes("--json");
+  const target = args.find((arg) => arg !== "--json") || "latest";
+  let row: any = null;
+
+  if (target.toLowerCase() === "latest") {
+    row =
+      db.raw<any>(`SELECT * FROM clips ORDER BY episode DESC LIMIT 1`)[0] ||
+      null;
+  } else {
+    const displayEpisode = Number(target.replace(/^ep/i, ""));
+    if (!Number.isInteger(displayEpisode) || displayEpisode < 1) {
+      usage();
+      process.exit(1);
+    }
+    row =
+      db.raw<any>(
+        `SELECT * FROM clips WHERE episode = ? LIMIT 1`,
+        displayEpisode - 1,
+      )[0] || null;
+  }
+
+  if (!row) throw new Error(`Episode ${target} not found`);
+
+  let storedPlan: Record<string, unknown> | null = null;
+  try {
+    storedPlan = row.showrunnerPlanJson
+      ? JSON.parse(String(row.showrunnerPlanJson))
+      : null;
+  } catch {}
+
+  const references =
+    storedPlan && "_references" in storedPlan
+      ? (storedPlan._references ?? null)
+      : null;
+  const showrunnerPlan = storedPlan
+    ? Object.fromEntries(
+        Object.entries(storedPlan).filter(([key]) => key !== "_references"),
+      )
+    : null;
+
+  const artifact = {
+    episode: Number(row.episode) + 1,
+    clipId: Number(row.id),
+    directiveId: row.directiveId == null ? null : Number(row.directiveId),
+    proposal: String(row.directive || ""),
+    references,
+    showrunner: {
+      model: row.showrunnerModel ?? null,
+      inputTokens: row.showrunnerInputTokens ?? null,
+      outputTokens: row.showrunnerOutputTokens ?? null,
+      ms: row.showrunnerMs ?? null,
+      plan: showrunnerPlan,
+    },
+    h3: {
+      prompt: row.h3Prompt ?? null,
+      expandedPrompt: row.expandedPrompt ?? null,
+      ms: row.h3Ms ?? null,
+      inferenceSeconds: row.inferenceSeconds ?? null,
+      resolution: row.resolution ?? null,
+    },
+    generation: {
+      mode: row.generationMode ?? null,
+      totalMs: row.totalGenerationMs ?? null,
+      requestId: row.requestId ?? null,
+      videoUrl: row.videoUrl ?? null,
+      anchorFrameUrl: row.anchorFrameUrl ?? null,
+    },
+  };
+
+  if (jsonOutput) {
+    console.log(JSON.stringify(artifact, null, 2));
+  } else {
+    const section = (title: string, value: unknown) => {
+      console.log(
+        `\n── ${title} ${"─".repeat(Math.max(2, 66 - title.length))}`,
+      );
+      if (value == null || value === "") {
+        console.log("(none)");
+      } else if (typeof value === "string") {
+        console.log(value);
+      } else {
+        console.log(JSON.stringify(value, null, 2));
+      }
+    };
+
+    console.log(
+      `EP ${artifact.episode} · clip #${artifact.clipId}` +
+        `${artifact.directiveId == null ? "" : ` · directive #${artifact.directiveId}`}` +
+        `${artifact.generation.mode ? ` · ${artifact.generation.mode}` : ""}`,
+    );
+    section("SELECTED IDEA", artifact.proposal);
+    section("RESOLVED REFERENCES", artifact.references);
+    section("SHOWRUNNER PLAN", artifact.showrunner.plan);
+    section("H3 INPUT PROMPT", artifact.h3.prompt);
+    section("FAL EXPANDED PROMPT", artifact.h3.expandedPrompt);
+    section("GENERATION META", {
+      showrunnerModel: artifact.showrunner.model,
+      showrunnerInputTokens: artifact.showrunner.inputTokens,
+      showrunnerOutputTokens: artifact.showrunner.outputTokens,
+      showrunnerMs: artifact.showrunner.ms,
+      h3Ms: artifact.h3.ms,
+      inferenceSeconds: artifact.h3.inferenceSeconds,
+      totalMs: artifact.generation.totalMs,
+      resolution: artifact.h3.resolution,
+      requestId: artifact.generation.requestId,
+      videoUrl: artifact.generation.videoUrl,
+      anchorFrameUrl: artifact.generation.anchorFrameUrl,
+    });
+  }
 } else if (command === "resolve") {
   const bypassCache = args.includes("--refresh");
   const forceResearch = args.includes("--force");
