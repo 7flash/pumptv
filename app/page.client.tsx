@@ -28,6 +28,32 @@ let captionsEnabled = true;
 let liveOverlayEnabled = true;
 let infoOpen = false;
 
+type TrayView = "ideas" | "world";
+type WalletState = "idle" | "connecting" | "connected" | "missing" | "error";
+
+let trayOpen = false;
+let trayView: TrayView = "ideas";
+let walletState: WalletState = "idle";
+let walletAddress: string | null = null;
+let ideaDraft = "";
+let ideaSubmitting = false;
+let votePendingId: number | null = null;
+let participationError: string | null = null;
+
+type PhantomPublicKey = { toString(): string };
+type PhantomProvider = {
+  isPhantom?: boolean;
+  isConnected?: boolean;
+  publicKey?: PhantomPublicKey | null;
+  connect(options?: {
+    onlyIfTrusted?: boolean;
+  }): Promise<{ publicKey: PhantomPublicKey }>;
+  on?(
+    event: "connect" | "disconnect" | "accountChanged",
+    handler: (value?: PhantomPublicKey | null) => void,
+  ): void;
+};
+
 type LiveSlotState = "playing" | "intermission" | "transitioning";
 let liveSlotState: LiveSlotState = "playing";
 
@@ -200,8 +226,8 @@ function redraw() {
   });
 }
 
-async function json<T>(url: string): Promise<T> {
-  const response = await fetch(url);
+async function json<T>(url: string, init?: RequestInit): Promise<T> {
+  const response = await fetch(url, init);
   const payload = await response.json();
   if (!response.ok)
     throw new Error(payload.error || `Request failed: ${response.status}`);
@@ -221,6 +247,154 @@ function applyState(state: StreamState) {
   )
     replayClipId = null;
   error = null;
+  redraw();
+}
+
+function phantomProvider(): PhantomProvider | null {
+  const provider = (window as any).phantom?.solana as
+    PhantomProvider | undefined;
+  return provider?.isPhantom ? provider : null;
+}
+
+function walletFromPublicKey(value?: PhantomPublicKey | null) {
+  const address = value?.toString?.().trim() || "";
+  walletAddress = address || null;
+  walletState = walletAddress ? "connected" : "idle";
+}
+
+let phantomEventsInstalled = false;
+function installPhantomEvents() {
+  if (phantomEventsInstalled) return;
+  const provider = phantomProvider();
+  if (!provider?.on) return;
+  phantomEventsInstalled = true;
+  provider.on("connect", (publicKey) => {
+    walletFromPublicKey(publicKey || provider.publicKey || null);
+    participationError = null;
+    redraw();
+  });
+  provider.on("disconnect", () => {
+    walletAddress = null;
+    walletState = "idle";
+    redraw();
+  });
+  provider.on("accountChanged", (publicKey) => {
+    walletFromPublicKey(publicKey || provider.publicKey || null);
+    redraw();
+  });
+}
+
+async function connectPhantom(interactive: boolean) {
+  const provider = phantomProvider();
+  if (!provider) {
+    walletAddress = null;
+    walletState = "missing";
+    if (interactive)
+      window.open("https://phantom.app/", "_blank", "noopener,noreferrer");
+    redraw();
+    return false;
+  }
+
+  installPhantomEvents();
+  walletState = "connecting";
+  participationError = null;
+  redraw();
+  try {
+    const result = await provider.connect(
+      interactive ? undefined : { onlyIfTrusted: true },
+    );
+    walletFromPublicKey(result?.publicKey || provider.publicKey || null);
+    redraw();
+    return Boolean(walletAddress);
+  } catch (cause: any) {
+    walletAddress = null;
+    const rejected = Number(cause?.code) === 4001;
+    walletState = interactive && !rejected ? "error" : "idle";
+    if (interactive && !rejected)
+      participationError =
+        cause instanceof Error ? cause.message : "Wallet connection failed";
+    redraw();
+    return false;
+  }
+}
+
+async function refreshStreamState() {
+  try {
+    applyState(await json<StreamState>("/api/state"));
+  } catch {}
+}
+
+async function ensureWallet() {
+  if (walletAddress) return walletAddress;
+  const connected = await connectPhantom(true);
+  return connected ? walletAddress : null;
+}
+
+async function submitIdea() {
+  if (ideaSubmitting) return;
+  const text = ideaDraft.replace(/\s+/g, " ").trim().slice(0, 500);
+  if (!text) return;
+  const address = await ensureWallet();
+  if (!address) return;
+
+  ideaSubmitting = true;
+  participationError = null;
+  redraw();
+  try {
+    await json("/api/proposals", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text, walletAddress: address }),
+    });
+    ideaDraft = "";
+    trayOpen = true;
+    trayView = "ideas";
+    await refreshStreamState();
+  } catch (cause) {
+    participationError =
+      cause instanceof Error ? cause.message : "Could not submit idea";
+  } finally {
+    ideaSubmitting = false;
+    redraw();
+  }
+}
+
+async function voteForProposal(proposalId: number) {
+  if (!Number.isSafeInteger(proposalId) || proposalId <= 0 || votePendingId)
+    return;
+  const address = await ensureWallet();
+  if (!address) return;
+
+  votePendingId = proposalId;
+  participationError = null;
+  redraw();
+  try {
+    await json("/api/votes", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ proposalId, walletAddress: address }),
+    });
+    await refreshStreamState();
+  } catch (cause) {
+    participationError =
+      cause instanceof Error ? cause.message : "Could not vote";
+  } finally {
+    votePendingId = null;
+    redraw();
+  }
+}
+
+function toggleTray() {
+  trayOpen = !trayOpen;
+  redraw();
+}
+
+function openTray(view: TrayView) {
+  if (trayOpen && trayView === view) trayOpen = false;
+  else {
+    trayOpen = true;
+    trayView = view;
+  }
   redraw();
 }
 
@@ -331,8 +505,10 @@ function ensureViewerIdAndPrefs() {
 async function boot() {
   ensureViewerIdAndPrefs();
   installInteractionLayer();
+  installPhantomEvents();
   syncLocalUiState();
   redraw();
+  void connectPhantom(false);
   try {
     applyState(await json<StreamState>("/api/state"));
   } catch (cause) {
@@ -998,12 +1174,43 @@ function installInteractionLayer() {
           infoOpen = false;
           syncLocalUiState();
         }
+      } else if (action === "tray-toggle") toggleTray();
+      else if (action === "tray-ideas") openTray("ideas");
+      else if (action === "tray-world") openTray("world");
+      else if (action === "wallet") void connectPhantom(true);
+      else if (action === "submit-idea") void submitIdea();
+      else if (action === "vote") {
+        const id = Number(control.dataset.proposalId);
+        if (Number.isSafeInteger(id)) void voteForProposal(id);
       } else if (action === "fullscreen") void toggleFullscreen();
       else if (action === "live") returnLive();
       else if (action === "episode") {
         const id = Number(control.dataset.episodeId);
         if (Number.isFinite(id)) jumpToEpisode(id);
       }
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "input",
+    (event) => {
+      const target =
+        event.target instanceof HTMLInputElement ? event.target : null;
+      if (!target?.matches("[data-idea-input]")) return;
+      ideaDraft = target.value.slice(0, 500);
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "submit",
+    (event) => {
+      const form =
+        event.target instanceof HTMLFormElement ? event.target : null;
+      if (!form?.matches("[data-idea-form]")) return;
+      event.preventDefault();
+      void submitIdea();
     },
     true,
   );
@@ -1188,9 +1395,11 @@ function stageGlyph(phase: LiveProgramState["phase"]) {
 function CandidateRows({
   round,
   limit = 5,
+  interactive = false,
 }: {
   round: PromptRound | null;
   limit?: number;
+  interactive?: boolean;
 }) {
   const candidates = sortedCandidates(round);
   if (!candidates.length) return null;
@@ -1202,8 +1411,13 @@ function CandidateRows({
           winnerId === candidate.id || candidate.status === "selected";
         return (
           <div
-            className={`rankRow ${selected ? "winner" : ""}`}
+            className={`rankRow ${selected ? "winner" : ""} ${interactive ? "interactive" : ""} ${votePendingId === candidate.id ? "pending" : ""}`}
             key={candidate.id}
+            data-action={interactive ? "vote" : undefined}
+            data-proposal-id={interactive ? candidate.id : undefined}
+            role={interactive ? "button" : undefined}
+            tabIndex={interactive ? 0 : undefined}
+            title={interactive ? "Vote" : undefined}
           >
             <em>{index + 1}</em>
             <div className="rankIdea">
@@ -1401,6 +1615,265 @@ function OutsideConsole() {
       <OutsideProgram />
       <WorldStatePanel />
     </div>
+  );
+}
+
+type TrayIconName = "wallet" | "ideas" | "world" | "chevron" | "send";
+
+function TrayIcon({ name }: { name: TrayIconName }) {
+  if (name === "wallet")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path
+          className="stroke"
+          d="M4 7.5h13.5A2.5 2.5 0 0 1 20 10v7.5H6A2 2 0 0 1 4 15.5v-8Z"
+        />
+        <path
+          className="stroke"
+          d="M4.5 7.5 15 4v3.5M15.5 11.5H20v3h-4.5a1.5 1.5 0 0 1 0-3Z"
+        />
+      </svg>
+    );
+  if (name === "ideas")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path
+          className="stroke"
+          d="M12 3v3M12 18v3M3 12h3M18 12h3M5.7 5.7l2.1 2.1M16.2 16.2l2.1 2.1M18.3 5.7l-2.1 2.1M7.8 16.2l-2.1 2.1"
+        />
+        <circle className="stroke" cx="12" cy="12" r="3.5" />
+      </svg>
+    );
+  if (name === "world")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <circle className="stroke" cx="12" cy="12" r="8" />
+        <path
+          className="stroke"
+          d="M4.5 10h15M4.5 14h15M12 4c2.2 2.1 3.2 4.8 3.2 8S14.2 17.9 12 20M12 4c-2.2 2.1-3.2 4.8-3.2 8S9.8 17.9 12 20"
+        />
+      </svg>
+    );
+  if (name === "send")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path className="stroke" d="m5 12 14-7-4.5 14-3-5.5L5 12Z" />
+        <path className="stroke" d="M11.5 13.5 19 5" />
+      </svg>
+    );
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path className="stroke" d="m7 9 5 5 5-5" />
+    </svg>
+  );
+}
+
+function trayRound() {
+  return program?.votingRound || null;
+}
+
+function ParticipationIdeas() {
+  const round = trayRound();
+  const candidates = sortedCandidates(round);
+  const canVote = Boolean(round?.status === "open");
+  const generating =
+    program?.phase === "planning" ||
+    program?.phase === "rendering" ||
+    program?.phase === "finalizing";
+
+  return (
+    <div className="trayIdeas">
+      <form className="ideaForm" data-idea-form>
+        <input
+          data-idea-input
+          value={ideaDraft}
+          maxLength={500}
+          autoComplete="off"
+          spellCheck="true"
+          placeholder="what happens next?"
+          aria-label="Next episode idea"
+          disabled={ideaSubmitting}
+        />
+        <button
+          type="submit"
+          data-action="submit-idea"
+          disabled={ideaSubmitting || !ideaDraft.trim()}
+          title="Submit"
+          aria-label="Submit idea"
+        >
+          <TrayIcon name="send" />
+        </button>
+      </form>
+
+      {program?.directive &&
+      (generating ||
+        program.phase === "locked" ||
+        program.phase === "ready") ? (
+        <div className="trayLocked">
+          <span>{program.directive.text}</span>
+          <i>{directiveAuthor(program.directive)}</i>
+        </div>
+      ) : null}
+
+      {round ? (
+        <div className="trayBallot">
+          <div className="trayBallotMeta">
+            <b>{round.targetEpisode + 1}</b>
+            {round.votingStartedAtMs && round.closesAtMs > liveNowMs() ? (
+              <strong data-future-vote-countdown>
+                {formatClock(round.closesAtMs - liveNowMs())}
+              </strong>
+            ) : null}
+          </div>
+          {candidates.length ? (
+            <CandidateRows round={round} interactive={canVote} limit={8} />
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ParticipationWorld() {
+  if (!worldState) return null;
+  return (
+    <div className="trayWorld">
+      <div className="trayWorldLocation">
+        <b>{worldState.location || "—"}</b>
+        {worldState.locationDetails ? (
+          <p>{worldState.locationDetails}</p>
+        ) : null}
+        {worldState.lastEndingBeat ? (
+          <em>{worldState.lastEndingBeat}</em>
+        ) : null}
+      </div>
+
+      {worldState.characters.length ? (
+        <div className="trayWorldGrid">
+          {worldState.characters.map((item) => (
+            <article key={item.id}>
+              <b>{item.name}</b>
+              <span>{item.status}</span>
+              {item.position ? <small>{item.position}</small> : null}
+            </article>
+          ))}
+        </div>
+      ) : null}
+
+      {worldState.props.length ? (
+        <div className="trayWorldGrid compact">
+          {worldState.props.map((item) => (
+            <article key={item.id}>
+              <b>{item.name}</b>
+              <span>{item.status}</span>
+              {item.position ? <small>{item.position}</small> : null}
+            </article>
+          ))}
+        </div>
+      ) : null}
+
+      {worldState.openThreads.length ? (
+        <div className="trayThreads">
+          {worldState.openThreads.slice(0, 8).map((item) => (
+            <span key={item}>{item}</span>
+          ))}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function ParticipationTray() {
+  const round = trayRound();
+  const phase = program?.phase || "idle";
+  const targetEpisode = round?.targetEpisode ?? program?.targetEpisode ?? 0;
+  const candidateCount = round?.proposals.length || 0;
+  const walletTitle =
+    walletState === "missing"
+      ? "Install Phantom"
+      : walletAddress
+        ? walletAddress
+        : walletState === "connecting"
+          ? "Connecting Phantom"
+          : "Connect Phantom";
+
+  return (
+    <section className={`participationTray ${trayOpen ? "open" : ""}`}>
+      <div className="trayBar">
+        <button
+          className="trayToggle"
+          type="button"
+          data-action="tray-toggle"
+          title={trayOpen ? "Collapse" : "Open"}
+          aria-label={
+            trayOpen ? "Collapse participation" : "Open participation"
+          }
+        >
+          <TrayIcon name="chevron" />
+        </button>
+
+        <div className="trayPulse" title={tooltipStatus()}>
+          <i>{stageGlyph(phase as LiveProgramState["phase"])}</i>
+          <b>{targetEpisode + 1}</b>
+          {candidateCount ? <small>{candidateCount}</small> : null}
+          {round?.votingStartedAtMs && round.closesAtMs > liveNowMs() ? (
+            <strong data-vote-countdown>
+              {formatClock(round.closesAtMs - liveNowMs())}
+            </strong>
+          ) : null}
+        </div>
+
+        <div className="trayActions">
+          <button
+            className={`trayAction wallet ${walletAddress ? "on" : ""} ${walletState}`}
+            type="button"
+            data-action="wallet"
+            title={walletTitle}
+            aria-label={walletTitle}
+          >
+            <TrayIcon name="wallet" />
+            {walletAddress ? <span>{shortAddress(walletAddress)}</span> : null}
+          </button>
+          <button
+            className={`trayAction ${trayOpen && trayView === "ideas" ? "on" : ""}`}
+            type="button"
+            data-action="tray-ideas"
+            title="Ideas"
+            aria-label="Ideas and voting"
+          >
+            <TrayIcon name="ideas" />
+          </button>
+          <button
+            className={`trayAction ${trayOpen && trayView === "world" ? "on" : ""}`}
+            type="button"
+            data-action="tray-world"
+            title="World"
+            aria-label="World state"
+          >
+            <TrayIcon name="world" />
+          </button>
+        </div>
+      </div>
+
+      {trayOpen ? (
+        <div className="trayBody">
+          {participationError ? (
+            <div
+              className="trayError"
+              title={participationError}
+              aria-label={participationError}
+            >
+              !
+            </div>
+          ) : null}
+          {trayView === "world" ? (
+            <ParticipationWorld />
+          ) : (
+            <ParticipationIdeas />
+          )}
+        </div>
+      ) : null}
+    </section>
   );
 }
 
@@ -1855,7 +2328,387 @@ function OutsideInterfaceStyles() {
         display: none;
       }
 
+      .participationTray {
+        width: min(980px, calc(100vw - 150px));
+        margin: 12px auto 0;
+        border: 1px solid rgba(255,255,255,.12);
+        border-radius: 17px;
+        background: rgba(10,11,14,.72);
+        box-shadow: inset 0 1px rgba(255,255,255,.04), 0 12px 40px rgba(0,0,0,.18);
+        backdrop-filter: blur(18px);
+        overflow: hidden;
+        position: relative;
+        z-index: 8;
+      }
+
+      .trayBar {
+        min-height: 48px;
+        display: grid;
+        grid-template-columns: 34px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 8px;
+        padding: 7px 8px;
+      }
+
+      .trayToggle,
+      .trayAction,
+      .ideaForm > button {
+        border: 0;
+        color: rgba(255,255,255,.66);
+        background: transparent;
+        cursor: pointer;
+      }
+
+      .trayToggle {
+        width: 34px;
+        height: 34px;
+        display: grid;
+        place-items: center;
+        border-radius: 11px;
+      }
+
+      .trayToggle svg,
+      .trayAction svg,
+      .ideaForm svg {
+        width: 18px;
+        height: 18px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.7;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .participationTray.open .trayToggle svg {
+        transform: rotate(180deg);
+      }
+
+      .trayPulse {
+        min-width: 0;
+        display: flex;
+        align-items: center;
+        gap: 8px;
+      }
+
+      .trayPulse > i,
+      .trayPulse > b,
+      .trayPulse > small,
+      .trayPulse > strong {
+        font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-style: normal;
+        opacity: .68;
+      }
+
+      .trayPulse > small {
+        min-width: 18px;
+        height: 18px;
+        display: grid;
+        place-items: center;
+        border-radius: 999px;
+        background: rgba(255,255,255,.07);
+      }
+
+      .trayPulse > strong {
+        margin-left: 2px;
+        opacity: .9;
+      }
+
+      .trayActions {
+        display: flex;
+        align-items: center;
+        gap: 5px;
+      }
+
+      .trayAction {
+        min-width: 34px;
+        height: 34px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 7px;
+        padding: 0 8px;
+        border: 1px solid transparent;
+        border-radius: 11px;
+      }
+
+      .trayAction.on {
+        color: #fff;
+        border-color: rgba(255,255,255,.14);
+        background: rgba(255,255,255,.06);
+      }
+
+      .trayAction.wallet > span {
+        max-width: 105px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        font: 650 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        white-space: nowrap;
+      }
+
+      .trayAction.wallet.connecting {
+        opacity: .55;
+      }
+
+      .trayBody {
+        position: relative;
+        border-top: 1px solid rgba(255,255,255,.08);
+        padding: 10px;
+      }
+
+      .trayError {
+        position: absolute;
+        top: 10px;
+        right: 10px;
+        width: 22px;
+        height: 22px;
+        display: grid;
+        place-items: center;
+        border-radius: 50%;
+        background: rgba(255,255,255,.08);
+        font: 800 11px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        z-index: 2;
+      }
+
+      .trayIdeas,
+      .trayWorld {
+        display: grid;
+        gap: 10px;
+      }
+
+      .ideaForm {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 38px;
+        gap: 7px;
+      }
+
+      .ideaForm > input {
+        width: 100%;
+        min-width: 0;
+        height: 40px;
+        border: 1px solid rgba(255,255,255,.1);
+        border-radius: 12px;
+        outline: none;
+        background: rgba(255,255,255,.035);
+        color: inherit;
+        padding: 0 12px;
+        font: inherit;
+        font-size: 13px;
+      }
+
+      .ideaForm > input:focus {
+        border-color: rgba(255,255,255,.24);
+        background: rgba(255,255,255,.055);
+      }
+
+      .ideaForm > input::placeholder {
+        color: rgba(255,255,255,.28);
+      }
+
+      .ideaForm > button {
+        width: 38px;
+        height: 40px;
+        display: grid;
+        place-items: center;
+        border: 1px solid rgba(255,255,255,.1);
+        border-radius: 12px;
+        background: rgba(255,255,255,.045);
+      }
+
+      .ideaForm > button:disabled {
+        opacity: .28;
+        cursor: default;
+      }
+
+      .trayLocked {
+        display: grid;
+        gap: 3px;
+        padding: 9px 10px;
+        border-radius: 11px;
+        background: rgba(255,255,255,.035);
+      }
+
+      .trayLocked > span {
+        font-size: 12px;
+        line-height: 1.4;
+      }
+
+      .trayLocked > i {
+        font-size: 9px;
+        font-style: normal;
+        opacity: .45;
+      }
+
+      .trayBallot {
+        display: grid;
+        gap: 7px;
+      }
+
+      .trayBallotMeta {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 0 2px;
+      }
+
+      .trayBallotMeta > b,
+      .trayBallotMeta > strong {
+        font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        opacity: .65;
+      }
+
+      .trayBallotMeta > strong {
+        margin-left: auto;
+        opacity: .88;
+      }
+
+      .participationTray .liveRanking {
+        display: grid;
+        gap: 6px;
+      }
+
+      .participationTray .rankRow {
+        display: grid;
+        grid-template-columns: 22px minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+        padding: 8px 9px;
+        border: 1px solid transparent;
+        border-radius: 10px;
+        background: rgba(255,255,255,.035);
+      }
+
+      .participationTray .rankRow.interactive {
+        cursor: pointer;
+      }
+
+      .participationTray .rankRow.interactive:hover {
+        border-color: rgba(255,255,255,.12);
+        background: rgba(255,255,255,.06);
+      }
+
+      .participationTray .rankRow.pending {
+        opacity: .45;
+      }
+
+      .participationTray .rankRow > em,
+      .participationTray .rankRow > b {
+        font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-style: normal;
+        opacity: .68;
+      }
+
+      .participationTray .rankIdea {
+        min-width: 0;
+        display: grid;
+        gap: 3px;
+        position: relative;
+        padding-bottom: 4px;
+      }
+
+      .participationTray .rankIdea > span {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 12px;
+      }
+
+      .participationTray .rankIdea > i {
+        font-size: 9px;
+        font-style: normal;
+        opacity: .42;
+      }
+
+      .participationTray .rankIdea > small {
+        position: absolute;
+        left: 0;
+        bottom: 0;
+        height: 1px;
+        border-radius: 999px;
+        background: currentColor;
+        opacity: .28;
+      }
+
+      .trayWorldLocation {
+        display: grid;
+        gap: 5px;
+        padding-right: 28px;
+      }
+
+      .trayWorldLocation > b {
+        font-size: 14px;
+      }
+
+      .trayWorldLocation > p,
+      .trayWorldLocation > em {
+        margin: 0;
+        max-width: 80ch;
+        font-size: 12px;
+        line-height: 1.45;
+        font-style: normal;
+        opacity: .68;
+      }
+
+      .trayWorldLocation > em {
+        opacity: .92;
+      }
+
+      .trayWorldGrid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 7px;
+      }
+
+      .trayWorldGrid article {
+        display: grid;
+        gap: 3px;
+        padding: 9px 10px;
+        border-radius: 10px;
+        background: rgba(255,255,255,.035);
+      }
+
+      .trayWorldGrid article > b {
+        font-size: 11px;
+      }
+
+      .trayWorldGrid article > span,
+      .trayWorldGrid article > small {
+        font-size: 10px;
+        line-height: 1.35;
+        opacity: .66;
+      }
+
+      .trayThreads {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+      }
+
+      .trayThreads > span {
+        max-width: 48ch;
+        padding: 6px 8px;
+        border: 1px solid rgba(255,255,255,.08);
+        border-radius: 999px;
+        font-size: 10px;
+        line-height: 1.25;
+        opacity: .7;
+      }
+
       @media (max-width: 760px) {
+        .participationTray {
+          width: min(94vw, 680px);
+          margin-top: 8px;
+        }
+
+        .trayBar {
+          grid-template-columns: 30px minmax(0, 1fr) auto;
+          padding-inline: 6px;
+        }
+
+        .trayAction.wallet > span {
+          display: none;
+        }
+
         .outsideConsole {
           width: min(94vw, 680px);
           grid-template-columns: 1fr;
@@ -1895,7 +2748,7 @@ function App() {
         <div className="tvCenter">
           <TactileTV clip={clip} />
         </div>
-        <OutsideConsole />
+        <ParticipationTray />
         {error ? (
           <div className="fatalBadge" title={error}>
             !

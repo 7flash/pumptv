@@ -1,23 +1,12 @@
-import {
-  ensurePromptRound,
-  submitPromptProposal,
-} from "../../../src/server/arbitration.ts";
 import { httpMeasure } from "../../../src/server/observability.ts";
 import { sanitizeLine } from "../../../src/server/prompt.ts";
-import { getLatestClip } from "../../../src/server/repository.ts";
+import { submitPumpfunProposal } from "../../../src/server/repository.ts";
 
-function webIdentity(value: unknown) {
-  const id = sanitizeLine(String(value || ""), 120);
-  if (!id) throw new Error("Missing voter id");
-  return {
-    voterKey: `web:${id}`,
-    author: `anon-${
-      id
-        .replace(/[^a-zA-Z0-9]/g, "")
-        .slice(0, 6)
-        .toLowerCase() || "viewer"
-    }`,
-  };
+function walletAddress(value: unknown) {
+  const address = sanitizeLine(String(value || ""), 64);
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address))
+    throw new Error("Connect a valid Solana wallet");
+  return address;
 }
 
 export async function POST(request: Request) {
@@ -25,33 +14,24 @@ export async function POST(request: Request) {
     const raw = await m("Parse request", () => request.json());
     if (!raw || typeof raw !== "object") throw new Error("Invalid JSON body");
     const body = raw as Record<string, unknown>;
-
     const text = sanitizeLine(String(body.text || ""), 500);
-    if (!text) throw new Error("Proposal cannot be empty");
+    if (!text) throw new Error("Idea cannot be empty");
+    const address = walletAddress(body.walletAddress);
+    const sourceId = `web:${address}:${crypto.randomUUID()}`;
 
-    const latest = await getLatestClip();
-    if (!latest)
-      throw new Error("The opening clip is still booting; try the next ballot");
-
-    const round = await ensurePromptRound(
-      latest.episode + 1,
-      latest.startsAtMs + latest.durationSeconds * 1000,
-    );
-    const identity = webIdentity(body.voterId);
-
-    return submitPromptProposal({
-      roundId: round.id,
+    return submitPumpfunProposal({
       text,
+      sourceId,
+      author: null,
+      authorAddress: address,
+      sourceRoom: "web",
+      voterKey: `wallet:${address}`,
+      voterHandle: null,
       source: "web",
-      author: identity.author,
-      voterKey: identity.voterKey,
     });
   });
 
   if (!result)
-    return Response.json(
-      { error: "Could not submit proposal." },
-      { status: 400 },
-    );
+    return Response.json({ error: "Could not submit idea." }, { status: 400 });
   return Response.json(result, { status: 201 });
 }

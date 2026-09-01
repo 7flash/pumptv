@@ -1,6 +1,7 @@
 import type {
   Clip,
   Directive,
+  DirectiveSource,
   GenerationMode,
   GenerationStage,
   GenerationTimingSample,
@@ -556,6 +557,7 @@ export async function submitPumpfunProposal(input: {
   sourceRoom: string | null;
   voterKey: string;
   voterHandle?: string | null;
+  source?: DirectiveSource;
 }) {
   const round = await roundForNewSuggestion();
   return dbMeasure.measureSync.assert("Submit Pump.fun proposal", () => {
@@ -586,7 +588,7 @@ export async function submitPumpfunProposal(input: {
           text: input.text,
           normalizedText: normalizeProposalText(input.text),
           status: "open",
-          source: "pumpfun",
+          source: input.source ?? "pumpfun",
           sourceId: input.sourceId,
           author: input.author,
           authorAddress: input.authorAddress,
@@ -605,7 +607,7 @@ export async function submitPumpfunProposal(input: {
         proposalId: Number((proposal as any).id),
         voterKey: input.voterKey,
         voterHandle: input.voterHandle ?? null,
-        source: "pumpfun",
+        source: input.source ?? "pumpfun",
         sourceId: input.sourceId,
       });
       const row = db.raw<any>(
@@ -642,6 +644,7 @@ export async function castPumpfunVote(input: {
   voterKey: string;
   voterHandle?: string | null;
   sourceId: string;
+  source?: DirectiveSource;
 }) {
   const round = await getOpenPromptRound();
   if (!round) return null;
@@ -659,7 +662,7 @@ export async function castPumpfunVote(input: {
         proposalId: input.proposalId,
         voterKey: input.voterKey,
         voterHandle: input.voterHandle ?? null,
-        source: "pumpfun",
+        source: input.source ?? "pumpfun",
         sourceId: input.sourceId,
       });
       db.exec("COMMIT");
