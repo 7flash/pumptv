@@ -145,19 +145,19 @@ async function generationTick() {
     }
 
     const episode = await nextEpisode();
-    console.log(
-      `[worker] generating EP ${episode + 1} · ${lockedRoom.resolution} · ${lockedOpening ? "opening" : "pump.fun prompt"}`,
-    );
     await setWorkerState("generating", null, "full");
 
     let clip;
     try {
-      clip = await workerMeasure.measure.assert(
+      clip = await workerMeasure.measure(
         {
-          label: "Generate episode",
-          episode,
-          resolution: lockedRoom.resolution,
-          mode: "full",
+          start: () =>
+            `Generate EP ${episode + 1} · ${lockedRoom.resolution} · ${lockedOpening ? "opening" : "triggered proposal"}`,
+          end: (result) => ({
+            episode: result.episode + 1,
+            totalMs: result.totalGenerationMs ?? null,
+            directive: result.directive,
+          }),
         },
         () =>
           generateNextClip({
@@ -182,9 +182,6 @@ async function generationTick() {
       };
     }
 
-    console.log(
-      `[worker] published EP ${clip.episode + 1} · ${clip.totalGenerationMs ?? 0}ms`,
-    );
     const finishedAtMs = Date.now();
     await ensureOpenPromptRound(clip.episode + 1);
 
@@ -209,14 +206,19 @@ async function generationTick() {
 }
 
 export async function runRoomWorker() {
-  console.log(`[worker] PumpTV room worker ${owner}`);
-  console.log(
-    `[worker] cwd=${process.cwd()} · FAL_KEY=${(process.env.FAL_KEY || "").trim() ? "present" : "missing"} · room=${process.env.PUMPTV_ROOM || "main"}`,
+  workerMeasure.measureSync(
+    {
+      start: () => `PumpTV worker ${owner}`,
+      end: (info) => info,
+    },
+    () => ({
+      cwd: process.cwd(),
+      room: process.env.PUMPTV_ROOM || "main",
+      db: dbPath,
+      fal: (process.env.FAL_KEY || "").trim() ? "present" : "missing",
+      jsxAI: `${process.env.JSX_AI_RUNTIME || "default"}/${process.env.JSX_AI_MODEL || "runtime-default"}`,
+    }),
   );
-  console.log(
-    `[worker] jsx-ai=${process.env.JSX_AI_RUNTIME || "default"}/${process.env.JSX_AI_MODEL || "runtime-default"}`,
-  );
-  console.log(`[worker] db=${dbPath}`);
 
   while (!stopping) {
     try {

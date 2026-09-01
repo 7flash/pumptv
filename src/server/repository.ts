@@ -486,7 +486,7 @@ function loadRoundById(id: number): PromptRound | null {
 }
 
 export async function getOpenPromptRound(): Promise<PromptRound | null> {
-  return dbMeasure.measureSync("Load open Pump.fun round", () => {
+  return dbMeasure.measureSync("Load open proposal board", () => {
     const row =
       db.raw<any>(
         `SELECT id FROM promptRounds WHERE status = 'open' ORDER BY id DESC LIMIT 1`,
@@ -496,7 +496,7 @@ export async function getOpenPromptRound(): Promise<PromptRound | null> {
 }
 
 export async function getLatestPromptRound(): Promise<PromptRound | null> {
-  return dbMeasure.measureSync("Load latest Pump.fun round", () => {
+  return dbMeasure.measureSync("Load latest proposal board", () => {
     const row =
       db.raw<any>(`SELECT id FROM promptRounds ORDER BY id DESC LIMIT 1`)[0] ||
       null;
@@ -517,15 +517,48 @@ export async function getPromptRoundForProposal(
   });
 }
 
+async function expectedProposalBoardEpisode() {
+  const next = await nextEpisode();
+  // EP 1 is the opening generated without a proposal. While there are no clips
+  // yet, suggestions are therefore for EP 2 (zero-based episode 1).
+  if (next === 0) return 1;
+  const pending = nextPendingDirectiveWithVotes();
+  return next + (pending ? 1 : 0);
+}
+
 export async function ensureOpenPromptRound(
   targetEpisode?: number,
 ): Promise<PromptRound> {
+  const desired = targetEpisode ?? (await expectedProposalBoardEpisode());
   const existing = await getOpenPromptRound();
-  if (existing) return existing;
-  const next = targetEpisode ?? (await nextEpisode());
-  return dbMeasure.measureSync.assert("Open Pump.fun prompt round", () => {
+  if (existing) {
+    if (existing.targetEpisode !== desired) {
+      return dbMeasure.measureSync(
+        {
+          start: () =>
+            `Retarget proposal board EP ${existing.targetEpisode + 1} → ${desired + 1}`,
+          end: (round) => ({
+            id: round.id,
+            targetEpisode: round.targetEpisode + 1,
+          }),
+        },
+        () => {
+          db.exec(
+            `UPDATE promptRounds SET targetEpisode = ? WHERE id = ?`,
+            desired,
+            existing.id,
+          );
+          const loaded = loadRoundById(existing.id);
+          if (!loaded) throw new Error("Could not reload proposal board");
+          return loaded;
+        },
+      );
+    }
+    return existing;
+  }
+  return dbMeasure.measureSync("Open persistent proposal board", () => {
     const row = db.promptRounds.insert({
-      targetEpisode: next,
+      targetEpisode: desired,
       status: "open",
       openedAtMs: Date.now(),
       votingStartedAtMs: null,
@@ -541,15 +574,9 @@ export async function ensureOpenPromptRound(
 }
 
 async function roundForNewSuggestion() {
-  const open = await getOpenPromptRound();
-  if (open) return open;
-  const latest = await getLatestPromptRound();
-  const base = await nextEpisode();
-  const target =
-    latest?.status === "closed"
-      ? Math.max(base, latest.targetEpisode + 1)
-      : base;
-  return ensureOpenPromptRound(target);
+  // The board follows actual generated/locked work, never historical round ids.
+  // This prevents repeated resets/triggers from drifting EP 7 into EP 16/61.
+  return ensureOpenPromptRound();
 }
 
 function clampWeight(value: number) {
@@ -568,7 +595,7 @@ export async function upsertWebProposal(input: {
   const normalized = normalizeProposalText(text);
   const ownerWeight = clampWeight(input.ownerWeight ?? 1);
 
-  return dbMeasure.measureSync.assert("Upsert persistent web proposal", () => {
+  return dbMeasure.measureSync("Upsert persistent web proposal", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       const own =
@@ -653,7 +680,7 @@ export async function upsertWebProposal(input: {
 export async function cancelWebProposal(ownerKey: string) {
   const round = await getOpenPromptRound();
   if (!round) return false;
-  return dbMeasure.measureSync.assert("Cancel persistent web proposal", () => {
+  return dbMeasure.measureSync("Cancel persistent web proposal", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       const proposal =
@@ -687,7 +714,7 @@ export async function attachWebWallet(input: {
   const round = await getOpenPromptRound();
   if (!round) return null;
   const weight = clampWeight(input.weight);
-  return dbMeasure.measureSync.assert("Apply wallet voting power", () => {
+  return dbMeasure.measureSync("Apply wallet voting power", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       db.exec(
@@ -728,7 +755,7 @@ export async function castWebVote(input: {
     throw new Error("Your own idea already carries your score");
   const weight = clampWeight(input.weight);
 
-  return dbMeasure.measureSync.assert("Cast persistent web vote", () => {
+  return dbMeasure.measureSync("Cast persistent web vote", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       db.exec(
@@ -767,7 +794,7 @@ export async function submitPumpfunProposal(input: {
   source?: DirectiveSource;
 }) {
   const round = await roundForNewSuggestion();
-  return dbMeasure.measureSync.assert("Submit Pump.fun proposal", () => {
+  return dbMeasure.measureSync("Submit proposal", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       let proposal =
@@ -845,7 +872,7 @@ export async function castPumpfunVote(input: {
   const round = await getOpenPromptRound();
   if (!round) return null;
   if (!round.proposals.some((p) => p.id === input.proposalId)) return null;
-  return dbMeasure.measureSync.assert("Cast Pump.fun vote", () => {
+  return dbMeasure.measureSync("Cast proposal vote", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       db.exec(
@@ -887,7 +914,7 @@ export async function castPumpfunVoteByHandle(input: {
   // Resolve the handle to the suggestion they authored. If their suggestion was
   // merged into an earlier near-duplicate, resolve the proposal they voted for
   // when they submitted it. Chat never needs to know an internal proposal id.
-  const proposal = dbMeasure.measureSync("Resolve Pump.fun vote handle", () => {
+  const proposal = dbMeasure.measureSync("Resolve proposal vote handle", () => {
     const authored =
       db.raw<any>(
         `SELECT * FROM proposals
@@ -921,7 +948,7 @@ export async function setProposalVoteOverride(
   proposalId: number,
   value: number | null,
 ) {
-  return dbMeasure.measureSync.assert("Override proposal votes", () => {
+  return dbMeasure.measureSync("Override proposal votes", () => {
     const proposal =
       db.raw<any>(
         `SELECT * FROM proposals WHERE id = ? LIMIT 1`,
@@ -1002,22 +1029,26 @@ export async function closePromptRound(
 ): Promise<Directive | null> {
   const round = await getOpenPromptRound();
   if (!round || round.proposals.length === 0) return null;
-  const nextTargetEpisode = Math.max(
-    round.targetEpisode + 1,
-    await nextEpisode(),
-  );
+  const generationEpisode = await nextEpisode();
+  if (generationEpisode === 0)
+    throw new Error(
+      "The opening episode must publish before proposals can be triggered",
+    );
   const winner =
     winnerProposalId == null
       ? round.proposals[0]
       : round.proposals.find((p) => p.id === winnerProposalId);
   if (!winner)
     throw new Error(`Proposal #${winnerProposalId} is not in the open round`);
-  return dbMeasure.measureSync.assert("Close Pump.fun round", () => {
+  return dbMeasure.measureSync("Lock proposal winner", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       const now = Date.now();
       db.exec(
-        `UPDATE promptRounds SET status = 'closed', closedAtMs = ?, winnerProposalId = ? WHERE id = ? AND status = 'open'`,
+        `UPDATE promptRounds
+         SET targetEpisode = ?, status = 'closed', closedAtMs = ?, winnerProposalId = ?
+         WHERE id = ? AND status = 'open'`,
+        generationEpisode,
         now,
         winner.id,
         round.id,
@@ -1050,7 +1081,7 @@ export async function closePromptRound(
       carryProposalBoardForward({
         roundId: round.id,
         winnerProposalId: winner.id,
-        targetEpisode: nextTargetEpisode,
+        targetEpisode: generationEpisode + 1,
         now,
       });
       db.exec("COMMIT");
@@ -1063,6 +1094,18 @@ export async function closePromptRound(
       throw error;
     }
   });
+}
+
+export async function triggerPromptRound(
+  winnerProposalId?: number,
+): Promise<Directive | null> {
+  const pending = nextPendingDirectiveWithVotes();
+  if (pending) {
+    throw new Error(
+      `Next generation is already ${pending.status}: ${pending.text}`,
+    );
+  }
+  return closePromptRound(winnerProposalId);
 }
 
 export async function forceProposalAsNext(
@@ -1085,7 +1128,7 @@ export async function forceProposalAsNext(
     return directive;
   }
 
-  return dbMeasure.measureSync.assert("Override locked Pump.fun winner", () => {
+  return dbMeasure.measureSync("Override locked proposal winner", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       const existing =
@@ -1160,7 +1203,7 @@ export async function operatorInjectProposal(text: string) {
   const round = await roundForNewSuggestion();
   const sourceId = `operator:${Date.now()}:${crypto.randomUUID()}`;
 
-  return dbMeasure.measureSync.assert("Inject operator proposal", () => {
+  return dbMeasure.measureSync("Inject operator proposal", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       let proposal =
@@ -1459,7 +1502,7 @@ export async function saveClipWithWorldState(
     audit?: Omit<WorldStateAudit, "episode"> | null;
   },
 ) {
-  const row = await dbMeasure.measureSync.assert(
+  const row = await dbMeasure.measureSync(
     "Persist generated scene + reconciled world state",
     () => {
       db.exec("BEGIN IMMEDIATE");
@@ -1575,7 +1618,7 @@ export async function getStreamState(): Promise<StreamState> {
     await Promise.all([
       getRoomRow(),
       getTimeline(),
-      dbMeasure.measureSync("Count queued Pump.fun prompts", () =>
+      dbMeasure.measureSync("Count triggered prompts", () =>
         db.directives
           .select()
           .where({ status: "queued", triggered: true })

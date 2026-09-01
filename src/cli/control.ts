@@ -62,7 +62,7 @@ function statusLines(state: StreamState, now = Date.now()) {
   const p = state.program;
   const lines = [
     `program: ${p.phase.toUpperCase()} · live EP ${p.liveEpisode == null ? "—" : p.liveEpisode + 1} · target EP ${p.targetEpisode + 1}`,
-    `worker: ${state.room.workerOnline ? "online" : "offline"} · ${state.room.workerProcess.state}${state.room.workerProcess.pid ? ` pid ${state.room.workerProcess.pid}` : ""} · pump.fun ${state.room.pumpfun.state}`,
+    `worker: ${state.room.workerOnline ? "online" : "offline"} · ${state.room.workerProcess.state}${state.room.workerProcess.pid ? ` pid ${state.room.workerProcess.pid}` : ""}`,
   ];
   if (p.reason) lines.push(`reason: ${p.reason}`);
   if (p.directive)
@@ -137,7 +137,7 @@ if (command === "status") {
     for (const p of round.proposals)
       console.log(`#${p.id} ${p.voteCount} ${p.text}`);
 } else if (command === "close" || command === "trigger") {
-  const directive = await repo.closePromptRound();
+  const directive = await repo.triggerPromptRound();
   if (!directive) throw new Error("No open round with proposals");
   console.log(`[control] locked → ${directive.text}`);
 } else if (command === "force") {
@@ -192,8 +192,9 @@ if (command === "status") {
     throw error;
   }
 
+  await repo.ensureOpenPromptRound(await repo.nextEpisode());
   console.log(
-    `[control] discarded ${before} queued/generating prompt${before === 1 ? "" : "s"}; proposal board preserved; next generation requires bun run control -- trigger`,
+    `[control] discarded ${before} queued/generating prompt${before === 1 ? "" : "s"}; proposal board preserved and retargeted; next generation requires bun run control -- trigger`,
   );
 } else if (command === "inject") {
   const text = args.join(" ").trim();

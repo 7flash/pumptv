@@ -1,4 +1,8 @@
-import { httpMeasure } from "../../../src/server/observability.ts";
+import {
+  errorText,
+  httpMeasure,
+  measuredRoute,
+} from "../../../src/server/observability.ts";
 import { sanitizeLine } from "../../../src/server/prompt.ts";
 import {
   cancelWebProposal,
@@ -10,46 +14,88 @@ import {
 } from "../../../src/server/wallet-score.ts";
 
 function ownerKey(value: unknown) {
-  const id = sanitizeLine(String(value || ""), 160);
-  if (!id) throw new Error("Missing viewer id");
+  const id = sanitizeLine(String(value || ""), 180);
+  if (!id) throw new Error("Missing proposal owner id");
   return `web:${id}`;
 }
 
-export async function POST(request: Request) {
-  const result = await httpMeasure.measure("POST /api/proposals", async (m) => {
-    const raw = await m("Parse request", () => request.json());
-    if (!raw || typeof raw !== "object") throw new Error("Invalid JSON body");
-    const body = raw as Record<string, unknown>;
-    const text = sanitizeLine(String(body.text || ""), 500);
-    if (!text) throw new Error("Idea cannot be empty");
-    const walletAddress = normalizeSolanaAddress(body.walletAddress);
-    const { power } = await walletVotingPower(walletAddress);
+export function POST(request: Request) {
+  return measuredRoute(request, async () => {
+    try {
+      const body = await httpMeasure.measure(
+        {
+          start: () => "Parse proposal request",
+          end: () => "ok",
+        },
+        async () => {
+          const raw = await request.json();
+          if (!raw || typeof raw !== "object" || Array.isArray(raw))
+            throw new Error("Invalid JSON body");
+          return raw as Record<string, unknown>;
+        },
+      );
 
-    return upsertWebProposal({
-      text,
-      ownerKey: ownerKey(body.viewerId),
-      walletAddress,
-      ownerWeight: power,
-    });
+      const text = sanitizeLine(String(body.text || ""), 500);
+      if (!text) throw new Error("Idea cannot be empty");
+      const identity = body.ownerId ?? body.viewerId;
+      const walletAddress = normalizeSolanaAddress(body.walletAddress);
+      const { power } = await httpMeasure.measure(
+        {
+          start: () => "Resolve proposal score",
+          end: (score) => score,
+        },
+        () => walletVotingPower(walletAddress),
+      );
+
+      const proposal = await httpMeasure.measure(
+        {
+          start: () => "Save persistent proposal",
+          end: (saved) =>
+            saved
+              ? { id: saved.id, score: saved.voteCount, text: saved.text }
+              : null,
+        },
+        () =>
+          upsertWebProposal({
+            text,
+            ownerKey: ownerKey(identity),
+            walletAddress,
+            ownerWeight: power,
+          }),
+      );
+
+      if (!proposal)
+        return Response.json(
+          { error: "Could not save idea." },
+          { status: 400 },
+        );
+      return Response.json(proposal, { status: 201 });
+    } catch (error) {
+      return Response.json({ error: errorText(error) }, { status: 400 });
+    }
   });
-
-  if (!result)
-    return Response.json({ error: "Could not save idea." }, { status: 400 });
-  return Response.json(result, { status: 201 });
 }
 
-export async function DELETE(request: Request) {
-  const result = await httpMeasure.measure(
-    "DELETE /api/proposals",
-    async (m) => {
-      const raw = await m("Parse request", () => request.json());
-      if (!raw || typeof raw !== "object") throw new Error("Invalid JSON body");
-      const body = raw as Record<string, unknown>;
-      return cancelWebProposal(ownerKey(body.viewerId));
-    },
-  );
-
-  if (result == null)
-    return Response.json({ error: "Could not cancel idea." }, { status: 400 });
-  return Response.json({ ok: true, removed: Boolean(result) });
+export function DELETE(request: Request) {
+  return measuredRoute(request, async () => {
+    try {
+      const body = await httpMeasure.measure(
+        "Parse proposal delete",
+        async () => {
+          const raw = await request.json();
+          if (!raw || typeof raw !== "object" || Array.isArray(raw))
+            throw new Error("Invalid JSON body");
+          return raw as Record<string, unknown>;
+        },
+      );
+      const identity = body.ownerId ?? body.viewerId;
+      const removed = await httpMeasure.measure(
+        "Cancel persistent proposal",
+        () => cancelWebProposal(ownerKey(identity)),
+      );
+      return Response.json({ ok: true, removed: Boolean(removed) });
+    } catch (error) {
+      return Response.json({ error: errorText(error) }, { status: 400 });
+    }
+  });
 }

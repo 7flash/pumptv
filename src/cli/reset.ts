@@ -88,7 +88,7 @@ try {
         ).count || 0,
       );
       const answer = await rl.question(
-        `Reset from EP ${fromEpisode}? ${futureCount} episode${futureCount === 1 ? "" : "s"} will be removed; Pump.fun prompts will ${requeue ? "be re-queued" : "remain consumed"}. [y/N] `,
+        `Reset from EP ${fromEpisode}? ${futureCount} episode${futureCount === 1 ? "" : "s"} will be removed; triggered prompts will ${requeue ? "be re-queued" : "remain consumed"}. [y/N] `,
       );
 
       if (!/^y(es)?$/i.test(answer.trim())) {
@@ -105,7 +105,7 @@ try {
             );
           } else {
             // Default reset is a clean rewind. Removed episodes do not silently create
-            // a generation backlog; a fresh Pump.fun winner/operator trigger is required.
+            // a generation backlog; a fresh proposal trigger is required.
             db.exec(
               `UPDATE directives
                SET status = 'used', usedEpisode = NULL, triggered = 0
@@ -117,6 +117,34 @@ try {
             `DELETE FROM worldStateSnapshots WHERE episode >= ${fromInternal}`,
           );
           db.exec(`DELETE FROM clips WHERE episode >= ${fromInternal}`);
+
+          const nextEpisode = Number(
+            (
+              db.raw<any>(
+                "SELECT COALESCE(MAX(episode), -1) + 1 AS episode FROM clips",
+              )[0] || {}
+            ).episode || 0,
+          );
+          const pendingTriggered = Number(
+            (
+              db.raw<any>(
+                "SELECT COUNT(*) AS count FROM directives WHERE triggered = 1 AND status IN ('queued','generating')",
+              )[0] || {}
+            ).count || 0,
+          );
+          db.exec(
+            `UPDATE promptRounds SET targetEpisode = ${Math.max(1, nextEpisode + (pendingTriggered ? 1 : 0))} WHERE status = 'open'`,
+          );
+          const pendingRound =
+            db.raw<any>(
+              `SELECT p.roundId FROM directives d JOIN proposals p ON p.id = d.proposalId
+             WHERE d.triggered = 1 AND d.status IN ('queued','generating')
+             ORDER BY d.id ASC LIMIT 1`,
+            )[0] || null;
+          if (pendingRound)
+            db.exec(
+              `UPDATE promptRounds SET targetEpisode = ${Math.max(1, nextEpisode)} WHERE id = ${Number(pendingRound.roundId)}`,
+            );
 
           db.exec(
             `UPDATE rooms SET
@@ -155,7 +183,7 @@ try {
         );
         console.log(`[reset] db=${dbPath}`);
         console.log(
-          `[reset] kept ${remaining} episode${remaining === 1 ? "" : "s"}; ${queued} Pump.fun prompt${queued === 1 ? "" : "s"} queued`,
+          `[reset] kept ${remaining} episode${remaining === 1 ? "" : "s"}; ${queued} triggered prompt${queued === 1 ? "" : "s"} queued`,
         );
         console.log(`[reset] next generated episode will be EP ${fromEpisode}`);
       }

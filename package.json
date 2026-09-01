@@ -15,13 +15,13 @@
   },
   "dependencies": {
     "@fal-ai/client": "^1.6.2",
-    "@openai/codex-sdk": "latest",
-    "bgrun": "^3.14.0",
-    "jsx-ai": "0.21.2",
-    "measure-fn": "^3.11.2",
+    "measure-fn": "^5.2.0",
     "sqlite-zod-orm": "^3.33.0",
     "tradjs": "^4.3.0",
-    "ws": "^8.18.0"
+    "ws": "^8.18.0",
+    "jsx-ai": "latest",
+    "bgrun": "^3.14.0",
+    "@openai/codex-sdk": "latest"
   },
   "devDependencies": {
     "@types/bun": "latest",

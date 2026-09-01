@@ -13,7 +13,10 @@ export async function extractVideoFrame(
   frameType: VideoFrameType,
 ): Promise<string> {
   const result = await falMeasure.measure(
-    { label: "Extract video frame", frameType },
+    {
+      start: () => `Extract ${frameType} frame`,
+      end: (response) => ({ requestId: response.requestId }),
+    },
     () =>
       fal.subscribe("fal-ai/ffmpeg-api/extract-frame", {
         input: { video_url: videoUrl, frame_type: frameType },

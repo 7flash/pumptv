@@ -1,4 +1,8 @@
-import { httpMeasure } from "../../../../src/server/observability.ts";
+import {
+  errorText,
+  httpMeasure,
+  measuredRoute,
+} from "../../../../src/server/observability.ts";
 import { sanitizeLine } from "../../../../src/server/prompt.ts";
 import { attachWebWallet } from "../../../../src/server/repository.ts";
 import {
@@ -7,34 +11,42 @@ import {
 } from "../../../../src/server/wallet-score.ts";
 
 function ownerKey(value: unknown) {
-  const id = sanitizeLine(String(value || ""), 160);
-  if (!id) throw new Error("Missing viewer id");
+  const id = sanitizeLine(String(value || ""), 180);
+  if (!id) throw new Error("Missing proposal owner id");
   return `web:${id}`;
 }
 
-export async function POST(request: Request) {
-  const result = await httpMeasure.measure(
-    "POST /api/wallet/score",
-    async (m) => {
-      const raw = await m("Parse request", () => request.json());
-      if (!raw || typeof raw !== "object") throw new Error("Invalid JSON body");
-      const body = raw as Record<string, unknown>;
+export function POST(request: Request) {
+  return measuredRoute(request, async () => {
+    try {
+      const body = await httpMeasure.measure(
+        "Parse wallet request",
+        async () => {
+          const raw = await request.json();
+          if (!raw || typeof raw !== "object" || Array.isArray(raw))
+            throw new Error("Invalid JSON body");
+          return raw as Record<string, unknown>;
+        },
+      );
       const address = normalizeSolanaAddress(body.walletAddress);
       if (!address) throw new Error("Invalid Solana wallet");
-      const score = await walletVotingPower(address);
-      await attachWebWallet({
-        ownerKey: ownerKey(body.viewerId),
-        walletAddress: address,
-        weight: score.power,
-      });
-      return { walletAddress: address, ...score };
-    },
-  );
-
-  if (!result)
-    return Response.json(
-      { error: "Could not read token balance." },
-      { status: 400 },
-    );
-  return Response.json(result);
+      const score = await httpMeasure.measure(
+        {
+          start: () => "Read wallet token balance",
+          end: (value) => value,
+        },
+        () => walletVotingPower(address),
+      );
+      await httpMeasure.measure("Apply wallet score", () =>
+        attachWebWallet({
+          ownerKey: ownerKey(body.ownerId ?? body.viewerId),
+          walletAddress: address,
+          weight: score.power,
+        }),
+      );
+      return Response.json({ walletAddress: address, ...score });
+    } catch (error) {
+      return Response.json({ error: errorText(error) }, { status: 400 });
+    }
+  });
 }

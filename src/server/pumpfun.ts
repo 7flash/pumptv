@@ -99,7 +99,10 @@ async function ingestMessage(message: PumpfunMessage) {
 
   if (command.kind === "vote") {
     const round = await pumpMeasure.measure(
-      { label: "Cast Pump.fun vote", room: MINT, handle: command.handle },
+      {
+        start: () => `Chat vote @${command.handle}`,
+        end: (value) => ({ round: value?.id ?? null }),
+      },
       () =>
         castPumpfunVoteByHandle({
           handle: command.handle,
@@ -117,9 +120,8 @@ async function ingestMessage(message: PumpfunMessage) {
 
   const proposal = await pumpMeasure.measure(
     {
-      label: "Submit Pump.fun proposal",
-      room: MINT,
-      messageId: message.id || null,
+      start: () => `Chat proposal ${message.id || sourceId}`,
+      end: (value) => (value ? { id: value.id, score: value.voteCount } : null),
     },
     () =>
       submitPumpfunProposal({
@@ -179,10 +181,9 @@ export async function runPumpfunChatIngestor() {
   await getRoomRow();
 
   if (!MINT) {
+    // Pump.fun chat is optional. A disabled adapter is normal and should not
+    // pollute the operator log or surface as a warning in the viewer UI.
     await setPumpChatState("disabled", null);
-    console.log(
-      "[pumpfun] disabled; set PUMPTV_PUMPFUN_MINT to ingest live chat",
-    );
     return;
   }
 
@@ -191,8 +192,12 @@ export async function runPumpfunChatIngestor() {
   );
 
   while (!stopping) {
-    const owned = await pumpMeasure.measure("Pump.fun lease session", () =>
-      runLeasedSession(),
+    const owned = await pumpMeasure.measure(
+      {
+        start: () => "Chat lease session",
+        end: (value) => ({ owned: Boolean(value) }),
+      },
+      () => runLeasedSession(),
     );
     if (!owned) await sleep(POLL_MS);
     else if (!stopping) await sleep(500);

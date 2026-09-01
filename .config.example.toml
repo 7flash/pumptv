@@ -13,6 +13,7 @@ model = "gpt-5.6"
 [pumptv]
 db_path = ".data/pumptv.sqlite"
 room = "main"
+admin_token = ""
 resolution = "480P"
 
 min_generation_interval_ms = 0
@@ -22,8 +23,11 @@ timeline_window = 96
 idle_poll_ms = 500
 error_backoff_ms = 2000
 
-# Pump.fun chat can join the same persistent proposal board as web viewers.
-# Leave mint blank to disable chat ingestion and token-weight lookup.
+# Token mint used for Phantom holding-weight. This is independent of chat.
+token_mint = ""
+
+# Optional Pump.fun live-chat ingestion. Leave blank when the web proposal board
+# is the only input source; disabled chat is not treated as an error.
 pumpfun_mint = ""
 pumpfun_prefix = "!next"
 pumpfun_vote_prefix = "!vote"
@@ -36,6 +40,6 @@ pumpfun_user_cooldown_ms = 0
 solana_rpc_url = "https://api.mainnet-beta.solana.com"
 wallet_score_cache_ms = 20000
 
+# PumpTV forces measure-fn output on in src/server/observability.ts.
 [measure]
-silent = 0
 timestamps = 1

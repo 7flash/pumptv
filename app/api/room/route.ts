@@ -1,4 +1,8 @@
-import { httpMeasure } from "../../../src/server/observability.ts";
+import {
+  errorText,
+  httpMeasure,
+  measuredRoute,
+} from "../../../src/server/observability.ts";
 import {
   getRoomRow,
   normalizeResolution,
@@ -6,49 +10,56 @@ import {
 } from "../../../src/server/repository.ts";
 
 function authorized(request: Request) {
-  const expected = process.env.PUMPTV_ADMIN_TOKEN;
-  if (!expected) return true;
+  const expected = (process.env.PUMPTV_ADMIN_TOKEN || "").trim();
+  if (!expected) return false;
   return request.headers.get("x-pumptv-admin-token") === expected;
 }
 
-export async function GET() {
-  const room = await httpMeasure.measure("GET /api/room", () => getRoomRow());
-  if (!room)
-    return Response.json({ error: "Could not load room." }, { status: 500 });
-  return Response.json({
-    name: room.name,
-    running: Boolean(room.running),
-    resolution: room.resolution,
-    workerState: room.workerState,
-    lastError: room.lastError ?? null,
+export function GET(request: Request) {
+  return measuredRoute(request, async () => {
+    const room = await httpMeasure.measure("Load room", () => getRoomRow());
+    return Response.json({
+      name: room.name,
+      running: Boolean(room.running),
+      resolution: room.resolution,
+      workerState: room.workerState,
+      lastError: room.lastError ?? null,
+    });
   });
 }
 
-export async function PATCH(request: Request) {
-  if (!authorized(request))
-    return Response.json({ error: "Unauthorized" }, { status: 401 });
-
-  const result = await httpMeasure.measure("PATCH /api/room", async (m) => {
-    const raw = await m("Parse request", () => request.json());
-    if (!raw || typeof raw !== "object") throw new Error("Invalid JSON body");
-    const body = raw as Record<string, unknown>;
-
-    return updateRoomSettings({
-      running: typeof body.running === "boolean" ? body.running : undefined,
-      resolution:
-        body.resolution === undefined
-          ? undefined
-          : normalizeResolution(body.resolution),
-    });
-  });
-
-  if (!result)
-    return Response.json({ error: "Could not update room." }, { status: 400 });
-  return Response.json({
-    name: result.name,
-    running: Boolean(result.running),
-    resolution: result.resolution,
-    workerState: result.workerState,
-    lastError: result.lastError ?? null,
+export function PATCH(request: Request) {
+  return measuredRoute(request, async () => {
+    if (!authorized(request))
+      return Response.json({ error: "Unauthorized" }, { status: 401 });
+    try {
+      const body = await httpMeasure.measure(
+        "Parse room settings",
+        async () => {
+          const raw = await request.json();
+          if (!raw || typeof raw !== "object" || Array.isArray(raw))
+            throw new Error("Invalid JSON body");
+          return raw as Record<string, unknown>;
+        },
+      );
+      const result = await httpMeasure.measure("Update room settings", () =>
+        updateRoomSettings({
+          running: typeof body.running === "boolean" ? body.running : undefined,
+          resolution:
+            body.resolution === undefined
+              ? undefined
+              : normalizeResolution(body.resolution),
+        }),
+      );
+      return Response.json({
+        name: result.name,
+        running: Boolean(result.running),
+        resolution: result.resolution,
+        workerState: result.workerState,
+        lastError: result.lastError ?? null,
+      });
+    } catch (error) {
+      return Response.json({ error: errorText(error) }, { status: 400 });
+    }
   });
 }

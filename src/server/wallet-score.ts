@@ -1,4 +1,10 @@
-const MINT = (process.env.PUMPTV_PUMPFUN_MINT || "").trim();
+import { walletMeasure } from "./observability.ts";
+
+const MINT = (
+  process.env.PUMPTV_TOKEN_MINT ||
+  process.env.PUMPTV_PUMPFUN_MINT ||
+  ""
+).trim();
 const RPC_URL =
   (process.env.PUMPTV_SOLANA_RPC_URL || "").trim() ||
   "https://api.mainnet-beta.solana.com";
@@ -26,20 +32,27 @@ export async function tokenBalanceForWallet(address: string) {
   if (cached && Date.now() - cached.checkedAtMs < CACHE_MS)
     return cached.tokenBalance;
 
-  const response = await fetch(RPC_URL, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: 1,
-      method: "getTokenAccountsByOwner",
-      params: [
-        address,
-        { mint: MINT },
-        { encoding: "jsonParsed", commitment: "confirmed" },
-      ],
-    }),
-  });
+  const response = await walletMeasure.measure(
+    {
+      start: () => `Token balance ${address.slice(0, 5)}…${address.slice(-4)}`,
+      end: (result) => ({ status: result.status }),
+    },
+    () =>
+      fetch(RPC_URL, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "getTokenAccountsByOwner",
+          params: [
+            address,
+            { mint: MINT },
+            { encoding: "jsonParsed", commitment: "confirmed" },
+          ],
+        }),
+      }),
+  );
   if (!response.ok) throw new Error(`Solana RPC ${response.status}`);
 
   const payload = (await response.json()) as any;

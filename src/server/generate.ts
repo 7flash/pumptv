@@ -100,8 +100,14 @@ export async function generateNextClip(input: {
 
     await setGenerationStage("rendering");
     const h3StartedAt = performance.now();
-    const result = await falMeasure.measure.assert(
-      { label: "Generate H3 Max clip", episode, endpoint, mode },
+    const result = await falMeasure.measure(
+      {
+        start: () => `H3 Max EP ${episode + 1} · ${mode} · ${endpoint}`,
+        end: (response) => ({
+          requestId: response.requestId,
+          hasVideo: Boolean((response.data as any)?.video?.url),
+        }),
+      },
       () =>
         fal.subscribe(endpoint, { input: requestInput as any, logs: false }),
     );

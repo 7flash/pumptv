@@ -265,8 +265,11 @@ export async function planNextShot(input: {
     };
   }
 
-  const result = await showrunnerMeasure.measure.assert(
-    { label: "Stage next shot", episode: input.episode, model: MODEL },
+  const result = await showrunnerMeasure.measure(
+    {
+      start: () => `Stage EP ${input.episode + 1} · ${MODEL}`,
+      end: () => ({ model: MODEL }),
+    },
     () =>
       callLLM(
         <PumpTVShowrunnerPrompt
@@ -325,9 +328,11 @@ export async function planNextShot(input: {
     }
   }
 
-  console.log(
-    `[showrunner] staged EP ${input.episode + 1} via JSX-AI tools · ${calls.length} calls · ${process.env.JSX_AI_RUNTIME || "default"}/${MODEL}`,
-  );
+  showrunnerMeasure.measureSync(`EP ${input.episode + 1} staged`, () => ({
+    calls: calls.length,
+    runtime: process.env.JSX_AI_RUNTIME || "default",
+    model: MODEL,
+  }));
 
   return {
     plan,

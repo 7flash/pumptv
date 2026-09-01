@@ -167,6 +167,34 @@ dbMeasure.measureSync("Migrate persistent proposal board", () => {
      WHERE COALESCE(triggered, 0) = 0
        AND status IN ('queued', 'generating')`,
   );
+
+  // Repair proposal-board episode drift from builds that advanced round targets
+  // independently of actual generated clips. A pending triggered directive owns
+  // the real next episode; the open board then targets the episode after it.
+  db.exec(
+    `UPDATE promptRounds
+     SET targetEpisode = MAX(
+       1,
+       (SELECT COALESCE(MAX(episode), -1) + 1 FROM clips) +
+       CASE WHEN EXISTS (
+         SELECT 1 FROM directives
+         WHERE COALESCE(triggered, 0) = 1
+           AND status IN ('queued', 'generating')
+       ) THEN 1 ELSE 0 END
+     )
+     WHERE status = 'open'`,
+  );
+  db.exec(
+    `UPDATE promptRounds
+     SET targetEpisode = MAX(1, (SELECT COALESCE(MAX(episode), -1) + 1 FROM clips))
+     WHERE id IN (
+       SELECT p.roundId
+       FROM directives d
+       JOIN proposals p ON p.id = d.proposalId
+       WHERE COALESCE(d.triggered, 0) = 1
+         AND d.status IN ('queued', 'generating')
+     )`,
+  );
 });
 
 dbMeasure.measureSync("Create directive source index", () =>

@@ -19,6 +19,7 @@ let serverOffsetMs = 0;
 let replayClipId: number | null = null;
 let source: EventSource | null = null;
 let viewerId = "";
+let proposalOwnerId = "";
 let transport: "connecting" | "live" | "reconnecting" = "connecting";
 let error: string | null = null;
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -344,7 +345,7 @@ async function refreshStreamState() {
 }
 
 function ownerKey() {
-  return `web:${viewerId}`;
+  return `web:${proposalOwnerId}`;
 }
 
 function currentBoardRound() {
@@ -371,7 +372,11 @@ async function refreshWalletScore() {
       {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ viewerId, walletAddress }),
+        body: JSON.stringify({
+          viewerId,
+          ownerId: proposalOwnerId,
+          walletAddress,
+        }),
       },
     );
     walletTokenBalance = Number(result.tokenBalance || 0);
@@ -400,7 +405,12 @@ async function submitIdea() {
     await json("/api/proposals", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ text, viewerId, walletAddress }),
+      body: JSON.stringify({
+        text,
+        viewerId,
+        ownerId: proposalOwnerId,
+        walletAddress,
+      }),
     });
     ideaDraft = "";
     await refreshStreamState();
@@ -434,7 +444,7 @@ async function cancelOwnIdea() {
     await json("/api/proposals", {
       method: "DELETE",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ viewerId }),
+      body: JSON.stringify({ viewerId, ownerId: proposalOwnerId }),
     });
     ideaDraft = "";
     await refreshStreamState();
@@ -458,7 +468,12 @@ async function voteForProposal(proposalId: number) {
     await json("/api/votes", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ proposalId, viewerId, walletAddress }),
+      body: JSON.stringify({
+        proposalId,
+        viewerId,
+        ownerId: proposalOwnerId,
+        walletAddress,
+      }),
     });
     await refreshStreamState();
   } catch (cause) {
@@ -731,6 +746,16 @@ function ensureViewerIdAndPrefs() {
   if (!viewerId) {
     viewerId = crypto.randomUUID();
     localStorage.setItem("pumptv-viewer-id", viewerId);
+  }
+
+  // Anonymous proposal ownership is session-scoped rather than tied to viewer
+  // presence. Separate tabs/browsers can therefore each keep one persistent
+  // idea without silently editing each other's proposal. It survives refreshes
+  // in the same tab through sessionStorage.
+  proposalOwnerId = sessionStorage.getItem("pumptv-proposal-owner-id") || "";
+  if (!proposalOwnerId) {
+    proposalOwnerId = crypto.randomUUID();
+    sessionStorage.setItem("pumptv-proposal-owner-id", proposalOwnerId);
   }
 
   soundEnabled = readPref("pumptv-v25-sound", false);
@@ -1647,20 +1672,20 @@ function tooltipStatus() {
   if (!program || !room) return "PumpTV is starting";
   if (program.reason) return program.reason;
   if (program.phase === "starting") return "Generation worker is starting";
-  if (!room.pumpfun.enabled) return "Pump.fun chat is not configured";
-  if (room.pumpfun.state !== "live")
-    return `Pump.fun chat: ${room.pumpfun.state}`;
-  if (program.phase === "voting")
-    return "Pump.fun is choosing the next episode";
-  if (program.phase === "locked") return "Next episode locked";
+  if (program.phase === "locked")
+    return "Next episode is triggered and waiting for the worker";
   if (
     program.phase === "planning" ||
     program.phase === "rendering" ||
     program.phase === "finalizing"
   )
-    return "Generating next PumpTV episode";
-  if (program.phase === "ready") return "Next episode ready";
-  return "Waiting for Pump.fun suggestions";
+    return `Generating episode ${program.targetEpisode + 1}`;
+  if (program.phase === "ready")
+    return `Episode ${program.targetEpisode + 1} ready`;
+  const proposals = program.votingRound?.proposals.length || 0;
+  return proposals
+    ? `${proposals} active suggestion${proposals === 1 ? "" : "s"}; waiting for trigger`
+    : "Waiting for suggestions";
 }
 
 type ControlIconName =
@@ -2740,9 +2765,10 @@ function TactileTV({ clip }: { clip: Clip | null }) {
 
 function ProgramShelfSlot() {
   if (!program) return null;
-  const round = program.votingRound || program.decisionRound;
-  const candidateCount = round?.proposals.length || 0;
   const phase = program.phase;
+  const candidateCount = program.votingRound?.proposals.length || 0;
+  if (phase === "ready") return null; // the real future clip card is already in the rail
+  if (phase === "idle" && candidateCount === 0) return null;
   const title =
     program.reason ||
     (phase === "voting"
@@ -2751,14 +2777,14 @@ function ProgramShelfSlot() {
         ? `Generating episode ${program.targetEpisode + 1}`
         : phase === "locked"
           ? `Episode ${program.targetEpisode + 1} locked`
-          : phase === "ready"
-            ? `Episode ${program.targetEpisode + 1} ready`
-            : `Waiting for episode ${program.targetEpisode + 1}`);
+          : `Waiting for episode ${program.targetEpisode + 1}`);
   return (
     <div className={`programShelfSlot phase-${phase}`} aria-label={title}>
       <span className="programShelfVisual">
         <i className="programShelfPulse" />
-        {candidateCount > 0 ? <small>{candidateCount}</small> : null}
+        {phase === "idle" && candidateCount > 0 ? (
+          <small>{candidateCount}</small>
+        ) : null}
       </span>
       <b>{program.targetEpisode + 1}</b>
     </div>
@@ -2784,6 +2810,7 @@ function EpisodeShelf() {
         <span>●</span>
       </button>
       <div className="episodeList">
+        <ProgramShelfSlot />
         {episodes.map((clip) => {
           const active = shown?.id === clip.id;
           const isLive = live?.id === clip.id && replayClipId == null;
@@ -4195,6 +4222,69 @@ function OutsideInterfaceStyles() {
         flex: 0 0 auto !important;
         width: 100% !important;
         min-width: 0 !important;
+      }
+
+      .episodeList > .programShelfSlot {
+        flex: 0 0 66px !important;
+        width: 100% !important;
+        min-width: 0 !important;
+        display: grid !important;
+        grid-template-columns: minmax(0, 1fr) 24px;
+        align-items: center;
+        gap: 8px;
+        padding: 8px;
+        border: 1px solid rgba(255,255,255,.09) !important;
+        border-radius: 13px;
+        background: linear-gradient(180deg, rgba(255,255,255,.035), rgba(255,255,255,.012));
+        box-shadow: inset 0 1px rgba(255,255,255,.025), 0 5px 18px rgba(0,0,0,.18) !important;
+        box-sizing: border-box;
+      }
+
+      .programShelfVisual {
+        position: relative;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 0;
+        height: 46px;
+        border-radius: 9px;
+        background: rgba(0,0,0,.32);
+        overflow: hidden;
+      }
+
+      .programShelfPulse {
+        width: 9px;
+        height: 9px;
+        border-radius: 50%;
+        background: rgba(255,255,255,.42);
+        box-shadow: 0 0 0 5px rgba(255,255,255,.025);
+      }
+
+      .programShelfSlot.phase-locked .programShelfPulse,
+      .programShelfSlot.phase-planning .programShelfPulse,
+      .programShelfSlot.phase-rendering .programShelfPulse,
+      .programShelfSlot.phase-finalizing .programShelfPulse {
+        animation: programShelfBreath 1.15s ease-in-out infinite alternate;
+      }
+
+      .programShelfVisual > small {
+        position: absolute;
+        right: 6px;
+        bottom: 4px;
+        font-size: 9px;
+        opacity: .55;
+      }
+
+      .programShelfSlot > b {
+        font-size: 11px;
+        font-variant-numeric: tabular-nums;
+        opacity: .7;
+        text-align: center;
+      }
+
+      @keyframes programShelfBreath {
+        from { transform: scale(.9); opacity: .45; }
+        to { transform: scale(1.14); opacity: 1; }
       }
 
       .episodeCard.future {
