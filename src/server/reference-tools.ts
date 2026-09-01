@@ -6,6 +6,13 @@ export type ReferenceSource = {
   url: string;
 };
 
+export type ReferenceDecision = {
+  research: boolean;
+  fresh: boolean;
+  reason: string;
+  cacheHit: boolean;
+};
+
 export type ReferenceContext = {
   observedAt: string;
   marketFacts: string[];
@@ -14,6 +21,13 @@ export type ReferenceContext = {
   visualNotes: string[];
   sources: ReferenceSource[];
   searched: boolean;
+  decision: ReferenceDecision;
+};
+
+export type ResolveReferenceOptions = {
+  knownTerms?: string[];
+  forceResearch?: boolean;
+  bypassCache?: boolean;
 };
 
 type ExaSearchResult = {
@@ -37,10 +51,31 @@ type ExaResponse = {
   requestId?: string;
 };
 
+type CachedReference = {
+  expiresAtMs: number;
+  value: ReferenceContext;
+};
+
 const PRICE_SIGNAL =
   /\b(price|worth|trading at|spot|market price|costs?|usd|dollars?|today|now|current)\b/i;
 const FRESH_SIGNAL =
   /\b(today|tonight|right now|now|current|currently|latest|live|price|weather|score|result|president|ceo|newest|this week|this month)\b/i;
+const EXTERNAL_REFERENCE_SIGNAL =
+  /\b(meme|character|celebrity|actor|singer|rapper|politician|president|ceo|brand|product|game|movie|film|anime|cartoon|show|series|team|player|company|coin|token|stock|ticker|website|tiktok|youtube|instagram|x\.com|twitter|reddit|news|headline|weather|score|result|election)\b/i;
+const URL_OR_HANDLE_SIGNAL = /(?:https?:\/\/|www\.|@[a-z0-9_]{2,})/i;
+const COMMON_CAPITALIZED = new Set([
+  "The",
+  "A",
+  "An",
+  "This",
+  "That",
+  "He",
+  "She",
+  "They",
+  "It",
+  "Raccoon",
+  "Store",
+]);
 
 const MARKET_ASSETS: Array<{ symbol: string; names: RegExp }> = [
   { symbol: "BTC", names: /\b(bitcoin|btc)\b/i },
@@ -49,8 +84,44 @@ const MARKET_ASSETS: Array<{ symbol: string; names: RegExp }> = [
   { symbol: "DOGE", names: /\b(dogecoin|doge)\b/i },
 ];
 
+const CACHE = new Map<string, CachedReference>();
+const FRESH_CACHE_MS = Math.max(
+  0,
+  Number(process.env.PUMPTV_REFERENCE_FRESH_CACHE_MS || 15_000),
+);
+const NORMAL_CACHE_MS = Math.max(
+  0,
+  Number(process.env.PUMPTV_REFERENCE_CACHE_MS || 5 * 60_000),
+);
+
 function compact(value: unknown, max = 500) {
   return sanitizeLine(String(value ?? ""), max);
+}
+
+function normalizeKey(value: string) {
+  return value.replace(/\s+/g, " ").trim().toLowerCase();
+}
+
+function normalizeTerms(values: string[] | undefined) {
+  return (values || [])
+    .map((value) => normalizeKey(value))
+    .filter(Boolean)
+    .slice(0, 32);
+}
+
+function cloneContext(
+  context: ReferenceContext,
+  cacheHit: boolean,
+): ReferenceContext {
+  return {
+    ...context,
+    marketFacts: [...context.marketFacts],
+    facts: [...context.facts],
+    entities: [...context.entities],
+    visualNotes: [...context.visualNotes],
+    sources: context.sources.map((source) => ({ ...source })),
+    decision: { ...context.decision, cacheHit },
+  };
 }
 
 export function detectMarketSymbols(text: string): string[] {
@@ -58,6 +129,69 @@ export function detectMarketSymbols(text: string): string[] {
   return MARKET_ASSETS.filter((asset) => asset.names.test(text)).map(
     (asset) => asset.symbol,
   );
+}
+
+function unknownCapitalizedTerms(text: string, knownTerms: string[]) {
+  const matches = text.match(/\b[A-Z][A-Za-z0-9'_-]{2,}\b/g) || [];
+  return matches.filter((term) => {
+    if (COMMON_CAPITALIZED.has(term)) return false;
+    const normalized = normalizeKey(term);
+    return !knownTerms.some(
+      (known) => known === normalized || known.includes(normalized),
+    );
+  });
+}
+
+export function decideReferenceResearch(
+  directive: string,
+  options: ResolveReferenceOptions = {},
+): Omit<ReferenceDecision, "cacheHit"> {
+  const text = compact(directive, 700);
+  const knownTerms = normalizeTerms(options.knownTerms);
+  const marketSymbols = detectMarketSymbols(text);
+  const fresh = FRESH_SIGNAL.test(text) || marketSymbols.length > 0;
+
+  if (options.forceResearch)
+    return { research: true, fresh, reason: "forced by operator" };
+  if (URL_OR_HANDLE_SIGNAL.test(text))
+    return { research: true, fresh, reason: "URL or social handle reference" };
+  if (EXTERNAL_REFERENCE_SIGNAL.test(text))
+    return { research: true, fresh, reason: "external-reference signal" };
+
+  const marketSet = new Set(
+    marketSymbols.map((symbol) => symbol.toLowerCase()),
+  );
+  const unknownCaps = unknownCapitalizedTerms(text, knownTerms).filter(
+    (term) => !marketSet.has(term.toLowerCase()),
+  );
+  if (unknownCaps.length)
+    return {
+      research: true,
+      fresh,
+      reason: `unknown named reference: ${unknownCaps.slice(0, 2).join(", ")}`,
+    };
+
+  // A dedicated market provider is more reliable and faster than a generic
+  // search for straightforward current crypto-price prompts.
+  if (marketSymbols.length)
+    return {
+      research: false,
+      fresh: true,
+      reason: "dedicated market-price lookup is sufficient",
+    };
+
+  if (fresh)
+    return {
+      research: true,
+      fresh: true,
+      reason: "fresh/current fact requested",
+    };
+
+  return {
+    research: false,
+    fresh: false,
+    reason: "self-contained scene intent",
+  };
 }
 
 function uniqueStrings(values: unknown, maxItems = 8, maxLength = 420) {
@@ -276,10 +410,22 @@ async function searchExaReference(
 
 export async function resolveExternalReferences(
   directive: string,
+  options: ResolveReferenceOptions = {},
 ): Promise<ReferenceContext> {
   const observedAt = new Date().toISOString();
   const marketSymbols = detectMarketSymbols(directive);
-  const fresh = FRESH_SIGNAL.test(directive) || marketSymbols.length > 0;
+  const decision = decideReferenceResearch(directive, options);
+  const cacheKey = normalizeKey(directive);
+  const ttlMs = decision.fresh ? FRESH_CACHE_MS : NORMAL_CACHE_MS;
+
+  if (!options.bypassCache && ttlMs > 0) {
+    const cached = CACHE.get(cacheKey);
+    if (cached && cached.expiresAtMs > Date.now()) {
+      return referenceMeasure.measureSync("Reference cache hit", () =>
+        cloneContext(cached.value, true),
+      );
+    }
+  }
 
   return referenceMeasure.measure(
     {
@@ -291,15 +437,25 @@ export async function resolveExternalReferences(
         visuals: context.visualNotes.length,
         sources: context.sources.length,
         searched: context.searched,
+        research: context.decision.research,
+        reason: context.decision.reason,
       }),
     },
     async () => {
       const [marketResults, exa] = await Promise.all([
         Promise.all(marketSymbols.map((symbol) => lookupCoinbaseSpot(symbol))),
-        searchExaReference(directive, fresh),
+        decision.research
+          ? searchExaReference(directive, decision.fresh)
+          : Promise.resolve({
+              facts: [],
+              entities: [],
+              visualNotes: [],
+              sources: [],
+              searched: false,
+            }),
       ]);
 
-      return {
+      const value: ReferenceContext = {
         observedAt,
         marketFacts: marketResults.filter((value): value is string =>
           Boolean(value),
@@ -309,7 +465,21 @@ export async function resolveExternalReferences(
         visualNotes: exa.visualNotes,
         sources: exa.sources,
         searched: exa.searched,
+        decision: { ...decision, cacheHit: false },
       };
+
+      if (ttlMs > 0) {
+        CACHE.set(cacheKey, {
+          expiresAtMs: Date.now() + ttlMs,
+          value: cloneContext(value, false),
+        });
+        if (CACHE.size > 128) {
+          const oldest = CACHE.keys().next().value;
+          if (oldest) CACHE.delete(oldest);
+        }
+      }
+
+      return value;
     },
   );
 }

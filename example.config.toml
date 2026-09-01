@@ -9,6 +9,12 @@
 [server]
 port = 3006
 
+
+# Optional. Used by /api/admin/resolve reference preflight.
+# Put the same key in .worker.toml for generation-time resolution.
+[exa]
+api_key = ""
+
 [pumptv]
 db_path = ".data/pumptv.sqlite" # must match .worker.toml
 room = "main"                  # must match .worker.toml
@@ -24,6 +30,10 @@ viewer_ttl_ms = 45000
 token_mint = ""
 solana_rpc_url = "https://api.mainnet-beta.solana.com"
 wallet_score_cache_ms = 20000
+
+# External-reference resolution cache. Fresh facts stay short-lived.
+reference_fresh_cache_ms = 15000
+reference_cache_ms = 300000
 
 # Shared worker ownership/health settings used by the web process.
 web_heartbeat_ttl_ms = 6000

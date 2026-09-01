@@ -13,7 +13,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function usage() {
   console.log(
-    `PumpTV control\n\n  bun run control -- status\n  bun run control -- watch\n  bun run control -- json\n  bun run control -- resolve <prompt...>\n  bun run control -- set-votes <proposalId> <count|auto>\n  bun run control -- trigger\n  bun run control -- force <proposalId>\n  bun run control -- inject <prompt...>\n  bun run control -- inject-force <prompt...>\n  bun run control -- clear-queue\n`,
+    `PumpTV control\n\n  bun run control -- status\n  bun run control -- watch\n  bun run control -- json\n  bun run control -- resolve [--refresh] [--force] <prompt...>\n  bun run control -- set-votes <proposalId> <count|auto>\n  bun run control -- trigger\n  bun run control -- force <proposalId>\n  bun run control -- inject <prompt...>\n  bun run control -- inject-force <prompt...>\n  bun run control -- clear-queue\n`,
   );
 }
 
@@ -101,7 +101,12 @@ if (command === "status") {
 } else if (command === "json") {
   console.log(JSON.stringify(await repo.getStreamState(), null, 2));
 } else if (command === "resolve") {
-  const text = args.join(" ").trim();
+  const bypassCache = args.includes("--refresh");
+  const forceResearch = args.includes("--force");
+  const text = args
+    .filter((arg) => arg !== "--refresh" && arg !== "--force")
+    .join(" ")
+    .trim();
   if (!text) {
     usage();
     process.exit(1);
@@ -109,7 +114,16 @@ if (command === "status") {
   await loadTomlEnvironment(PROJECT_ROOT, ".worker.toml", { required: true });
   const { resolveExternalReferences } =
     await import("../server/reference-tools.ts");
-  const context = await resolveExternalReferences(text);
+  const worldState = await repo.getLatestWorldState();
+  const context = await resolveExternalReferences(text, {
+    bypassCache,
+    forceResearch,
+    knownTerms: [
+      worldState.location,
+      ...worldState.characters.map((character) => character.name),
+      ...worldState.props.map((prop) => prop.name),
+    ],
+  });
   console.log(JSON.stringify(context, null, 2));
 } else if (command === "set-votes") {
   const id = Number((args[0] || "").replace(/^#/, ""));

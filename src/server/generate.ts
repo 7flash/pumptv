@@ -60,7 +60,15 @@ export async function generateNextClip(input: {
 
     await setGenerationStage("planning");
     const referenceContext =
-      episode === 0 ? undefined : await resolveExternalReferences(directive);
+      episode === 0
+        ? undefined
+        : await resolveExternalReferences(directive, {
+            knownTerms: [
+              worldState.location,
+              ...worldState.characters.map((character) => character.name),
+              ...worldState.props.map((prop) => prop.name),
+            ],
+          });
     const showrunnerStartedAt = performance.now();
     const showrunner = await planNextShot({
       directive,

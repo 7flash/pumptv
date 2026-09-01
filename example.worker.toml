@@ -26,6 +26,10 @@ worker_heartbeat_ms = 1000
 idle_poll_ms = 500
 error_backoff_ms = 2000
 
+# External-reference resolution cache. Fresh facts stay short-lived.
+reference_fresh_cache_ms = 15000
+reference_cache_ms = 300000
+
 [measure]
 silent = 0
 timestamps = 1
