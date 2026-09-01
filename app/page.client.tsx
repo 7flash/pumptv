@@ -48,6 +48,12 @@ let mediaTargetObserver: ResizeObserver | null = null;
 let observedGlass: HTMLElement | null = null;
 let lastMediaRect = "";
 
+// A cold refresh is the only time the current episode has no warm inactive deck.
+// Download that first clip completely before handing it to the video decoder so
+// playback starts from a local blob instead of racing the network while visible.
+const videoLoadSerial = new WeakMap<HTMLVideoElement, number>();
+const videoObjectUrls = new WeakMap<HTMLVideoElement, string>();
+
 function liveNowMs() {
   return Date.now() + serverOffsetMs;
 }
@@ -360,24 +366,41 @@ async function boot() {
   }, 100);
 }
 
-function configureVideo(video: HTMLVideoElement, clip: Clip, slot: number) {
-  if (video.dataset.clipId === String(clip.id) && video.src) return;
+function releaseVideoObjectUrl(video: HTMLVideoElement) {
+  const url = videoObjectUrls.get(video);
+  if (!url) return;
+  videoObjectUrls.delete(video);
+  try {
+    URL.revokeObjectURL(url);
+  } catch {}
+}
 
-  video.pause();
-  video.classList.remove("active", "retiring");
-  video.dataset.clipId = String(clip.id);
-  video.dataset.ready = "0";
-  video.dataset.resumePending = "0";
-  video.preload = "auto";
-  video.playsInline = true;
-  video.muted = true;
-  video.poster = clipPoster(clip);
-  video.src = clip.videoUrl;
+function attachVideoSource(
+  video: HTMLVideoElement,
+  clip: Clip,
+  slot: number,
+  source: string,
+  objectUrl: boolean,
+) {
+  if (video.dataset.clipId !== String(clip.id)) {
+    if (objectUrl) {
+      try {
+        URL.revokeObjectURL(source);
+      } catch {}
+    }
+    return;
+  }
+
+  releaseVideoObjectUrl(video);
+  if (objectUrl) videoObjectUrls.set(video, source);
+  video.src = source;
   video.oncanplay = () => {
+    if (video.dataset.clipId !== String(clip.id)) return;
     video.dataset.ready = "1";
     syncVideoDeck();
   };
   video.onloadeddata = () => {
+    if (video.dataset.clipId !== String(clip.id)) return;
     video.dataset.ready = "1";
     syncVideoDeck();
   };
@@ -385,84 +408,71 @@ function configureVideo(video: HTMLVideoElement, clip: Clip, slot: number) {
   video.load();
 }
 
+async function attachColdVideoSource(
+  video: HTMLVideoElement,
+  clip: Clip,
+  slot: number,
+  serial: number,
+) {
+  try {
+    const response = await fetch(clip.videoUrl, { cache: "force-cache" });
+    if (!response.ok) throw new Error(`video prefetch ${response.status}`);
+    const blob = await response.blob();
+    if (
+      videoLoadSerial.get(video) !== serial ||
+      video.dataset.clipId !== String(clip.id)
+    )
+      return;
+    const objectUrl = URL.createObjectURL(blob);
+    attachVideoSource(video, clip, slot, objectUrl, true);
+  } catch (cause) {
+    if (
+      videoLoadSerial.get(video) !== serial ||
+      video.dataset.clipId !== String(clip.id)
+    )
+      return;
+    console.warn(
+      `[pumptv/media] cold prefetch failed for EP ${clip.episode + 1}; using direct URL`,
+      cause,
+    );
+    attachVideoSource(video, clip, slot, clip.videoUrl, false);
+  }
+}
+
+function configureVideo(video: HTMLVideoElement, clip: Clip, slot: number) {
+  if (video.dataset.clipId === String(clip.id) && video.src) return;
+
+  video.pause();
+  video.classList.remove("active", "retiring", "entering", "reveal");
+  video.setAttribute("aria-hidden", "true");
+  video.dataset.clipId = String(clip.id);
+  video.dataset.ready = "0";
+  video.dataset.resumePending = "0";
+  video.preload = "auto";
+  video.playsInline = true;
+  video.muted = true;
+  video.poster = clipPoster(clip);
+
+  const serial = (videoLoadSerial.get(video) || 0) + 1;
+  videoLoadSerial.set(video, serial);
+  releaseVideoObjectUrl(video);
+  video.removeAttribute("src");
+  video.load();
+
+  const coldRefresh = activeVideoClipId == null && replayClipId == null;
+  if (coldRefresh) {
+    void attachColdVideoSource(video, clip, slot, serial);
+    return;
+  }
+
+  attachVideoSource(video, clip, slot, clip.videoUrl, false);
+}
+
 function targetTimeFor(_clip: Clip) {
   // Publication decides which episode is live. Playback always reveals a newly
   // selected/published episode from frame 0 so transitions never jump into the
   // middle of a clip.
   return 0;
-}
-
-function bufferedFromStart(video: HTMLVideoElement) {
-  for (let index = 0; index < video.buffered.length; index += 1) {
-    const start = video.buffered.start(index);
-    const end = video.buffered.end(index);
-    if (start <= 0.08) return Math.max(0, end);
-  }
-  return 0;
-}
-
-function smoothStartGoal(video: HTMLVideoElement) {
-  const duration = video.duration;
-  if (Number.isFinite(duration) && duration > 0) {
-    // PumpTV episodes are currently ~5 seconds. Fully buffer short episodes on
-    // a cold page load so the viewer never watches network/decode warm-up as
-    // visible stutter. Longer future formats only require a healthy runway.
-    if (duration <= 8) return Math.max(1.25, duration - 0.15);
-    return Math.max(2.5, Math.min(4, duration * 0.4));
-  }
-  return 2.5;
-}
-
-async function waitForSmoothStartBuffer(video: HTMLVideoElement) {
-  const goal = smoothStartGoal(video);
-  const startedAt = performance.now();
-  const hardTimeoutMs = 8_000;
-
-  while (bufferedFromStart(video) < goal) {
-    if (video.error)
-      throw new Error(`media error ${video.error.code} while buffering`);
-    if (performance.now() - startedAt >= hardTimeoutMs) {
-      const buffered = bufferedFromStart(video);
-      // Never fail forever on servers/browsers that do not aggressively honor
-      // preload=auto. We still require a meaningful runway before revealing.
-      if (
-        buffered >= 1.25 ||
-        video.readyState >= HTMLMediaElement.HAVE_ENOUGH_DATA
-      )
-        return;
-      throw new Error(
-        `timed out warming playback buffer (${buffered.toFixed(2)}s buffered)`,
-      );
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, 50));
-  }
-}
-
-async function rewindForReveal(video: HTMLVideoElement) {
-  if (video.currentTime <= 0.03) {
-    try {
-      video.currentTime = 0;
-    } catch {}
-    return;
-  }
-
-  await new Promise<void>((resolve) => {
-    let settled = false;
-    const finish = () => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timeout);
-      video.removeEventListener("seeked", finish);
-      resolve();
-    };
-    const timeout = setTimeout(finish, 1_000);
-    video.addEventListener("seeked", finish, { once: true });
-    try {
-      video.currentTime = 0;
-    } catch {
-      finish();
-    }
-  });
 }
 
 async function waitForPaint(video: HTMLVideoElement) {
@@ -597,20 +607,13 @@ async function activateVideoSlot(
   video.muted = true;
 
   try {
-    const coldBootstrap = activeVideoClipId == null && previous === video;
-    if (coldBootstrap) {
-      if (replayClipId == null && liveSlotState !== "transitioning") {
-        liveSlotState = "transitioning";
-        syncLocalUiState();
-      }
-      // A fresh page load has no already-warm outgoing deck. Start the hidden
-      // video muted to make the browser fetch/decode aggressively, wait for a
-      // real playback runway, then rewind before the viewer sees frame 0.
-      await video.play();
-      await waitForSmoothStartBuffer(video);
-      video.pause();
-      await rewindForReveal(video);
+    if (activeVideoClipId == null && replayClipId == null) {
+      liveSlotState = "transitioning";
+      syncLocalUiState();
     }
+    // Cold refreshes arrive here only after configureVideo has fully prefetched
+    // the first clip. Do not play a hidden video and rewind it: that path left
+    // Chromium's decoder in a visibly stuttery state on first reveal.
     await video.play();
     await waitForPaint(video);
   } catch (cause) {
