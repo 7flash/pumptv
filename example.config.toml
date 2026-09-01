@@ -9,16 +9,12 @@
 [server]
 port = 3006
 
-
-# Optional. Used by /api/admin/resolve reference preflight.
-# Put the same key in .worker.toml for generation-time resolution.
-[exa]
-api_key = ""
-
 [pumptv]
 db_path = ".data/pumptv.sqlite" # must match .worker.toml
 room = "main"                  # must match .worker.toml
 admin_token = ""
+# Optional operator CLI target. When set, `bun run control -- ...` uses the remote admin API.
+admin_url = ""
 resolution = "480P"
 
 # Browser state transport.
@@ -26,17 +22,22 @@ long_poll_check_ms = 400
 long_poll_timeout_ms = 25000
 viewer_ttl_ms = 45000
 
-# Phantom/token-weighted proposal score.
+# Phantom/token-weighted proposal score. This MUST be configured in the web .config.toml
+# because /api/wallet/score runs in the web process.
 token_mint = ""
 solana_rpc_url = "https://api.mainnet-beta.solana.com"
 wallet_score_cache_ms = 20000
 
-# External-reference resolution cache. Fresh facts stay short-lived.
-reference_fresh_cache_ms = 15000
-reference_cache_ms = 300000
-
 # Shared worker ownership/health settings used by the web process.
 web_heartbeat_ttl_ms = 6000
+
+# Lightweight proposal/vote moderation. IP addresses are never stored raw;
+# PumpTV stores only an HMAC hash in a separate moderation SQLite file.
+# Enable proxy headers only when your reverse proxy overwrites CF-Connecting-IP,
+# X-Real-IP, or X-Forwarded-For from the real client connection.
+moderation_db_path = ".data/pumptv-moderation.sqlite"
+moderation_secret = ""
+trust_proxy_headers = 0
 
 [measure]
 silent = 0

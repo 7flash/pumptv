@@ -54,6 +54,8 @@ let walletTokenBalance = 0;
 let walletPower = 1;
 let walletScoreLoading = false;
 let ideaDraft = "";
+let ideaDraftDirty = false;
+let syncedOwnProposalSignature = "";
 let ideaSubmitting = false;
 let votePendingId: number | null = null;
 let participationError: string | null = null;
@@ -248,6 +250,7 @@ function redraw() {
     observeMediaTarget();
     syncVideoDeck();
     syncLocalPresentation();
+    syncIdeaFormState();
     updateLiveMeters();
     centerSelectedEpisode();
   });
@@ -268,6 +271,7 @@ function applyState(state: StreamState) {
   nextDirective = state.nextDirective;
   program = state.program;
   worldState = state.worldState;
+  syncIdeaDraftFromBoard();
 
   if (initialCatchupPending) {
     const published = [...state.timeline]
@@ -392,6 +396,37 @@ function ownProposal() {
   );
 }
 
+function normalizedIdea(value: string) {
+  return value.replace(/\s+/g, " ").trim().slice(0, 500);
+}
+
+function syncIdeaDraftFromBoard() {
+  if (ideaDraftDirty) return;
+  const own = ownProposal();
+  const signature = own ? `${own.id}:${own.text}` : "";
+  if (signature === syncedOwnProposalSignature) return;
+  syncedOwnProposalSignature = signature;
+  ideaDraft = own?.text || "";
+}
+
+function ideaCanSubmit() {
+  if (ideaSubmitting) return false;
+  const text = normalizedIdea(ideaDraft);
+  if (!text) return false;
+  const own = ownProposal();
+  return !own || normalizedIdea(own.text) !== text;
+}
+
+function syncIdeaFormState() {
+  const enabled = ideaCanSubmit();
+  document
+    .querySelectorAll<HTMLButtonElement>('[data-action="submit-idea"]')
+    .forEach((button) => {
+      button.disabled = !enabled;
+      button.setAttribute("aria-disabled", String(!enabled));
+    });
+}
+
 async function refreshWalletScore() {
   if (!walletAddress || walletScoreLoading) return;
   walletScoreLoading = true;
@@ -426,7 +461,7 @@ async function refreshWalletScore() {
 
 async function submitIdea() {
   if (ideaSubmitting) return;
-  const text = ideaDraft.replace(/\s+/g, " ").trim().slice(0, 500);
+  const text = normalizedIdea(ideaDraft);
   if (!text) return;
 
   ideaSubmitting = true;
@@ -443,7 +478,8 @@ async function submitIdea() {
         walletAddress,
       }),
     });
-    ideaDraft = "";
+    ideaDraftDirty = false;
+    syncedOwnProposalSignature = "";
     await refreshStreamState();
   } catch (cause) {
     participationError =
@@ -452,18 +488,6 @@ async function submitIdea() {
     ideaSubmitting = false;
     redraw();
   }
-}
-
-function editOwnIdea() {
-  const own = ownProposal();
-  if (!own) return;
-  ideaDraft = own.text;
-  redraw();
-  queueMicrotask(() => {
-    const input = document.querySelector<HTMLInputElement>("[data-idea-input]");
-    input?.focus();
-    input?.select();
-  });
 }
 
 async function cancelOwnIdea() {
@@ -482,6 +506,8 @@ async function cancelOwnIdea() {
       }),
     });
     ideaDraft = "";
+    ideaDraftDirty = false;
+    syncedOwnProposalSignature = "";
     await refreshStreamState();
   } catch (cause) {
     participationError =
@@ -1623,7 +1649,6 @@ function installInteractionLayer() {
       else if (action === "tray-world") openTray("world");
       else if (action === "wallet") void connectPhantom(true);
       else if (action === "submit-idea") void submitIdea();
-      else if (action === "edit-own") editOwnIdea();
       else if (action === "cancel-own") void cancelOwnIdea();
       else if (action === "world-detail") {
         const kind = control.dataset.worldKind as
@@ -1655,6 +1680,8 @@ function installInteractionLayer() {
         event.target instanceof HTMLInputElement ? event.target : null;
       if (!target?.matches("[data-idea-input]")) return;
       ideaDraft = target.value.slice(0, 500);
+      ideaDraftDirty = true;
+      syncIdeaFormState();
     },
     true,
   );
@@ -2486,28 +2513,14 @@ function ProposalCard({
         </i>
       </div>
       {own ? (
-        <>
-          <b
-            className="proposalTotal"
-            data-rich-tooltip="1"
-            data-tooltip-kicker={`SCORE · #${proposal.id}`}
-            data-tooltip-body={proposalScoreTooltip(proposal)}
-          >
-            {formatScore(proposal.voteCount)}
-          </b>
-          <div className="ownIdeaActions">
-            <button type="button" data-action="edit-own" aria-label="Edit idea">
-              <BoardIcon name="edit" />
-            </button>
-            <button
-              type="button"
-              data-action="cancel-own"
-              aria-label="Cancel idea"
-            >
-              <BoardIcon name="cancel" />
-            </button>
-          </div>
-        </>
+        <b
+          className="proposalTotal"
+          data-rich-tooltip="1"
+          data-tooltip-kicker={`SCORE · #${proposal.id}`}
+          data-tooltip-body={proposalScoreTooltip(proposal)}
+        >
+          {formatScore(proposal.voteCount)}
+        </b>
       ) : (
         <button
           type="button"
@@ -2535,7 +2548,10 @@ function PersistentIdeas() {
   const proposals = sortedCandidates(round);
   return (
     <section className="persistentIdeas" aria-label="Suggestions">
-      <form className="persistentIdeaForm" data-idea-form>
+      <form
+        className={`persistentIdeaForm ${own ? "editing" : ""}`}
+        data-idea-form
+      >
         <input
           data-idea-input
           value={ideaDraft}
@@ -2549,11 +2565,21 @@ function PersistentIdeas() {
         <button
           type="submit"
           data-action="submit-idea"
-          disabled={ideaSubmitting || !ideaDraft.trim()}
-          aria-label={own ? "Save idea" : "Submit idea"}
+          disabled={!ideaCanSubmit()}
+          aria-label={own ? "Save changed idea" : "Submit idea"}
         >
           <BoardIcon name="send" />
         </button>
+        {own ? (
+          <button
+            type="button"
+            className="withdrawIdea"
+            data-action="cancel-own"
+            aria-label="Withdraw idea"
+          >
+            <BoardIcon name="cancel" />
+          </button>
+        ) : null}
       </form>
       <div className="persistentProposalList">
         {proposals.map((proposal, index) => (
@@ -2701,21 +2727,21 @@ function PersistentWorld() {
         </div>
       ) : null}
       {worldState.openThreads.length ? (
-        <div className="persistentThreads">
-          {worldState.openThreads.slice(0, 2).map((thread) => (
-            <span key={thread}>{thread}</span>
-          ))}
-          {worldState.openThreads.length > 2 ? (
-            <button
-              type="button"
-              data-action="world-detail"
-              data-world-kind="location"
-              data-world-id="location"
-              aria-label={`${worldState.openThreads.length - 2} more open threads`}
+        <div
+          className="persistentThreads"
+          role="list"
+          aria-label="Open story threads"
+        >
+          {worldState.openThreads.map((thread, index) => (
+            <div
+              className="persistentThreadRow"
+              role="listitem"
+              key={`${index}:${thread}`}
             >
-              +{worldState.openThreads.length - 2}
-            </button>
-          ) : null}
+              <em>{index + 1}</em>
+              <span>{thread}</span>
+            </div>
+          ))}
         </div>
       ) : null}
     </section>
@@ -5773,6 +5799,91 @@ function OutsideInterfaceStyles() {
         overflow: hidden !important;
         text-overflow: ellipsis !important;
       }
+
+
+      /* v33: interaction clarity. */
+      .participationBoard svg .stroke {
+        fill: none !important;
+        stroke: currentColor !important;
+        stroke-width: 1.8 !important;
+        stroke-linecap: round !important;
+        stroke-linejoin: round !important;
+      }
+
+      .persistentThreads {
+        display: grid !important;
+        align-content: start !important;
+        gap: 0 !important;
+        max-height: 150px !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
+        padding-right: 3px !important;
+        border-top: 1px solid rgba(255,255,255,.045) !important;
+        scrollbar-width: thin !important;
+      }
+      .persistentThreadRow {
+        display: grid !important;
+        grid-template-columns: 18px minmax(0,1fr) !important;
+        gap: 7px !important;
+        align-items: start !important;
+        padding: 7px 4px !important;
+        border-bottom: 1px solid rgba(255,255,255,.045) !important;
+        min-width: 0 !important;
+      }
+      .persistentThreadRow > em {
+        margin-top: 1px !important;
+        color: var(--pump-gold-low) !important;
+        font: 700 7px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace !important;
+        font-style: normal !important;
+        text-align: center !important;
+        opacity: .75 !important;
+      }
+      .persistentThreadRow > span {
+        min-width: 0 !important;
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        color: rgba(237,237,232,.64) !important;
+        font-size: 9px !important;
+        line-height: 1.38 !important;
+      }
+
+      .persistentIdeaForm.editing {
+        grid-template-columns: minmax(0,1fr) 34px 34px !important;
+      }
+      .persistentIdeaForm.editing > button {
+        border-radius: 0 !important;
+      }
+      .persistentIdeaForm.editing > button:last-child {
+        border-radius: 0 7px 7px 0 !important;
+      }
+      .persistentIdeaForm > button:not(:disabled) {
+        color: var(--pump-gold-hi) !important;
+        border-color: rgba(215,164,59,.28) !important;
+        background: rgba(215,164,59,.045) !important;
+      }
+      .persistentIdeaForm > button:disabled {
+        opacity: .22 !important;
+      }
+      .withdrawIdea {
+        color: rgba(200,201,203,.52) !important;
+        border-left-color: rgba(255,255,255,.06) !important;
+      }
+      .withdrawIdea:hover {
+        color: rgba(255,255,255,.84) !important;
+        background: rgba(255,255,255,.04) !important;
+      }
+
+      .persistentProposal.own {
+        grid-template-columns: 24px minmax(0,1fr) auto !important;
+      }
+      .ownIdeaActions { display: none !important; }
+      .proposalVote svg {
+        display: block !important;
+        flex: 0 0 auto !important;
+        opacity: .9 !important;
+      }
+      .proposalVote:hover svg { color: var(--pump-gold-hi) !important; }
 
       @media (max-width: 820px) {
         .minimalTop .wordmark { width: 58px !important; height: 58px !important; }

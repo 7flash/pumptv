@@ -43,14 +43,22 @@ let lifecycleTimer: ReturnType<typeof setInterval> | null = null;
 let shuttingDown = false;
 
 function cleanError(error: unknown) {
-  return (
+  const message = (
     error instanceof Error
       ? error.message
       : String(error || "Unknown bgrun worker error")
   )
     .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 700);
+    .trim();
+
+  // bgrun includes the worker stderr tail in startup failures. Keep the viewer UI
+  // useful instead of surfacing a multi-screen stack trace for transient SQLite
+  // contention; the complete child log remains available through bgrun.
+  if (/SQLITE_BUSY|database is locked/i.test(message)) {
+    return "Generation worker database was busy during startup; retrying.";
+  }
+
+  return message.slice(0, 700);
 }
 
 function snapshot(patch: Partial<ManagedWorkerStatus>): ManagedWorkerStatus {

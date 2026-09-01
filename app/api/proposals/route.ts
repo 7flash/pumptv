@@ -5,6 +5,11 @@ import {
 } from "../../../src/server/observability.ts";
 import { sanitizeLine } from "../../../src/server/prompt.ts";
 import {
+  assertRequestAllowed,
+  ModerationBlockedError,
+  recordSubjectOrigin,
+} from "../../../src/server/moderation.ts";
+import {
   cancelWebProposal,
   upsertWebProposal,
 } from "../../../src/server/repository.ts";
@@ -26,6 +31,7 @@ function ownerKey(value: unknown, walletAddress: string | null) {
 export function POST(request: Request) {
   return measuredRoute(request, async () => {
     try {
+      const { originIpHash } = assertRequestAllowed(request);
       const body = await httpMeasure.measure(
         {
           start: () => "Parse proposal request",
@@ -43,6 +49,7 @@ export function POST(request: Request) {
       if (!text) throw new Error("Idea cannot be empty");
       const identity = body.ownerId ?? body.viewerId;
       const walletAddress = normalizeSolanaAddress(body.walletAddress);
+      const subjectKey = ownerKey(identity, walletAddress);
       const { power } = await httpMeasure.measure(
         {
           start: () => "Resolve proposal score",
@@ -62,7 +69,7 @@ export function POST(request: Request) {
         () =>
           upsertWebProposal({
             text,
-            ownerKey: ownerKey(identity, walletAddress),
+            ownerKey: subjectKey,
             walletAddress,
             ownerWeight: power,
           }),
@@ -73,9 +80,13 @@ export function POST(request: Request) {
           { error: "Could not save idea." },
           { status: 400 },
         );
+      recordSubjectOrigin(subjectKey, originIpHash);
       return Response.json(proposal, { status: 201 });
     } catch (error) {
-      return Response.json({ error: errorText(error) }, { status: 400 });
+      return Response.json(
+        { error: errorText(error) },
+        { status: error instanceof ModerationBlockedError ? 403 : 400 },
+      );
     }
   });
 }

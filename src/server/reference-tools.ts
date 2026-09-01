@@ -442,30 +442,51 @@ export async function resolveExternalReferences(
       }),
     },
     async () => {
-      const [marketResults, exa] = await Promise.all([
-        Promise.all(marketSymbols.map((symbol) => lookupCoinbaseSpot(symbol))),
-        decision.research
-          ? searchExaReference(directive, decision.fresh)
-          : Promise.resolve({
-              facts: [],
-              entities: [],
-              visualNotes: [],
-              sources: [],
-              searched: false,
-            }),
-      ]);
+      const marketResults = await Promise.all(
+        marketSymbols.map((symbol) => lookupCoinbaseSpot(symbol)),
+      );
+      const marketFacts = marketResults.filter((value): value is string =>
+        Boolean(value),
+      );
+
+      let effectiveDecision = decision;
+      let exa = decision.research
+        ? await searchExaReference(directive, decision.fresh)
+        : {
+            facts: [],
+            entities: [],
+            visualNotes: [],
+            sources: [],
+            searched: false,
+          };
+
+      // Current market values are one of the few references where guessing is
+      // worse than waiting. If the dedicated price provider fails, fall back to
+      // fresh Exa research. If neither path produces a sourced fact, abort the
+      // generation so the worker can retry instead of inventing a price.
+      if (marketSymbols.length > marketFacts.length) {
+        effectiveDecision = {
+          research: true,
+          fresh: true,
+          reason: "market-price provider unavailable; fresh search fallback",
+        };
+        if (!exa.searched) exa = await searchExaReference(directive, true);
+        if (!marketFacts.length && !exa.facts.length) {
+          throw new Error(
+            `Could not resolve current market price for ${marketSymbols.join(", ")}`,
+          );
+        }
+      }
 
       const value: ReferenceContext = {
         observedAt,
-        marketFacts: marketResults.filter((value): value is string =>
-          Boolean(value),
-        ),
+        marketFacts,
         facts: exa.facts,
         entities: exa.entities,
         visualNotes: exa.visualNotes,
         sources: exa.sources,
         searched: exa.searched,
-        decision: { ...decision, cacheHit: false },
+        decision: { ...effectiveDecision, cacheHit: false },
       };
 
       if (ttlMs > 0) {

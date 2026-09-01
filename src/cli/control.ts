@@ -5,15 +5,234 @@ import type { PromptRound, StreamState } from "../shared/contracts.ts";
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
 await loadTomlEnvironment(PROJECT_ROOT, ".config.toml");
 
+const command = process.argv[2] || "status";
+const rawArgs = process.argv.slice(3);
+const localOnly = rawArgs.includes("--local");
+const args = rawArgs.filter((arg) => arg !== "--local");
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const ADMIN_URL = (process.env.PUMPTV_ADMIN_URL || "")
+  .trim()
+  .replace(/\/+$/, "");
+const ADMIN_TOKEN = (process.env.PUMPTV_ADMIN_TOKEN || "").trim();
+
+function remoteHeaders(json = false) {
+  const headers: Record<string, string> = {};
+  if (ADMIN_TOKEN) headers["x-pumptv-admin-token"] = ADMIN_TOKEN;
+  if (json) headers["content-type"] = "application/json";
+  return headers;
+}
+
+async function remoteJson(path: string, init: RequestInit = {}) {
+  const response = await fetch(`${ADMIN_URL}${path}`, init);
+  const text = await response.text();
+  let payload: any = null;
+  try {
+    payload = text ? JSON.parse(text) : null;
+  } catch {
+    payload = { error: text || `HTTP ${response.status}` };
+  }
+  if (!response.ok)
+    throw new Error(
+      payload?.error || `Remote PumpTV returned HTTP ${response.status}`,
+    );
+  return payload;
+}
+
+function triggerSelectionArgs(commandName: string, values: string[]) {
+  if (commandName === "force") {
+    const proposalId = Number((values[0] || "").replace(/^#/, ""));
+    if (!Number.isSafeInteger(proposalId) || proposalId <= 0)
+      throw new Error("force requires a proposal id");
+    return { proposalId };
+  }
+  const proposalFlag = values.indexOf("--proposal");
+  if (proposalFlag >= 0) {
+    const proposalId = Number(
+      (values[proposalFlag + 1] || "").replace(/^#/, ""),
+    );
+    if (!Number.isSafeInteger(proposalId) || proposalId <= 0)
+      throw new Error("--proposal requires a positive proposal id");
+    return { proposalId };
+  }
+  const textFlag = values.indexOf("--text");
+  if (textFlag >= 0) {
+    const text = values
+      .slice(textFlag + 1)
+      .join(" ")
+      .trim();
+    if (!text) throw new Error("--text requires an exact proposal text");
+    return { text };
+  }
+  if (values.length === 1 && /^#?\d+$/.test(values[0]))
+    return { proposalId: Number(values[0].replace(/^#/, "")) };
+  return {};
+}
+
+function positiveArg(value: string | undefined, label: string) {
+  const id = Number(String(value || "").replace(/^#/, ""));
+  if (!Number.isSafeInteger(id) || id <= 0)
+    throw new Error(`${label} must be a positive integer`);
+  return id;
+}
+
+function proposalArg(values: string[]) {
+  const flag = values.indexOf("--proposal");
+  if (flag >= 0) return positiveArg(values[flag + 1], "--proposal");
+  const positional = values.find((value) => !value.startsWith("--"));
+  return positiveArg(positional, "proposal id");
+}
+
+function reasonArg(values: string[]) {
+  const flag = values.indexOf("--reason");
+  if (flag < 0) return undefined;
+  const parts: string[] = [];
+  for (
+    let i = flag + 1;
+    i < values.length && !values[i].startsWith("--");
+    i += 1
+  )
+    parts.push(values[i]);
+  return parts.join(" ").trim() || undefined;
+}
+
+async function handleRemoteCommand() {
+  if (!ADMIN_URL || localOnly) return false;
+
+  if (command === "status") {
+    const payload = await remoteJson("/api/status", {
+      headers: remoteHeaders(),
+    });
+    console.log(`[control] remote ${ADMIN_URL}`);
+    console.log(JSON.stringify(payload, null, 2));
+    return true;
+  }
+  if (command === "json") {
+    const payload = await remoteJson("/api/state", {
+      headers: remoteHeaders(),
+    });
+    console.log(JSON.stringify(payload, null, 2));
+    return true;
+  }
+  if (command === "board") {
+    const payload = await remoteJson("/api/admin/trigger", {
+      headers: remoteHeaders(),
+    });
+    for (const proposal of payload.proposals || [])
+      console.log(`#${proposal.id}  ${proposal.score}  ${proposal.text}`);
+    return true;
+  }
+  if (command === "trigger" || command === "close" || command === "force") {
+    const body = triggerSelectionArgs(command, args);
+    const payload = await remoteJson("/api/admin/trigger", {
+      method: "POST",
+      headers: remoteHeaders(true),
+      body: JSON.stringify(body),
+    });
+    console.log(
+      `[control] remote locked #${payload?.proposal?.id ?? "?"}` +
+        `${payload?.proposal?.rank ? ` · rank ${payload.proposal.rank}` : ""}` +
+        `${payload?.proposal?.score != null ? ` · score ${payload.proposal.score}` : ""}` +
+        ` → ${payload?.proposal?.text ?? payload?.directive?.text ?? "selected proposal"}`,
+    );
+    return true;
+  }
+  if (command === "resolve") {
+    const refresh = args.includes("--refresh");
+    const force = args.includes("--force");
+    const text = args
+      .filter((arg) => arg !== "--refresh" && arg !== "--force")
+      .join(" ")
+      .trim();
+    if (!text) throw new Error("resolve requires prompt text");
+    const payload = await remoteJson("/api/admin/resolve", {
+      method: "POST",
+      headers: remoteHeaders(true),
+      body: JSON.stringify({ text, refresh, force }),
+    });
+    console.log(JSON.stringify(payload, null, 2));
+    return true;
+  }
+  if (command === "wallet") {
+    const address = args.find((arg) => !arg.startsWith("--")) || "";
+    if (!address) throw new Error("wallet requires a Solana address");
+    const refresh = args.includes("--refresh") ? "&refresh=1" : "";
+    const payload = await remoteJson(
+      `/api/wallet/score?walletAddress=${encodeURIComponent(address)}${refresh}`,
+      { headers: remoteHeaders() },
+    );
+    console.log(JSON.stringify(payload, null, 2));
+    return true;
+  }
+  if (command === "bans") {
+    const payload = await remoteJson("/api/admin/moderation", {
+      headers: remoteHeaders(),
+    });
+    if (!(payload.bans || []).length)
+      console.log("[control] no moderation bans");
+    for (const ban of payload.bans || [])
+      console.log(
+        `#${ban.id}  ${ban.active ? "ACTIVE" : "off"}  ${ban.hash}  ${ban.reason || ""}`.trim(),
+      );
+    return true;
+  }
+  if (["remove", "ban", "ban-ip", "unban"].includes(command)) {
+    let body: Record<string, unknown>;
+    if (command === "remove")
+      body = { action: "remove", proposalId: proposalArg(args) };
+    else if (command === "ban")
+      body = {
+        action: "ban-proposal",
+        proposalId: proposalArg(args),
+        reason: reasonArg(args),
+      };
+    else if (command === "ban-ip") {
+      const ip = args.find((value) => !value.startsWith("--"));
+      if (!ip) throw new Error("ban-ip requires an IP address");
+      body = { action: "ban-ip", ip, reason: reasonArg(args) };
+    } else body = { action: "unban", banId: positiveArg(args[0], "ban id") };
+    const payload = await remoteJson("/api/admin/moderation", {
+      method: "POST",
+      headers: remoteHeaders(true),
+      body: JSON.stringify(body),
+    });
+    console.log(JSON.stringify(payload, null, 2));
+    return true;
+  }
+
+  throw new Error(
+    `${command} is local-only while PUMPTV_ADMIN_URL is configured. Pass --local to explicitly operate the local database.`,
+  );
+}
+
+if (await handleRemoteCommand()) process.exit(0);
+
 const repo = await import("../server/repository.ts");
 const { db } = await import("../server/db.ts");
-const command = process.argv[2] || "status";
-const args = process.argv.slice(3);
-const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function usage() {
   console.log(
-    `PumpTV control\n\n  bun run control -- status\n  bun run control -- watch\n  bun run control -- json\n  bun run control -- resolve [--refresh] [--force] <prompt...>\n  bun run control -- prompt <episode|latest> [--json]\n  bun run control -- set-votes <proposalId> <count|auto>\n  bun run control -- trigger\n  bun run control -- force <proposalId>\n  bun run control -- inject <prompt...>\n  bun run control -- inject-force <prompt...>\n  bun run control -- clear-queue\n`,
+    `PumpTV control
+
+  bun run control -- status [--local]
+  bun run control -- board [--local]
+  bun run control -- watch --local
+  bun run control -- json [--local]
+  bun run control -- resolve [--refresh] [--force] <prompt...>
+  bun run control -- prompt <episode|latest> [--json] --local
+  bun run control -- wallet [--refresh] <address>
+  bun run control -- remove --proposal <id>
+  bun run control -- ban --proposal <id> [--reason <text>]
+  bun run control -- ban-ip <ip> [--reason <text>]
+  bun run control -- bans
+  bun run control -- unban <banId>
+  bun run control -- set-votes <proposalId> <count|auto> --local
+  bun run control -- trigger [--proposal <id> | --text <exact text>]
+  bun run control -- force <proposalId>
+  bun run control -- inject <prompt...> --local
+  bun run control -- inject-force <prompt...> --local
+  bun run control -- clear-queue --local
+`,
   );
 }
 
@@ -100,6 +319,54 @@ if (command === "status") {
   }
 } else if (command === "json") {
   console.log(JSON.stringify(await repo.getStreamState(), null, 2));
+} else if (command === "board") {
+  const round = await repo.getOpenPromptRound();
+  if (!round?.proposals.length) console.log("[control] no active proposals");
+  else
+    for (const proposal of round.proposals)
+      console.log(`#${proposal.id}  ${proposal.voteCount}  ${proposal.text}`);
+} else if (command === "bans") {
+  const moderation = await import("../server/moderation.ts");
+  const rows = moderation.listBans();
+  if (!rows.length) console.log("[control] no moderation bans");
+  for (const ban of rows)
+    console.log(
+      `#${ban.id}  ${ban.active ? "ACTIVE" : "off"}  ${ban.hash}  ${ban.reason || ""}`.trim(),
+    );
+} else if (command === "remove") {
+  const moderation = await import("../server/moderation.ts");
+  const result = moderation.removeProposalById(proposalArg(args));
+  console.log(`[control] removed #${result.proposalId} → ${result.text}`);
+} else if (command === "ban") {
+  const moderation = await import("../server/moderation.ts");
+  const proposalId = proposalArg(args);
+  const result = moderation.banProposalIp(proposalId, reasonArg(args));
+  console.log(
+    `[control] banned origin of #${proposalId} · ban #${result.banId} · removed ${result.removedProposals} proposal(s), ${result.removedVotes} vote(s)`,
+  );
+} else if (command === "ban-ip") {
+  const moderation = await import("../server/moderation.ts");
+  const ip = args.find((value) => !value.startsWith("--"));
+  if (!ip) throw new Error("ban-ip requires an IP address");
+  const result = moderation.banIp(ip, reasonArg(args));
+  console.log(
+    `[control] banned ${result.ip} · ban #${result.banId} · removed ${result.removedProposals} proposal(s), ${result.removedVotes} vote(s)`,
+  );
+} else if (command === "unban") {
+  const moderation = await import("../server/moderation.ts");
+  const result = moderation.unbanById(positiveArg(args[0], "ban id"));
+  console.log(`[control] unbanned #${result.banId}`);
+} else if (command === "wallet") {
+  const address = args.find((arg) => !arg.startsWith("--")) || "";
+  if (!address) {
+    usage();
+    process.exit(1);
+  }
+  const { walletVotingPower } = await import("../server/wallet-score.ts");
+  const result = await walletVotingPower(address, {
+    fresh: args.includes("--refresh"),
+  });
+  console.log(JSON.stringify({ walletAddress: address, ...result }, null, 2));
 } else if (command === "prompt" || command === "episode") {
   const jsonOutput = args.includes("--json");
   const target = args.find((arg) => arg !== "--json") || "latest";
@@ -252,9 +519,15 @@ if (command === "status") {
     for (const p of round.proposals)
       console.log(`#${p.id} ${p.voteCount} ${p.text}`);
 } else if (command === "close" || command === "trigger") {
-  const directive = await repo.triggerPromptRound();
-  if (!directive) throw new Error("No open round with proposals");
-  console.log(`[control] locked → ${directive.text}`);
+  const selection = triggerSelectionArgs(command, args);
+  const result = await repo.triggerNextProposal({
+    ...("proposalId" in selection ? { proposalId: selection.proposalId } : {}),
+    ...("text" in selection ? { text: selection.text } : {}),
+    actor: "cli",
+  });
+  console.log(
+    `[control] locked #${result.proposal.id} · rank ${result.rank} · score ${result.score} → ${result.proposal.text}`,
+  );
 } else if (command === "force") {
   const id = Number((args[0] || "").replace(/^#/, ""));
   if (!Number.isInteger(id) || id < 1) {

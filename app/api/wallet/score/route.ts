@@ -4,6 +4,11 @@ import {
   measuredRoute,
 } from "../../../../src/server/observability.ts";
 import { sanitizeLine } from "../../../../src/server/prompt.ts";
+import {
+  assertRequestAllowed,
+  ModerationBlockedError,
+  recordSubjectOrigin,
+} from "../../../../src/server/moderation.ts";
 import { attachWebWallet } from "../../../../src/server/repository.ts";
 import {
   normalizeSolanaAddress,
@@ -14,6 +19,13 @@ function ownerKey(value: unknown) {
   const id = sanitizeLine(String(value || ""), 180);
   if (!id) throw new Error("Missing proposal owner id");
   return `web:${id}`;
+}
+
+function errorStatus(error: unknown) {
+  const message = errorText(error);
+  return /not configured|does not exist|not an SPL token mint/i.test(message)
+    ? 503
+    : 400;
 }
 
 export function GET(request: Request) {
@@ -32,7 +44,9 @@ export function GET(request: Request) {
           start: () =>
             `Inspect wallet score ${address.slice(0, 5)}…${address.slice(-4)}`,
           end: (value) => ({
-            tokenBalance: "[omitted]",
+            mint: value.mint,
+            tokenProgram: value.tokenProgram,
+            matchingAccounts: value.matchingAccounts,
             power: value.power,
             fresh,
           }),
@@ -41,7 +55,13 @@ export function GET(request: Request) {
       );
       return Response.json({ walletAddress: address, ...score });
     } catch (error) {
-      return Response.json({ error: errorText(error) }, { status: 400 });
+      return Response.json(
+        { error: errorText(error) },
+        {
+          status:
+            error instanceof ModerationBlockedError ? 403 : errorStatus(error),
+        },
+      );
     }
   });
 }
@@ -49,6 +69,7 @@ export function GET(request: Request) {
 export function POST(request: Request) {
   return measuredRoute(request, async () => {
     try {
+      const { originIpHash } = assertRequestAllowed(request);
       const body = await httpMeasure.measure(
         "Parse wallet request",
         async () => {
@@ -60,10 +81,17 @@ export function POST(request: Request) {
       );
       const address = normalizeSolanaAddress(body.walletAddress);
       if (!address) throw new Error("Invalid Solana wallet");
+      const anonymousOwnerKey = ownerKey(body.ownerId ?? body.viewerId);
+      const walletOwnerKey = `wallet:${address}`;
       const score = await httpMeasure.measure(
         {
           start: () => "Read wallet token balance",
-          end: (value) => ({ tokenBalance: "[omitted]", power: value.power }),
+          end: (value) => ({
+            mint: value.mint,
+            tokenProgram: value.tokenProgram,
+            matchingAccounts: value.matchingAccounts,
+            power: value.power,
+          }),
         },
         () => walletVotingPower(address),
       );
@@ -78,14 +106,22 @@ export function POST(request: Request) {
         },
         () =>
           attachWebWallet({
-            ownerKey: ownerKey(body.ownerId ?? body.viewerId),
+            ownerKey: anonymousOwnerKey,
             walletAddress: address,
             weight: score.power,
           }),
       );
+      recordSubjectOrigin(anonymousOwnerKey, originIpHash);
+      recordSubjectOrigin(walletOwnerKey, originIpHash);
       return Response.json({ walletAddress: address, ...score });
     } catch (error) {
-      return Response.json({ error: errorText(error) }, { status: 400 });
+      return Response.json(
+        { error: errorText(error) },
+        {
+          status:
+            error instanceof ModerationBlockedError ? 403 : errorStatus(error),
+        },
+      );
     }
   });
 }

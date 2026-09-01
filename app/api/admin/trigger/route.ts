@@ -5,7 +5,7 @@ import {
 } from "../../../../src/server/observability.ts";
 import {
   getOpenPromptRound,
-  triggerPromptRound,
+  triggerNextProposal,
 } from "../../../../src/server/repository.ts";
 
 function adminToken(request: Request) {
@@ -59,7 +59,15 @@ export function GET(request: Request) {
       },
       () => getOpenPromptRound(),
     );
-    return Response.json(boardPayload(round));
+    return Response.json({
+      ...boardPayload(round),
+      readOnly: true,
+      trigger: {
+        method: "POST",
+        default: "highest-score",
+        override: "proposalId or exact text",
+      },
+    });
   });
 }
 
@@ -98,58 +106,44 @@ export function POST(request: Request) {
       if (proposalId !== undefined && rawText)
         throw new Error("Use proposalId or text, not both");
 
-      const before = await httpMeasure.measure("Load trigger candidates", () =>
-        getOpenPromptRound(),
-      );
-      if (!before || !before.proposals.length)
-        throw new Error("There are no active proposals to trigger");
-
-      const normalizedText = rawText.replace(/\s+/g, " ").toLowerCase();
-      const selected =
-        proposalId !== undefined
-          ? before.proposals.find((proposal) => proposal.id === proposalId)
-          : normalizedText
-            ? before.proposals.find(
-                (proposal) =>
-                  proposal.text.replace(/\s+/g, " ").trim().toLowerCase() ===
-                  normalizedText,
-              )
-            : before.proposals[0];
-      if (!selected)
-        throw new Error(
-          proposalId !== undefined
-            ? `Proposal #${proposalId} is not active`
-            : `No active proposal exactly matches: ${rawText}`,
-        );
-
-      const override = proposalId !== undefined || Boolean(normalizedText);
-      const directive = await httpMeasure.measure(
+      const result = await httpMeasure.measure(
         {
           start: () =>
-            override
-              ? `Trigger override #${selected.id}`
-              : `Trigger highest score #${selected.id}`,
+            proposalId !== undefined
+              ? `Trigger override #${proposalId}`
+              : rawText
+                ? "Trigger override by exact text"
+                : "Trigger highest score",
           end: (value) => ({
-            directiveId: value?.id ?? null,
-            text: value?.text ?? null,
+            proposalId: value.proposal.id,
+            rank: value.rank,
+            score: value.score,
+            directiveId: value.directive.id,
+            text: value.proposal.text.slice(0, 100),
           }),
         },
-        () => triggerPromptRound(override ? selected.id : undefined),
+        () =>
+          triggerNextProposal({
+            proposalId,
+            text: rawText || undefined,
+            actor: "api",
+          }),
       );
-      if (!directive) throw new Error("Could not lock a proposal");
 
       return Response.json(
         {
           ok: true,
-          selection: override ? "override" : "highest-score",
+          selection:
+            proposalId !== undefined || rawText ? "override" : "highest-score",
           proposal: {
-            id: selected.id,
-            score: selected.voteCount,
-            text: selected.text,
-            author: selected.author,
-            authorAddress: selected.authorAddress,
+            id: result.proposal.id,
+            rank: result.rank,
+            score: result.score,
+            text: result.proposal.text,
+            author: result.proposal.author,
+            authorAddress: result.proposal.authorAddress,
           },
-          directive,
+          directive: result.directive,
         },
         { status: 202 },
       );

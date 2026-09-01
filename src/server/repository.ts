@@ -128,6 +128,7 @@ function nextPendingDirectiveWithVotes() {
               END AS voteCount
        FROM directives d
        WHERE COALESCE(d.triggered, 0) = 1
+         AND d.sourceId LIKE 'trigger:%'
          AND d.status IN ('generating', 'queued')
        ORDER BY CASE d.status WHEN 'generating' THEN 0 ELSE 1 END, d.id ASC
        LIMIT 1`,
@@ -1137,88 +1138,209 @@ function carryProposalBoardForward(input: {
   return nextRoundId;
 }
 
-export async function closePromptRound(
-  winnerProposalId?: number,
-): Promise<Directive | null> {
-  const round = await getOpenPromptRound();
-  if (!round || round.proposals.length === 0) return null;
-  const generationEpisode = await nextEpisode();
-  if (generationEpisode === 0)
-    throw new Error(
-      "The opening episode must publish before proposals can be triggered",
-    );
-  const winner =
-    winnerProposalId == null
-      ? round.proposals[0]
-      : round.proposals.find((p) => p.id === winnerProposalId);
-  if (!winner)
-    throw new Error(`Proposal #${winnerProposalId} is not in the open round`);
-  return dbMeasure.measureSync("Lock proposal winner", () => {
-    db.exec("BEGIN IMMEDIATE");
-    try {
-      const now = Date.now();
-      db.exec(
-        `UPDATE promptRounds
-         SET targetEpisode = ?, status = 'closed', closedAtMs = ?, winnerProposalId = ?
-         WHERE id = ? AND status = 'open'`,
-        generationEpisode,
-        now,
-        winner.id,
-        round.id,
-      );
-      db.exec(
-        `UPDATE proposals SET status = CASE WHEN id = ? THEN 'selected' ELSE 'lost' END WHERE roundId = ?`,
-        winner.id,
-        round.id,
-      );
-      let directive =
-        db.raw<any>(
-          `SELECT * FROM directives WHERE proposalId = ? LIMIT 1`,
-          winner.id,
-        )[0] || null;
-      if (!directive) {
-        directive = db.directives.insert({
-          text: winner.text,
-          status: "queued",
-          usedEpisode: null,
-          source: winner.source,
-          sourceId: `round:${round.id}:proposal:${winner.id}`,
-          author: winner.author,
-          authorAddress: winner.authorAddress,
-          sourceRoom: winner.sourceRoom,
-          proposalId: winner.id,
-          triggered: true,
-        });
-      }
-      if (!directive) throw new Error("Could not create winning directive");
-      carryProposalBoardForward({
-        roundId: round.id,
-        winnerProposalId: winner.id,
-        targetEpisode: generationEpisode + 1,
-        now,
-      });
-      db.exec("COMMIT");
-      const hydrated = directiveWithVotesById(Number((directive as any).id));
-      return hydrated ? toDirective(hydrated) : toDirective(directive);
-    } catch (error) {
-      try {
-        db.exec("ROLLBACK");
-      } catch {}
-      throw error;
-    }
-  });
+type TriggerSelection = {
+  proposalId?: number;
+  text?: string;
+  actor?: string;
+};
+
+export type TriggerResult = {
+  directive: Directive;
+  proposal: PromptProposal;
+  rank: number;
+  score: number;
+  actor: string;
+};
+
+function cleanTriggerActor(value: string | undefined) {
+  const actor = String(value || "unknown")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 48);
+  return actor || "unknown";
 }
 
+function triggerDirectiveSourceId(
+  actor: string,
+  roundId: number,
+  proposalId: number,
+) {
+  return `trigger:${cleanTriggerActor(actor)}:round:${roundId}:proposal:${proposalId}`;
+}
+
+export async function triggerNextProposal(
+  selection: TriggerSelection = {},
+): Promise<TriggerResult> {
+  const actor = cleanTriggerActor(selection.actor);
+
+  return dbMeasure.measureSync(
+    {
+      start: () => `Trigger proposal · ${actor}`,
+      end: (result) => ({
+        actor: result.actor,
+        proposalId: result.proposal.id,
+        rank: result.rank,
+        score: result.score,
+        directiveId: result.directive.id,
+        text: result.proposal.text.slice(0, 100),
+      }),
+    },
+    () => {
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const pending =
+          db.raw<any>(
+            `SELECT id, text, status, sourceId
+             FROM directives
+             WHERE COALESCE(triggered, 0) = 1
+               AND sourceId LIKE 'trigger:%'
+               AND status IN ('generating', 'queued')
+             ORDER BY CASE status WHEN 'generating' THEN 0 ELSE 1 END, id ASC
+             LIMIT 1`,
+          )[0] || null;
+        if (pending) {
+          throw new Error(
+            `Next generation is already ${pending.status}: ${pending.text}`,
+          );
+        }
+
+        const roundRow =
+          db.raw<any>(
+            `SELECT id FROM promptRounds
+             WHERE status = 'open'
+             ORDER BY id DESC
+             LIMIT 1`,
+          )[0] || null;
+        if (!roundRow) throw new Error("There is no open proposal board");
+
+        const round = loadRoundById(Number(roundRow.id));
+        if (!round || !round.proposals.length)
+          throw new Error("There are no active proposals to trigger");
+
+        const generationEpisodeRow =
+          db.raw<any>(`SELECT MAX(episode) AS latestEpisode FROM clips`)[0] ||
+          null;
+        const generationEpisode =
+          generationEpisodeRow?.latestEpisode == null
+            ? 0
+            : Number(generationEpisodeRow.latestEpisode) + 1;
+        if (generationEpisode === 0)
+          throw new Error(
+            "The opening episode must publish before proposals can be triggered",
+          );
+
+        const normalizedText = selection.text
+          ?.replace(/\s+/g, " ")
+          .trim()
+          .toLowerCase();
+
+        const selected =
+          selection.proposalId !== undefined
+            ? round.proposals.find(
+                (proposal) => proposal.id === selection.proposalId,
+              )
+            : normalizedText
+              ? round.proposals.find(
+                  (proposal) =>
+                    proposal.text.replace(/\s+/g, " ").trim().toLowerCase() ===
+                    normalizedText,
+                )
+              : round.proposals[0];
+
+        if (!selected) {
+          if (selection.proposalId !== undefined)
+            throw new Error(`Proposal #${selection.proposalId} is not active`);
+          throw new Error(
+            `No active proposal exactly matches: ${selection.text || ""}`,
+          );
+        }
+
+        const rank =
+          round.proposals.findIndex((proposal) => proposal.id === selected.id) +
+          1;
+        const score = Number(selected.voteCount || 0);
+        const now = Date.now();
+
+        const closed = db.raw<any>(
+          `UPDATE promptRounds
+           SET targetEpisode = ?, status = 'closed', closedAtMs = ?, winnerProposalId = ?
+           WHERE id = ? AND status = 'open'
+           RETURNING id`,
+          generationEpisode,
+          now,
+          selected.id,
+          round.id,
+        );
+        if (!closed?.length)
+          throw new Error("Proposal board changed while triggering; try again");
+
+        db.exec(
+          `UPDATE proposals
+           SET status = CASE WHEN id = ? THEN 'selected' ELSE 'lost' END
+           WHERE roundId = ?`,
+          selected.id,
+          round.id,
+        );
+
+        const sourceId = triggerDirectiveSourceId(actor, round.id, selected.id);
+        const directive = db.directives.insert({
+          text: selected.text,
+          status: "queued",
+          usedEpisode: null,
+          source: selected.source,
+          sourceId,
+          author: selected.author,
+          authorAddress: selected.authorAddress,
+          sourceRoom: selected.sourceRoom,
+          proposalId: selected.id,
+          triggered: true,
+        });
+        if (!directive) throw new Error("Could not create winning directive");
+
+        carryProposalBoardForward({
+          roundId: round.id,
+          winnerProposalId: selected.id,
+          targetEpisode: generationEpisode + 1,
+          now,
+        });
+
+        db.exec("COMMIT");
+
+        const hydrated = directiveWithVotesById(Number((directive as any).id));
+        const finalDirective = hydrated
+          ? toDirective(hydrated)
+          : toDirective(directive);
+
+        return {
+          directive: finalDirective,
+          proposal: selected,
+          rank,
+          score,
+          actor,
+        };
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {}
+        throw error;
+      }
+    },
+  );
+}
+
+// Compatibility wrapper for any old operator code. New CLI/API paths call
+// triggerNextProposal() so selection, ranking and attribution are identical.
 export async function triggerPromptRound(
   winnerProposalId?: number,
+  actor = "legacy",
 ): Promise<Directive | null> {
-  const pending = nextPendingDirectiveWithVotes();
-  if (pending) {
-    throw new Error(
-      `Next generation is already ${pending.status}: ${pending.text}`,
-    );
-  }
-  return closePromptRound(winnerProposalId);
+  const result = await triggerNextProposal({
+    proposalId: winnerProposalId,
+    actor,
+  });
+  return result.directive;
 }
 
 export async function forceProposalAsNext(
@@ -1236,9 +1358,11 @@ export async function forceProposalAsNext(
   const round = loadRoundById(Number(proposal.roundId));
   if (!round) throw new Error(`Round for proposal #${proposalId} not found`);
   if (round.status === "open") {
-    const directive = await closePromptRound(proposalId);
-    if (!directive) throw new Error("Could not close prompt round");
-    return directive;
+    const result = await triggerNextProposal({
+      proposalId,
+      actor: "force",
+    });
+    return result.directive;
   }
 
   return dbMeasure.measureSync("Override locked proposal winner", () => {
@@ -1268,7 +1392,7 @@ export async function forceProposalAsNext(
         db.exec(
           `UPDATE directives SET text = ?, sourceId = ?, author = ?, authorAddress = ?, sourceRoom = ?, proposalId = ?, triggered = 1 WHERE id = ?`,
           proposal.text,
-          `round:${round.id}:proposal:${proposalId}`,
+          triggerDirectiveSourceId("force-override", round.id, proposalId),
           proposal.author ?? null,
           proposal.authorAddress ?? null,
           proposal.sourceRoom ?? null,
@@ -1285,7 +1409,11 @@ export async function forceProposalAsNext(
           status: "queued",
           usedEpisode: null,
           source: proposal.source || "pumpfun",
-          sourceId: `round:${round.id}:proposal:${proposalId}`,
+          sourceId: triggerDirectiveSourceId(
+            "force-override",
+            round.id,
+            proposalId,
+          ),
           author: proposal.author ?? null,
           authorAddress: proposal.authorAddress ?? null,
           sourceRoom: proposal.sourceRoom ?? null,
@@ -1391,23 +1519,32 @@ export async function operatorInjectProposal(text: string) {
 export async function operatorInjectAndForce(text: string) {
   const proposal = await operatorInjectProposal(text);
   if (!proposal) throw new Error("Could not inject operator proposal");
-  return closePromptRound(proposal.id);
+  const result = await triggerNextProposal({
+    proposalId: proposal.id,
+    actor: "inject-force",
+  });
+  return result.directive;
 }
 
 export async function claimQueuedDirective(episode: number) {
-  const queued = await dbMeasure.measureSync("Get queued directive", () =>
-    db.directives
-      .select()
-      .where({ status: "queued", triggered: true })
-      .orderBy("id", "ASC")
-      .first(),
+  const queued = await dbMeasure.measureSync(
+    "Get explicitly triggered directive",
+    () =>
+      db.raw<any>(
+        `SELECT * FROM directives
+         WHERE status = 'queued'
+           AND COALESCE(triggered, 0) = 1
+           AND sourceId LIKE 'trigger:%'
+         ORDER BY id ASC
+         LIMIT 1`,
+      )[0] || null,
   );
   if (!queued) return null;
 
   const claimed = await dbMeasure.measureSync("Claim directive", () =>
     db.directives
       .select()
-      .where({ id: (queued as any).id })
+      .where({ id: Number(queued.id), status: "queued" })
       .updateAll({ status: "generating", usedEpisode: episode }),
   );
   if (claimed === null) throw new Error("Could not claim directive");
@@ -1416,12 +1553,17 @@ export async function claimQueuedDirective(episode: number) {
 }
 
 export async function hasQueuedDirective() {
-  const row = await dbMeasure.measureSync("Check queued directive", () =>
-    db.directives
-      .select("id")
-      .where({ status: "queued", triggered: true })
-      .orderBy("id", "ASC")
-      .first(),
+  const row = await dbMeasure.measureSync(
+    "Check explicitly triggered directive",
+    () =>
+      db.raw<any>(
+        `SELECT id FROM directives
+         WHERE status = 'queued'
+           AND COALESCE(triggered, 0) = 1
+           AND sourceId LIKE 'trigger:%'
+         ORDER BY id ASC
+         LIMIT 1`,
+      )[0] || null,
   );
   return Boolean(row);
 }
@@ -1775,12 +1917,16 @@ export async function getStreamState(): Promise<StreamState> {
     await Promise.all([
       getRoomRow(),
       getTimeline(),
-      dbMeasure.measureSync("Count triggered prompts", () =>
-        db.directives
-          .select()
-          .where({ status: "queued", triggered: true })
-          .count(),
-      ),
+      dbMeasure.measureSync("Count triggered prompts", () => {
+        const row =
+          db.raw<any>(
+            `SELECT COUNT(*) AS count FROM directives
+             WHERE status = 'queued'
+               AND COALESCE(triggered, 0) = 1
+               AND sourceId LIKE 'trigger:%'`,
+          )[0] || null;
+        return Number(row?.count || 0);
+      }),
       getRecentGenerationTimings(),
       getOpenPromptRound(),
     ]);

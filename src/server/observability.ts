@@ -25,6 +25,7 @@ export const reconcileMeasure = createMeasure("reconcile");
 export const workerMeasure = createMeasure("worker");
 export const pumpMeasure = createMeasure("pumpfun");
 export const walletMeasure = createMeasure("wallet");
+export const moderationMeasure = createMeasure("moderation");
 export const arbitrationMeasure = createMeasure("arbitration");
 export const lifecycleMeasure = createMeasure("lifecycle");
 export const webMeasure = createMeasure("web");

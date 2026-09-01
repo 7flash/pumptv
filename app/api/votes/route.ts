@@ -4,6 +4,11 @@ import {
   measuredRoute,
 } from "../../../src/server/observability.ts";
 import { sanitizeLine } from "../../../src/server/prompt.ts";
+import {
+  assertRequestAllowed,
+  ModerationBlockedError,
+  recordSubjectOrigin,
+} from "../../../src/server/moderation.ts";
 import { castWebVote } from "../../../src/server/repository.ts";
 import {
   normalizeSolanaAddress,
@@ -23,6 +28,7 @@ function voterKey(value: unknown, walletAddress: string | null) {
 export function POST(request: Request) {
   return measuredRoute(request, async () => {
     try {
+      const { originIpHash } = assertRequestAllowed(request);
       const body = await httpMeasure.measure("Parse vote request", async () => {
         const raw = await request.json();
         if (!raw || typeof raw !== "object" || Array.isArray(raw))
@@ -33,6 +39,7 @@ export function POST(request: Request) {
       if (!Number.isSafeInteger(proposalId) || proposalId <= 0)
         throw new Error("Invalid proposal id");
       const walletAddress = normalizeSolanaAddress(body.walletAddress);
+      const subjectKey = voterKey(body.ownerId ?? body.viewerId, walletAddress);
       const { power } = await httpMeasure.measure(
         {
           start: () => "Resolve vote score",
@@ -48,16 +55,20 @@ export function POST(request: Request) {
         () =>
           castWebVote({
             proposalId,
-            voterKey: voterKey(body.ownerId ?? body.viewerId, walletAddress),
+            voterKey: subjectKey,
             weight: power,
             walletAddress,
           }),
       );
       if (!round)
         return Response.json({ error: "Could not vote." }, { status: 400 });
+      recordSubjectOrigin(subjectKey, originIpHash);
       return Response.json(round);
     } catch (error) {
-      return Response.json({ error: errorText(error) }, { status: 400 });
+      return Response.json(
+        { error: errorText(error) },
+        { status: error instanceof ModerationBlockedError ? 403 : 400 },
+      );
     }
   });
 }
