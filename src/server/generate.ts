@@ -4,6 +4,8 @@ import { falMeasure } from "./observability.ts";
 import { OPENING, renderH3Prompt } from "./prompt.ts";
 import { planNextShot } from "./showrunner.tsx";
 import { resolveExternalReferences } from "./reference-tools.ts";
+import type { ReferenceContext } from "./reference-tools.ts";
+import { generateFactEndKeyframe } from "./fact-keyframe.ts";
 import { extractVideoFrame, sampleClipFrames } from "./video-frames.ts";
 import {
   claimQueuedDirective,
@@ -25,6 +27,37 @@ function configureFal() {
 
 function elapsed(startedAt: number) {
   return Math.max(0, Math.round(performance.now() - startedAt));
+}
+
+function factualOverlayText(
+  directive: string,
+  context: ReferenceContext | undefined,
+): string | null {
+  if (!context) return null;
+
+  for (const fact of context.marketFacts || []) {
+    const match = fact.match(
+      /^([A-Z0-9]{2,10})\s+spot price:\s*(\$[0-9][0-9,]*(?:\.[0-9]+)?)/i,
+    );
+    if (match) return `${match[1].toUpperCase()} ${match[2]}`.slice(0, 96);
+  }
+
+  const symbol = /\b(bitcoin|btc)\b/i.test(directive)
+    ? "BTC"
+    : /\b(ethereum|ether|eth)\b/i.test(directive)
+      ? "ETH"
+      : /\b(solana|sol)\b/i.test(directive)
+        ? "SOL"
+        : /\b(dogecoin|doge)\b/i.test(directive)
+          ? "DOGE"
+          : null;
+  if (!symbol) return null;
+
+  for (const fact of context.facts || []) {
+    const amount = fact.match(/\$[0-9][0-9,]*(?:\.[0-9]+)?/);
+    if (amount) return `${symbol} ${amount[0]}`.slice(0, 96);
+  }
+  return null;
 }
 
 async function continuityFrame(previousClip: Clip | null) {
@@ -69,6 +102,7 @@ export async function generateNextClip(input: {
               ...worldState.props.map((prop) => prop.name),
             ],
           });
+    const factOverlayText = factualOverlayText(directive, referenceContext);
     const showrunnerStartedAt = performance.now();
     const showrunner = await planNextShot({
       directive,
@@ -81,11 +115,20 @@ export async function generateNextClip(input: {
     });
     const showrunnerMs = elapsed(showrunnerStartedAt);
 
+    const factKeyframe = await generateFactEndKeyframe({
+      anchorFrameUrl,
+      factText: factOverlayText,
+      plan: showrunner.plan,
+      resolution: input.resolution,
+    });
+
     const prompt = renderH3Prompt({
       plan: showrunner.plan,
       episode,
       hasAnchor: Boolean(anchorFrameUrl),
       worldState,
+      factOverlayText,
+      factKeyframeProvided: Boolean(factKeyframe?.url),
     });
 
     const endpoint = anchorFrameUrl
@@ -96,6 +139,7 @@ export async function generateNextClip(input: {
       ? {
           prompt,
           image_url: anchorFrameUrl,
+          ...(factKeyframe?.url ? { end_image_url: factKeyframe.url } : {}),
           duration: CLIP_SECONDS,
           resolution: input.resolution,
           enable_safety_checker: true,
@@ -174,6 +218,8 @@ export async function generateNextClip(input: {
         showrunnerPlanJson: JSON.stringify({
           ...showrunner.plan,
           _references: showrunner.referenceContext || null,
+          _factOverlay: factOverlayText,
+          _factKeyframe: factKeyframe,
         }),
         showrunnerInputTokens: showrunner.inputTokens,
         showrunnerOutputTokens: showrunner.outputTokens,

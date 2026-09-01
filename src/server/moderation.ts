@@ -224,6 +224,30 @@ function activateIpBan(ipHash: string, reason?: string | null) {
   return Number((row as any).id);
 }
 
+function resolveModerationProposal(proposalId: number) {
+  const requested =
+    db.raw<any>(
+      `SELECT id, text, normalizedText, status, sourceId, authorAddress
+     FROM proposals WHERE id = ? LIMIT 1`,
+      proposalId,
+    )[0] || null;
+  if (!requested) throw new Error(`Proposal #${proposalId} not found`);
+  if (requested.status === "open")
+    return { requestedId: proposalId, proposal: requested };
+
+  // Compatibility for boards created before persistent proposal ids were fixed:
+  // old rounds cloned survivors into a new id and marked the previous row lost.
+  const active =
+    db.raw<any>(
+      `SELECT id, text, normalizedText, status, sourceId, authorAddress
+     FROM proposals
+     WHERE status = 'open' AND normalizedText = ?
+     ORDER BY id DESC LIMIT 1`,
+      requested.normalizedText,
+    )[0] || null;
+  return { requestedId: proposalId, proposal: active || requested };
+}
+
 export function removeProposalById(proposalId: number) {
   return moderationMeasure.measureSync(
     {
@@ -231,20 +255,17 @@ export function removeProposalById(proposalId: number) {
       end: (result) => ({ proposalId: result.proposalId }),
     },
     () => {
-      const proposal =
-        db.raw<any>(
-          `SELECT id, text, status FROM proposals WHERE id = ? LIMIT 1`,
-          proposalId,
-        )[0] || null;
-      if (!proposal) throw new Error(`Proposal #${proposalId} not found`);
-      if (proposal.status !== "open")
+      const resolved = resolveModerationProposal(proposalId);
+      const proposal = resolved.proposal;
+      if (proposal.status === "selected")
         throw new Error(
-          `Proposal #${proposalId} is already ${proposal.status}`,
+          `Proposal #${proposalId} already executed and cannot be removed from history`,
         );
+      const activeId = Number(proposal.id);
       db.exec("BEGIN IMMEDIATE");
       try {
-        db.exec(`DELETE FROM proposalVotes WHERE proposalId = ?`, proposalId);
-        db.exec(`DELETE FROM proposals WHERE id = ?`, proposalId);
+        db.exec(`DELETE FROM proposalVotes WHERE proposalId = ?`, activeId);
+        db.exec(`DELETE FROM proposals WHERE id = ?`, activeId);
         db.exec("COMMIT");
       } catch (error) {
         try {
@@ -252,7 +273,12 @@ export function removeProposalById(proposalId: number) {
         } catch {}
         throw error;
       }
-      return { proposalId, text: String(proposal.text) };
+      return {
+        proposalId: activeId,
+        requestedProposalId: proposalId,
+        text: String(proposal.text),
+        resolvedLegacyClone: activeId !== proposalId,
+      };
     },
   );
 }
@@ -289,12 +315,9 @@ export function banProposalIp(proposalId: number, reason?: string | null) {
       }),
     },
     () => {
-      const proposal =
-        db.raw<any>(
-          `SELECT id, text, sourceId, authorAddress FROM proposals WHERE id = ? LIMIT 1`,
-          proposalId,
-        )[0] || null;
-      if (!proposal) throw new Error(`Proposal #${proposalId} not found`);
+      const resolved = resolveModerationProposal(proposalId);
+      const proposal = resolved.proposal;
+      const activeProposalId = Number(proposal.id);
       const subjectKeys = [
         String(proposal.sourceId || ""),
         proposal.authorAddress ? `wallet:${proposal.authorAddress}` : "",
@@ -310,14 +333,15 @@ export function banProposalIp(proposalId: number, reason?: string | null) {
       }
       if (!origin)
         throw new Error(
-          `Proposal #${proposalId} has no recorded IP hash (it predates IP moderation, or trusted proxy headers are disabled).`,
+          `Proposal #${activeProposalId} has no recorded IP hash (it predates IP moderation, or trusted proxy headers are disabled).`,
         );
       const ipHash = String(origin.ipHash);
       const banId = activateIpBan(ipHash, reason);
       const cleaned = removeActiveContributions(subjectKeysForHash(ipHash));
       return {
         banId,
-        proposalId,
+        proposalId: activeProposalId,
+        requestedProposalId: proposalId,
         text: String(proposal.text),
         hash: ipHash.slice(0, 12),
         ...cleaned,

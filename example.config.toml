@@ -13,7 +13,8 @@ port = 3006
 db_path = ".data/pumptv.sqlite" # must match .worker.toml
 room = "main"                  # must match .worker.toml
 admin_token = ""
-# Optional operator CLI target. When set, `bun run control -- ...` uses the remote admin API.
+# Optional operator CLI target. When set, `bun run control -- ...` and `bun run reset -- ...` use the remote admin API.
+# Pass --local to either command to explicitly touch this machine's SQLite DB instead.
 admin_url = ""
 resolution = "480P"
 

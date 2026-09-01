@@ -25,6 +25,8 @@ export function renderH3Prompt(input: {
   episode: number;
   hasAnchor: boolean;
   worldState: WorldState;
+  factOverlayText?: string | null;
+  factKeyframeProvided?: boolean;
 }) {
   const { plan } = input;
   return `Shot ${input.episode + 1} of one endless, continuous, interactive livestream.
@@ -50,6 +52,10 @@ ${sanitizeLine(plan.camera, 500)}
 
 VISUAL DETAILS:
 ${sanitizeLine(plan.visualDetails, 700)}
+
+TEXT / NUMBERS:
+Do not invent readable words, names, labels, receipts, subtitles, prices, numbers, signage, UI text, or typography during the motion. Never satisfy a named person or character by printing their name on an object.
+${input.factOverlayText && input.factKeyframeProvided ? `The supplied FINAL keyframe already contains the exact in-world factual readout ${sanitizeLine(input.factOverlayText, 120)}. Preserve that final keyframe faithfully. Let the display be obscured, abstract, or unreadable during the earlier motion rather than inventing alternate digits; the exact text should resolve only as the shot reaches the supplied final frame.` : input.factOverlayText ? `PumpTV will present this exact factual readout separately: ${sanitizeLine(input.factOverlayText, 120)}. Stage the physical reveal and character reaction, but DO NOT draw or spell that value in generated frames.` : "No exact factual readout is required for this shot."}
 
 AUDIO:
 ${sanitizeLine(plan.audio, 600)}

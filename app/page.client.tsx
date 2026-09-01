@@ -2422,7 +2422,7 @@ function formatScore(value: number) {
 function formatExactScore(value: number) {
   const score = Math.max(0, Number(value || 0));
   return new Intl.NumberFormat("en-US", {
-    maximumFractionDigits: 6,
+    maximumFractionDigits: 0,
   }).format(score);
 }
 
@@ -2753,7 +2753,7 @@ function ParticipationBoard() {
   const candidates = sortedCandidates(round);
   const leader = candidates[0] || null;
   const walletTitle = walletAddress
-    ? `${shortAddress(walletAddress)} · ${formatExactScore(walletTokenBalance)} tokens · power ${formatExactScore(walletPower)}`
+    ? `${shortAddress(walletAddress)} · ${formatExactScore(walletTokenBalance)} $PumpTV · voting power ${formatExactScore(walletPower)}`
     : "Connect Phantom";
   const own = ownProposal();
 
@@ -2811,10 +2811,10 @@ function ParticipationBoard() {
           data-action="wallet"
           aria-label={walletTitle}
           data-rich-tooltip={walletAddress ? "1" : undefined}
-          data-tooltip-kicker={walletAddress ? "TOKEN POWER" : undefined}
+          data-tooltip-kicker={walletAddress ? "$PUMPTV TOKEN" : undefined}
           data-tooltip-body={
             walletAddress
-              ? `Balance ${formatExactScore(walletTokenBalance)}\nVoting power ${formatExactScore(walletPower)}`
+              ? `$PumpTV balance ${formatExactScore(walletTokenBalance)}\nVoting power ${formatExactScore(walletPower)}`
               : undefined
           }
           data-tooltip-meta={

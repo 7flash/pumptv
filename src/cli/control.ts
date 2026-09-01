@@ -96,9 +96,73 @@ function reasonArg(values: string[]) {
   return parts.join(" ").trim() || undefined;
 }
 
+function printPromptArtifact(artifact: any) {
+  const section = (title: string, value: unknown) => {
+    console.log(`\n── ${title} ${"─".repeat(Math.max(2, 66 - title.length))}`);
+    if (value == null || value === "") console.log("(none)");
+    else if (typeof value === "string") console.log(value);
+    else console.log(JSON.stringify(value, null, 2));
+  };
+
+  console.log(
+    `EP ${artifact.episode} · clip #${artifact.clipId}` +
+      `${artifact.directiveId == null ? "" : ` · directive #${artifact.directiveId}`}` +
+      `${artifact.generation?.mode ? ` · ${artifact.generation.mode}` : ""}`,
+  );
+  section("SELECTED IDEA", artifact.proposal);
+  section("RESOLVED REFERENCES", artifact.references);
+  section("FACT OVERLAY", artifact.factOverlay ?? null);
+  section("FACT END KEYFRAME", artifact.factKeyframe ?? null);
+  section("SHOWRUNNER PLAN", artifact.showrunner?.plan);
+  section("H3 INPUT PROMPT", artifact.h3?.prompt);
+  section("FAL EXPANDED PROMPT", artifact.h3?.expandedPrompt);
+  section("GENERATION META", {
+    showrunnerModel: artifact.showrunner?.model ?? null,
+    showrunnerInputTokens: artifact.showrunner?.inputTokens ?? null,
+    showrunnerOutputTokens: artifact.showrunner?.outputTokens ?? null,
+    showrunnerMs: artifact.showrunner?.ms ?? null,
+    h3Ms: artifact.h3?.ms ?? null,
+    inferenceSeconds: artifact.h3?.inferenceSeconds ?? null,
+    totalMs: artifact.generation?.totalMs ?? null,
+    resolution: artifact.h3?.resolution ?? null,
+    requestId: artifact.generation?.requestId ?? null,
+    videoUrl: artifact.generation?.videoUrl ?? null,
+    anchorFrameUrl: artifact.generation?.anchorFrameUrl ?? null,
+  });
+}
+
 async function handleRemoteCommand() {
   if (!ADMIN_URL || localOnly) return false;
 
+  if (command === "doctor") {
+    const payload = await remoteJson("/api/admin/doctor", {
+      headers: remoteHeaders(),
+    });
+    console.log(`[doctor] target remote ${ADMIN_URL}`);
+    console.log(
+      `[doctor] web pid ${payload.web?.pid ?? "?"} · room ${payload.web?.room ?? "?"}`,
+    );
+    console.log(`[doctor] db ${payload.web?.dbPath ?? "?"}`);
+    console.log(`[doctor] token mint ${payload.web?.tokenMint || "MISSING"}`);
+    if (payload.web?.configStale)
+      console.log(
+        `[doctor] RESTART REQUIRED · stale: ${(payload.web.staleKeys || []).join(", ")}`,
+      );
+    console.log(
+      `[doctor] worker ${payload.worker?.process?.state || "?"}${payload.worker?.process?.pid ? ` pid ${payload.worker.process.pid}` : ""} · FAL ${payload.worker?.falConfigured ? "ok" : "MISSING"} · Exa ${payload.worker?.exaConfigured ? "ok" : "off"}`,
+    );
+    console.log(
+      `[doctor] moderation ${payload.web?.moderation?.configured ? "ok" : "MISSING SECRET"} · proxy headers ${payload.web?.moderation?.trustProxyHeaders ? "trusted" : "direct only"}`,
+    );
+    if ((payload.issues || []).length) {
+      console.log("[doctor] issues:");
+      for (const issue of payload.issues) console.log(`  - ${issue}`);
+      process.exitCode = 2;
+    } else {
+      console.log("[doctor] OK");
+    }
+    return true;
+  }
   if (command === "status") {
     const payload = await remoteJson("/api/status", {
       headers: remoteHeaders(),
@@ -153,6 +217,17 @@ async function handleRemoteCommand() {
     console.log(JSON.stringify(payload, null, 2));
     return true;
   }
+  if (command === "prompt" || command === "episode") {
+    const jsonOutput = args.includes("--json");
+    const target = args.find((arg) => arg !== "--json") || "latest";
+    const payload = await remoteJson(
+      `/api/admin/prompt?episode=${encodeURIComponent(target)}`,
+      { headers: remoteHeaders() },
+    );
+    if (jsonOutput) console.log(JSON.stringify(payload, null, 2));
+    else printPromptArtifact(payload);
+    return true;
+  }
   if (command === "wallet") {
     const address = args.find((arg) => !arg.startsWith("--")) || "";
     if (!address) throw new Error("wallet requires a Solana address");
@@ -196,6 +271,7 @@ async function handleRemoteCommand() {
       headers: remoteHeaders(true),
       body: JSON.stringify(body),
     });
+    console.log(`[control] remote ${ADMIN_URL}`);
     console.log(JSON.stringify(payload, null, 2));
     return true;
   }
@@ -214,12 +290,13 @@ function usage() {
   console.log(
     `PumpTV control
 
+  bun run control -- doctor [--local]
   bun run control -- status [--local]
   bun run control -- board [--local]
   bun run control -- watch --local
   bun run control -- json [--local]
   bun run control -- resolve [--refresh] [--force] <prompt...>
-  bun run control -- prompt <episode|latest> [--json] --local
+  bun run control -- prompt <episode|latest> [--json] [--local]
   bun run control -- wallet [--refresh] <address>
   bun run control -- remove --proposal <id>
   bun run control -- ban --proposal <id> [--reason <text>]
@@ -301,7 +378,64 @@ function stateSignature(state: StreamState) {
   });
 }
 
-if (command === "status") {
+if (command === "doctor") {
+  const { existsSync } = await import("node:fs");
+  const { resolve } = await import("node:path");
+  const { readTomlEnvironment } = await import("../server/config-file.ts");
+  const webConfig = await readTomlEnvironment(PROJECT_ROOT, ".config.toml");
+  const workerConfig = await readTomlEnvironment(PROJECT_ROOT, ".worker.toml");
+  const webPath = resolve(PROJECT_ROOT, ".config.toml");
+  const workerPath = resolve(PROJECT_ROOT, ".worker.toml");
+  const webDb = resolve(
+    PROJECT_ROOT,
+    webConfig.PUMPTV_DB_PATH || ".data/pumptv.sqlite",
+  );
+  const workerDb = resolve(
+    PROJECT_ROOT,
+    workerConfig.PUMPTV_DB_PATH || ".data/pumptv.sqlite",
+  );
+  const webRoom = webConfig.PUMPTV_ROOM || "main";
+  const workerRoom = workerConfig.PUMPTV_ROOM || "main";
+  const issues: string[] = [];
+  if (!existsSync(webPath)) issues.push("Missing .config.toml");
+  if (!existsSync(workerPath)) issues.push("Missing .worker.toml");
+  if (webDb !== workerDb)
+    issues.push(`web DB ${webDb} != worker DB ${workerDb}`);
+  if (webRoom !== workerRoom)
+    issues.push(`web room ${webRoom} != worker room ${workerRoom}`);
+  if (!webConfig.PUMPTV_TOKEN_MINT)
+    issues.push("token_mint missing from .config.toml");
+  if (!webConfig.PUMPTV_ADMIN_TOKEN)
+    issues.push("admin_token missing from .config.toml");
+  if (!webConfig.PUMPTV_MODERATION_SECRET)
+    issues.push("moderation_secret missing from .config.toml");
+  if (!workerConfig.FAL_KEY) issues.push("FAL key missing from .worker.toml");
+  console.log("[doctor] target local config files");
+  console.log(
+    `[doctor] web ${existsSync(webPath) ? "ok" : "MISSING"} · worker ${existsSync(workerPath) ? "ok" : "MISSING"}`,
+  );
+  console.log(`[doctor] room ${webRoom} · db ${webDb}`);
+  console.log(
+    `[doctor] token mint ${webConfig.PUMPTV_TOKEN_MINT || "MISSING"}`,
+  );
+  console.log(
+    `[doctor] worker FAL ${workerConfig.FAL_KEY ? "ok" : "MISSING"} · Exa ${workerConfig.EXA_API_KEY ? "ok" : "off"} · model ${workerConfig.JSX_AI_MODEL || "default"}`,
+  );
+  console.log(
+    `[doctor] moderation ${webConfig.PUMPTV_MODERATION_SECRET ? "ok" : "MISSING SECRET"} · proxy headers ${webConfig.PUMPTV_TRUST_PROXY_HEADERS === "1" ? "trusted" : "direct only"}`,
+  );
+  if (ADMIN_URL)
+    console.log(
+      `[doctor] configured remote ${ADMIN_URL} (pass without --local to inspect running production)`,
+    );
+  if (issues.length) {
+    console.log("[doctor] issues:");
+    for (const issue of issues) console.log(`  - ${issue}`);
+    process.exitCode = 2;
+  } else {
+    console.log("[doctor] config files OK");
+  }
+} else if (command === "status") {
   console.log(statusLines(await repo.getStreamState()).join("\n"));
 } else if (command === "watch") {
   console.log("[control] watching canonical program state; Ctrl+C to stop\n");
@@ -402,9 +536,22 @@ if (command === "status") {
     storedPlan && "_references" in storedPlan
       ? (storedPlan._references ?? null)
       : null;
+  const factOverlay =
+    storedPlan && "_factOverlay" in storedPlan
+      ? (storedPlan._factOverlay ?? null)
+      : null;
+  const factKeyframe =
+    storedPlan && "_factKeyframe" in storedPlan
+      ? (storedPlan._factKeyframe ?? null)
+      : null;
   const showrunnerPlan = storedPlan
     ? Object.fromEntries(
-        Object.entries(storedPlan).filter(([key]) => key !== "_references"),
+        Object.entries(storedPlan).filter(
+          ([key]) =>
+            key !== "_references" &&
+            key !== "_factOverlay" &&
+            key !== "_factKeyframe",
+        ),
       )
     : null;
 
@@ -414,6 +561,8 @@ if (command === "status") {
     directiveId: row.directiveId == null ? null : Number(row.directiveId),
     proposal: String(row.directive || ""),
     references,
+    factOverlay,
+    factKeyframe,
     showrunner: {
       model: row.showrunnerModel ?? null,
       inputTokens: row.showrunnerInputTokens ?? null,
@@ -437,46 +586,8 @@ if (command === "status") {
     },
   };
 
-  if (jsonOutput) {
-    console.log(JSON.stringify(artifact, null, 2));
-  } else {
-    const section = (title: string, value: unknown) => {
-      console.log(
-        `\n── ${title} ${"─".repeat(Math.max(2, 66 - title.length))}`,
-      );
-      if (value == null || value === "") {
-        console.log("(none)");
-      } else if (typeof value === "string") {
-        console.log(value);
-      } else {
-        console.log(JSON.stringify(value, null, 2));
-      }
-    };
-
-    console.log(
-      `EP ${artifact.episode} · clip #${artifact.clipId}` +
-        `${artifact.directiveId == null ? "" : ` · directive #${artifact.directiveId}`}` +
-        `${artifact.generation.mode ? ` · ${artifact.generation.mode}` : ""}`,
-    );
-    section("SELECTED IDEA", artifact.proposal);
-    section("RESOLVED REFERENCES", artifact.references);
-    section("SHOWRUNNER PLAN", artifact.showrunner.plan);
-    section("H3 INPUT PROMPT", artifact.h3.prompt);
-    section("FAL EXPANDED PROMPT", artifact.h3.expandedPrompt);
-    section("GENERATION META", {
-      showrunnerModel: artifact.showrunner.model,
-      showrunnerInputTokens: artifact.showrunner.inputTokens,
-      showrunnerOutputTokens: artifact.showrunner.outputTokens,
-      showrunnerMs: artifact.showrunner.ms,
-      h3Ms: artifact.h3.ms,
-      inferenceSeconds: artifact.h3.inferenceSeconds,
-      totalMs: artifact.generation.totalMs,
-      resolution: artifact.h3.resolution,
-      requestId: artifact.generation.requestId,
-      videoUrl: artifact.generation.videoUrl,
-      anchorFrameUrl: artifact.generation.anchorFrameUrl,
-    });
-  }
+  if (jsonOutput) console.log(JSON.stringify(artifact, null, 2));
+  else printPromptArtifact(artifact);
 } else if (command === "resolve") {
   const bypassCache = args.includes("--refresh");
   const forceResearch = args.includes("--force");

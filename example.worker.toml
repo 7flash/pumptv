@@ -30,6 +30,12 @@ error_backoff_ms = 2000
 reference_fresh_cache_ms = 15000
 reference_cache_ms = 300000
 
+# For shots that need an exact visible current fact (for example BTC price),
+# PumpTV can edit the continuity frame into a target final still and pass it to
+# H3 Max as end_image_url. Failure is non-fatal; the normal factual caption stays.
+fact_keyframe = 1
+fact_keyframe_model = "fal-ai/flux-2/edit"
+
 [measure]
 silent = 0
 timestamps = 1
