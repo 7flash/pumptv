@@ -1,4 +1,5 @@
 import { render } from "tradjs/client";
+import { createMeasure } from "measure-fn";
 import type {
   Clip,
   Directive,
@@ -9,6 +10,14 @@ import type {
   StreamState,
   WorldState,
 } from "../src/shared/contracts.ts";
+
+const mediaMeasure = createMeasure("media");
+
+function clientErrorText(error: unknown) {
+  return error instanceof Error
+    ? error.message
+    : String(error ?? "Unknown error");
+}
 
 let timeline: Clip[] = [];
 let room: RoomState | null = null;
@@ -21,6 +30,8 @@ let longPollAbort: AbortController | null = null;
 let streamRevision = 0;
 let viewerId = "";
 let proposalOwnerId = "";
+let initialCatchupPending = false;
+const NEW_VIEWER_HISTORY_OFFSET = 7;
 let transport: "connecting" | "live" | "reconnecting" = "connecting";
 let error: string | null = null;
 let timer: ReturnType<typeof setInterval> | null = null;
@@ -257,6 +268,25 @@ function applyState(state: StreamState) {
   nextDirective = state.nextDirective;
   program = state.program;
   worldState = state.worldState;
+
+  if (initialCatchupPending) {
+    const published = [...state.timeline]
+      .filter((clip) => clip.startsAtMs <= state.serverNowMs)
+      .sort((a, b) => a.episode - b.episode || a.id - b.id);
+    if (published.length) {
+      const targetIndex = Math.max(
+        0,
+        published.length - 1 - NEW_VIEWER_HISTORY_OFFSET,
+      );
+      const target = published[targetIndex] || published[0];
+      const latest = published[published.length - 1];
+      replayClipId =
+        target && latest && target.id !== latest.id ? target.id : null;
+      initialCatchupPending = false;
+      localStorage.removeItem("pumptv-new-viewer-catchup");
+    }
+  }
+
   if (
     replayClipId != null &&
     !timeline.some((clip) => clip.id === replayClipId)
@@ -491,8 +521,14 @@ async function voteForProposal(proposalId: number) {
 }
 
 function toggleTray() {
-  trayOpen = !trayOpen;
+  const opening = !trayOpen;
+  trayOpen = opening;
+  if (opening) trayView = "ideas";
   redraw();
+  if (opening)
+    queueMicrotask(() =>
+      document.querySelector<HTMLInputElement>("[data-idea-input]")?.focus(),
+    );
 }
 
 function openTray(view: TrayView) {
@@ -751,7 +787,10 @@ function ensureViewerIdAndPrefs() {
   if (!viewerId) {
     viewerId = crypto.randomUUID();
     localStorage.setItem("pumptv-viewer-id", viewerId);
+    localStorage.setItem("pumptv-new-viewer-catchup", "1");
   }
+  initialCatchupPending =
+    localStorage.getItem("pumptv-new-viewer-catchup") === "1";
 
   // Anonymous proposal ownership is session-scoped rather than tied to viewer
   // presence. Separate tabs/browsers can therefore each keep one persistent
@@ -772,6 +811,7 @@ async function runStateLongPoll() {
   longPollAbort?.abort();
   const controller = new AbortController();
   longPollAbort = controller;
+  let retryMs = 850;
 
   while (!controller.signal.aborted) {
     try {
@@ -789,6 +829,7 @@ async function runStateLongPoll() {
         streamRevision = Number(payload.revision);
       if (payload.state) applyState(payload.state);
       else error = null;
+      retryMs = 850;
       if (transport !== "live") {
         transport = "live";
         redraw();
@@ -798,7 +839,9 @@ async function runStateLongPoll() {
       transport = "reconnecting";
       error = cause instanceof Error ? cause.message : "state reconnecting";
       redraw();
-      await new Promise((resolve) => setTimeout(resolve, 850));
+      const jitter = Math.floor(Math.random() * Math.min(500, retryMs / 3));
+      await new Promise((resolve) => setTimeout(resolve, retryMs + jitter));
+      retryMs = Math.min(8_000, Math.round(retryMs * 1.7));
     }
   }
 }
@@ -987,10 +1030,10 @@ function startColdLivePrime(clip: Clip, nodes: Array<HTMLVideoElement | null>) {
   if (coldStartPrime?.clipId === clip.id) return;
   const promise = primeColdLiveClip(clip, nodes)
     .catch((cause) => {
-      console.warn(
-        `[pumptv/media] cold decoder prime failed for EP ${clip.episode + 1}`,
-        cause,
-      );
+      mediaMeasure.measureSync("Cold decoder prime failed", () => ({
+        episode: clip.episode + 1,
+        error: clientErrorText(cause),
+      }));
     })
     .finally(() => {
       if (coldStartPrime?.promise === promise) coldStartPrime = null;
@@ -1152,11 +1195,12 @@ async function activateVideoSlot(
     await video.play();
     await waitForPaint(video);
   } catch (cause) {
-    console.warn(
-      `[pumptv/media] activation failed for EP ${clip.episode + 1}`,
-      cause,
-      video.error,
-    );
+    mediaMeasure.measureSync("Video activation failed", () => ({
+      episode: clip.episode + 1,
+      error: clientErrorText(cause),
+      mediaCode: video.error?.code ?? null,
+      mediaMessage: video.error?.message ?? null,
+    }));
     // Keep the requested episode selected and retry from the media synchronizer
     // instead of silently falling back to the previous clip.
     video.dataset.ready =
@@ -1734,10 +1778,12 @@ function ControlIcon({ name }: { name: ControlIconName }) {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d="M4 9v6h4l5 4V5L8 9H4Z" />
-        <path
-          className="stroke"
-          d="M16 9.2c1.1 1.1 1.1 4.5 0 5.6M18.5 7c2.6 2.5 2.6 7.5 0 10"
-        />
+        {soundEnabled ? (
+          <path
+            className="stroke"
+            d="M16 9.2c1.1 1.1 1.1 4.5 0 5.6M18.5 7c2.6 2.5 2.6 7.5 0 10"
+          />
+        ) : null}
       </svg>
     );
   if (name === "captions")
@@ -1790,7 +1836,6 @@ function KnobControl(props: {
       aria-label={props.title}
       aria-pressed={Boolean(props.active)}
     >
-      <span className="knobNeedle" />
       <span className="knobIcon">
         <ControlIcon name={props.icon} />
       </span>
@@ -2099,7 +2144,7 @@ function TrayIcon({ name }: { name: TrayIconName }) {
     );
   return (
     <svg viewBox="0 0 24 24" aria-hidden="true">
-      <path className="stroke" d="m7 9 5 5 5-5" />
+      <path className="stroke" d="m7 15 5-5 5 5" />
     </svg>
   );
 }
@@ -2330,13 +2375,37 @@ function formatScore(value: number) {
   const score = Math.max(0, Number(value || 0));
   if (score < 1_000)
     return score < 10 && score % 1
-      ? score.toFixed(1)
+      ? score.toFixed(1).replace(/\.0$/, "")
       : Math.round(score).toString();
-  if (score < 1_000_000)
-    return `${(score / 1_000).toFixed(score < 10_000 ? 1 : 0)}K`;
-  if (score < 1_000_000_000)
-    return `${(score / 1_000_000).toFixed(score < 10_000_000 ? 1 : 0)}M`;
-  return `${(score / 1_000_000_000).toFixed(score < 10_000_000_000 ? 1 : 0)}B`;
+  const units = [
+    [1_000_000_000_000_000, "Q"],
+    [1_000_000_000_000, "T"],
+    [1_000_000_000, "B"],
+    [1_000_000, "M"],
+    [1_000, "K"],
+  ] as const;
+  for (const [size, suffix] of units) {
+    if (score < size) continue;
+    const scaled = score / size;
+    return `${scaled.toFixed(scaled < 10 ? 1 : 0).replace(/\.0$/, "")}${suffix}`;
+  }
+  return Math.round(score).toString();
+}
+
+function formatExactScore(value: number) {
+  const score = Math.max(0, Number(value || 0));
+  return new Intl.NumberFormat("en-US", {
+    maximumFractionDigits: 6,
+  }).format(score);
+}
+
+function proposalScoreTooltip(proposal: PromptProposal) {
+  return [
+    `Total ${formatExactScore(proposal.voteCount)}`,
+    `Creator ${formatExactScore(proposal.ownerWeight)}`,
+    `Votes ${formatExactScore(proposal.realVoteCount)}`,
+    `Voters ${proposal.voterCount}`,
+  ].join("\n");
 }
 
 type BoardIconName =
@@ -2403,7 +2472,7 @@ function ProposalCard({
   const pending = votePendingId === proposal.id;
   return (
     <div
-      className={`persistentProposal ${own ? "own" : ""} ${pending ? "pending" : ""}`}
+      className={`persistentProposal ${rank === 1 ? "leader" : ""} ${own ? "own" : ""} ${pending ? "pending" : ""}`}
       data-proposal-id={proposal.id}
     >
       <em className="proposalRank">{rank}</em>
@@ -2414,15 +2483,18 @@ function ProposalCard({
           {proposal.author || proposal.authorAddress ? (
             <>{authorLabel(proposal.author, proposal.authorAddress)}</>
           ) : null}
-          <small>
-            {formatScore(proposal.ownerWeight)} +{" "}
-            {formatScore(proposal.realVoteCount)} · {proposal.voterCount}↑
-          </small>
         </i>
       </div>
       {own ? (
         <>
-          <b className="proposalTotal">{formatScore(proposal.voteCount)}</b>
+          <b
+            className="proposalTotal"
+            data-rich-tooltip="1"
+            data-tooltip-kicker={`SCORE · #${proposal.id}`}
+            data-tooltip-body={proposalScoreTooltip(proposal)}
+          >
+            {formatScore(proposal.voteCount)}
+          </b>
           <div className="ownIdeaActions">
             <button type="button" data-action="edit-own" aria-label="Edit idea">
               <BoardIcon name="edit" />
@@ -2444,6 +2516,10 @@ function ProposalCard({
           data-proposal-id={proposal.id}
           disabled={pending}
           aria-label={`Vote with score ${formatScore(walletPower)}. Current total ${formatScore(proposal.voteCount)}`}
+          data-rich-tooltip="1"
+          data-tooltip-kicker={`SCORE · #${proposal.id}`}
+          data-tooltip-body={proposalScoreTooltip(proposal)}
+          data-tooltip-meta={`Your vote adds ${formatExactScore(walletPower)}`}
         >
           <BoardIcon name="upvote" />
           <b>{formatScore(proposal.voteCount)}</b>
@@ -2498,9 +2574,11 @@ function worldDetail() {
   if (worldDetailKind === "location")
     return {
       title: worldState.location,
-      lines: [worldState.locationDetails, worldState.lastEndingBeat].filter(
-        Boolean,
-      ),
+      lines: [
+        worldState.locationDetails,
+        worldState.lastEndingBeat,
+        ...worldState.openThreads,
+      ].filter(Boolean),
     };
   if (worldDetailKind === "character") {
     const item = worldState.characters.find(
@@ -2624,9 +2702,20 @@ function PersistentWorld() {
       ) : null}
       {worldState.openThreads.length ? (
         <div className="persistentThreads">
-          {worldState.openThreads.slice(0, 8).map((thread) => (
+          {worldState.openThreads.slice(0, 2).map((thread) => (
             <span key={thread}>{thread}</span>
           ))}
+          {worldState.openThreads.length > 2 ? (
+            <button
+              type="button"
+              data-action="world-detail"
+              data-world-kind="location"
+              data-world-id="location"
+              aria-label={`${worldState.openThreads.length - 2} more open threads`}
+            >
+              +{worldState.openThreads.length - 2}
+            </button>
+          ) : null}
         </div>
       ) : null}
     </section>
@@ -2638,8 +2727,9 @@ function ParticipationBoard() {
   const candidates = sortedCandidates(round);
   const leader = candidates[0] || null;
   const walletTitle = walletAddress
-    ? `${shortAddress(walletAddress)} · ${walletTokenBalance} tokens · score ${walletPower}`
+    ? `${shortAddress(walletAddress)} · ${formatExactScore(walletTokenBalance)} tokens · power ${formatExactScore(walletPower)}`
     : "Connect Phantom";
+  const own = ownProposal();
 
   return (
     <section className={`participationBoard ${trayOpen ? "open" : ""}`}>
@@ -2648,9 +2738,12 @@ function ParticipationBoard() {
           className="boardToggle"
           type="button"
           data-action="tray-toggle"
-          aria-label={trayOpen ? "Collapse panel" : "Expand panel"}
+          aria-label={
+            trayOpen ? "Close ideas" : own ? "Open my idea" : "Add an idea"
+          }
           aria-expanded={trayOpen}
         >
+          <span>{own ? "MY IDEA" : "ADD IDEA"}</span>
           <TrayIcon name="chevron" />
         </button>
 
@@ -2691,6 +2784,16 @@ function ParticipationBoard() {
           className={`walletMetric ${walletAddress ? "connected" : ""}`}
           data-action="wallet"
           aria-label={walletTitle}
+          data-rich-tooltip={walletAddress ? "1" : undefined}
+          data-tooltip-kicker={walletAddress ? "TOKEN POWER" : undefined}
+          data-tooltip-body={
+            walletAddress
+              ? `Balance ${formatExactScore(walletTokenBalance)}\nVoting power ${formatExactScore(walletPower)}`
+              : undefined
+          }
+          data-tooltip-meta={
+            walletAddress ? shortAddress(walletAddress) : undefined
+          }
         >
           <BoardIcon name="wallet" />
           {walletAddress ? (
@@ -2804,24 +2907,42 @@ function ProgramShelfSlot() {
   const candidateCount = program.votingRound?.proposals.length || 0;
   if (phase === "ready") return null; // the real future clip card is already in the rail
   if (phase === "idle" && candidateCount === 0) return null;
+  const episode = program.targetEpisode + 1;
+  const directiveText = program.directive?.text?.trim() || "";
   const title =
     program.reason ||
     (phase === "voting"
-      ? `Voting for episode ${program.targetEpisode + 1}`
+      ? `Voting for episode ${episode}`
       : phase === "planning" || phase === "rendering" || phase === "finalizing"
-        ? `Generating episode ${program.targetEpisode + 1}`
+        ? `Generating episode ${episode}`
         : phase === "locked"
-          ? `Episode ${program.targetEpisode + 1} locked`
-          : `Waiting for episode ${program.targetEpisode + 1}`);
+          ? `Episode ${episode} locked`
+          : `Waiting for episode ${episode}`);
+  const copy =
+    directiveText ||
+    (candidateCount
+      ? `${candidateCount} idea${candidateCount === 1 ? "" : "s"}`
+      : "");
   return (
-    <div className={`programShelfSlot phase-${phase}`} aria-label={title}>
-      <span className="programShelfVisual">
-        <i className="programShelfPulse" />
-        {phase === "idle" && candidateCount > 0 ? (
-          <small>{candidateCount}</small>
-        ) : null}
+    <div
+      className={`programShelfSlot phase-${phase}`}
+      aria-label={title}
+      data-rich-tooltip="1"
+      data-tooltip-kicker={`EP ${episode}`}
+      data-tooltip-body={directiveText || title}
+      data-tooltip-meta={
+        candidateCount
+          ? `${candidateCount} active idea${candidateCount === 1 ? "" : "s"}`
+          : title
+      }
+    >
+      <span className="programShelfState" aria-hidden="true">
+        {stageGlyph(phase)}
       </span>
-      <b>{program.targetEpisode + 1}</b>
+      <span className="programShelfCopy">
+        {copy ? <span>{copy}</span> : <i />}
+      </span>
+      <b>{episode}</b>
     </div>
   );
 }
@@ -4837,18 +4958,839 @@ function OutsideInterfaceStyles() {
       .dockIdeaSummary > b,
       .walletMetric.connected { color: var(--pump-gold-hi) !important; }
 
+      /* v21 — quieter hardware: icon/state/depth, no decorative needles. */
+      .minimalTop .wordmark {
+        width: 66px !important;
+        height: 66px !important;
+        opacity: .94;
+      }
+      .pumptvLogo {
+        mix-blend-mode: lighten;
+        filter: drop-shadow(0 4px 10px rgba(0,0,0,.28)) saturate(.92) !important;
+      }
+
+      .knobStack { gap: 8px !important; }
+      .knobControl {
+        width: 46px !important;
+        height: 34px !important;
+        min-width: 46px !important;
+        min-height: 34px !important;
+        border-radius: 9px !important;
+        border-color: rgba(200,201,203,.20) !important;
+        color: rgba(200,201,203,.58) !important;
+        background:
+          linear-gradient(180deg, rgba(255,255,255,.065), rgba(255,255,255,.012) 54%, rgba(0,0,0,.08)),
+          #151617 !important;
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.08),
+          inset 0 -1px 0 rgba(0,0,0,.72),
+          0 3px 0 rgba(0,0,0,.46),
+          0 6px 12px rgba(0,0,0,.18) !important;
+      }
+      .knobControl::after {
+        content: "";
+        position: absolute;
+        right: 5px;
+        top: 5px;
+        width: 4px;
+        height: 4px;
+        border-radius: 50%;
+        background: rgba(125,128,133,.34);
+        box-shadow: inset 0 1px rgba(255,255,255,.12);
+      }
+      .knobControl.on::after {
+        background: var(--pump-gold-hi);
+        box-shadow: 0 0 5px rgba(243,204,114,.26);
+      }
+      .knobControl[data-control="fullscreen"]::after { display: none; }
+      .knobControl:hover {
+        color: var(--pump-silver) !important;
+        border-color: rgba(200,201,203,.34) !important;
+        transform: translateY(-1px) !important;
+      }
+      .knobControl:active {
+        transform: translateY(2px) !important;
+        box-shadow:
+          inset 0 2px 5px rgba(0,0,0,.54),
+          inset 0 1px rgba(255,255,255,.035),
+          0 1px 0 rgba(0,0,0,.42) !important;
+      }
+      .knobControl.on {
+        color: var(--pump-gold-hi) !important;
+        border-color: rgba(215,164,59,.34) !important;
+        background:
+          linear-gradient(180deg, rgba(215,164,59,.09), rgba(255,255,255,.012) 58%, rgba(0,0,0,.09)),
+          #171714 !important;
+      }
+      .knobNeedle { display: none !important; }
+      .knobIcon, .knobIcon svg {
+        width: 18px !important;
+        height: 18px !important;
+      }
+
+      /* Episode state reads as physical indexing, not border decoration. */
+      .episodeCard {
+        opacity: .68 !important;
+        transform: none !important;
+        background: rgba(255,255,255,.012) !important;
+      }
+      .episodeCard:hover {
+        opacity: .88 !important;
+        transform: translateX(-1px) !important;
+      }
+      .episodeCard.active {
+        opacity: 1 !important;
+        transform: translateX(-4px) !important;
+        background: linear-gradient(90deg, rgba(215,164,59,.07), rgba(255,255,255,.022)) !important;
+        box-shadow: 0 5px 14px rgba(0,0,0,.18) !important;
+      }
+      .episodeCard.active::after {
+        content: "" !important;
+        position: absolute !important;
+        left: -2px !important;
+        top: 50% !important;
+        width: 3px !important;
+        height: 24px !important;
+        border-radius: 1px 3px 3px 1px !important;
+        transform: translateY(-50%) !important;
+        background: linear-gradient(180deg, var(--pump-gold-hi), var(--pump-gold-low)) !important;
+        box-shadow: 0 0 7px rgba(215,164,59,.20) !important;
+      }
+      .episodeCard.active > b::before { content: none !important; }
+      .episodeCard.active > b { color: var(--pump-gold-hi) !important; }
+      .episodeCard.active .episodeThumb {
+        border-color: rgba(200,201,203,.20) !important;
+        box-shadow: inset 0 1px rgba(255,255,255,.055), 0 6px 15px rgba(0,0,0,.24) !important;
+      }
+      .episodeCard.live .episodeThumb > em {
+        color: #ff596b !important;
+        text-shadow: 0 0 7px rgba(255,89,107,.38) !important;
+      }
+
+      /* Proposals read as ranked rows rather than a pile of pills. */
+      .persistentProposalList { gap: 6px !important; }
+      .persistentProposal {
+        min-height: 52px !important;
+        padding: 8px 9px !important;
+        border-radius: 9px !important;
+        border-color: rgba(200,201,203,.075) !important;
+        background: rgba(255,255,255,.018) !important;
+        box-shadow: inset 0 1px rgba(255,255,255,.022) !important;
+      }
+      .persistentProposal:hover {
+        border-color: rgba(200,201,203,.14) !important;
+        background: rgba(255,255,255,.03) !important;
+      }
+      .persistentProposal:first-child {
+        border-color: rgba(215,164,59,.18) !important;
+        background: linear-gradient(90deg, rgba(215,164,59,.045), rgba(255,255,255,.016)) !important;
+      }
+      .persistentProposal.own {
+        border-color: rgba(200,201,203,.16) !important;
+        background: rgba(200,201,203,.026) !important;
+      }
+      .proposalRank {
+        font-size: 9px !important;
+        opacity: .82;
+      }
+      .persistentProposalText { gap: 3px !important; }
+      .persistentProposalText > span {
+        font-size: 12px !important;
+        line-height: 1.28 !important;
+      }
+      .persistentProposalText > i {
+        gap: 6px !important;
+        font-size: 8px !important;
+      }
+      .proposalTotal { min-width: 26px !important; font-size: 11px !important; }
+      .proposalVote {
+        min-width: 44px !important;
+        height: 29px !important;
+        padding: 0 7px !important;
+        border-radius: 7px !important;
+        gap: 4px !important;
+      }
+      .ownIdeaActions { gap: 3px !important; }
+      .ownIdeaActions > button {
+        width: 28px !important;
+        height: 28px !important;
+        border-radius: 7px !important;
+      }
+      .persistentIdeaForm > input {
+        border-radius: 9px 0 0 9px !important;
+      }
+      .persistentIdeaForm > button {
+        border-radius: 0 9px 9px 0 !important;
+      }
+      .walletMetric, .boardToggle { border-radius: 8px !important; }
+
+      /* v23: denser drawer + less dashboard-like hierarchy. */
+      .participationSheet {
+        height: clamp(300px, 40vh, 455px) !important;
+        border-radius: 16px !important;
+      }
+      .drawerGrab { height: 24px !important; }
+      .drawerGrab > i {
+        width: 42px !important;
+        height: 3px !important;
+        opacity: .66 !important;
+      }
+      .participationColumns {
+        grid-template-columns: minmax(270px, .72fr) minmax(0, 1.28fr) !important;
+      }
+      .persistentWorld,
+      .persistentIdeas {
+        padding: 11px 12px 12px !important;
+      }
+      .persistentWorld {
+        gap: 7px !important;
+      }
+      .worldLocationCard {
+        gap: 4px !important;
+        padding: 9px 10px !important;
+        border-radius: 9px !important;
+      }
+      .worldLocationCard > b {
+        font-size: 12px !important;
+      }
+      .worldLocationCard > span {
+        display: -webkit-box !important;
+        overflow: hidden !important;
+        -webkit-box-orient: vertical !important;
+        -webkit-line-clamp: 2 !important;
+        font-size: 10px !important;
+        line-height: 1.32 !important;
+      }
+      .persistentWorldItems {
+        grid-template-columns: repeat(auto-fit, minmax(118px, 1fr)) !important;
+        gap: 5px !important;
+      }
+      .persistentWorldItems > button {
+        min-height: 49px !important;
+        padding: 7px 8px !important;
+        border-radius: 8px !important;
+      }
+      .persistentWorldItems > button > b { font-size: 10px !important; }
+      .persistentWorldItems > button > span { font-size: 9px !important; }
+      .persistentThreads {
+        display: grid !important;
+        gap: 3px !important;
+      }
+      .persistentThreads > span {
+        max-width: none !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+        padding: 3px 2px !important;
+        border: 0 !important;
+        border-radius: 0 !important;
+        font-size: 8px !important;
+        line-height: 1.2 !important;
+        opacity: .42 !important;
+      }
+      .persistentThreads > span::before {
+        content: "·";
+        margin-right: 5px;
+        color: var(--pump-gold-low);
+      }
+      .persistentIdeas {
+        gap: 6px !important;
+      }
+      .persistentIdeaForm {
+        grid-template-columns: minmax(0,1fr) 34px !important;
+        gap: 5px !important;
+        padding-bottom: 6px !important;
+      }
+      .persistentIdeaForm > input,
+      .persistentIdeaForm > button {
+        height: 34px !important;
+      }
+      .persistentIdeaForm > button { width: 34px !important; }
+      .persistentProposal {
+        min-height: 47px !important;
+        padding: 7px 8px !important;
+      }
+      .persistentProposalText > span {
+        font-size: 11px !important;
+      }
+      .persistentProposalText > i {
+        font-size: 7.5px !important;
+      }
+      .participationDock {
+        min-height: 42px !important;
+        padding: 4px 7px !important;
+        gap: 6px !important;
+        border-radius: 12px !important;
+      }
+      .boardToggle {
+        width: 31px !important;
+        height: 31px !important;
+      }
+      .dockIdeaSummary,
+      .viewerMetric,
+      .walletMetric { height: 30px !important; }
+      .dockIdeaSummary { padding: 0 9px !important; }
+
+      /* Selected episode: underline the media itself instead of a rail-side tab. */
+      .episodeCard.active {
+        transform: translateX(-2px) !important;
+      }
+      .episodeCard.active::after {
+        content: none !important;
+      }
+      .episodeCard .episodeThumb {
+        position: relative !important;
+        overflow: visible !important;
+      }
+      .episodeCard.active .episodeThumb::after {
+        content: "" !important;
+        position: absolute !important;
+        left: 50% !important;
+        bottom: -5px !important;
+        width: 28px !important;
+        height: 3px !important;
+        transform: translateX(-50%) !important;
+        border: 0 !important;
+        border-radius: 2px !important;
+        background: linear-gradient(90deg, var(--pump-gold-low), var(--pump-gold-hi), var(--pump-gold-low)) !important;
+        box-shadow: 0 1px 5px rgba(215,164,59,.24) !important;
+      }
+      .episodeCard.active > b {
+        color: var(--pump-gold-hi) !important;
+      }
+
+      /* v24: open drawer is a control console, not a second dashboard. */
+      .participationSheet {
+        height: auto !important;
+        max-height: min(46vh, 430px) !important;
+      }
+      .participationColumns {
+        height: auto !important;
+        max-height: calc(min(46vh, 430px) - 24px) !important;
+      }
+      .persistentWorld,
+      .persistentIdeas {
+        max-height: calc(min(46vh, 430px) - 24px) !important;
+      }
+      .participationBoard.open .participationDock {
+        display: flex !important;
+        align-items: center !important;
+        min-height: 38px !important;
+        padding: 3px 6px !important;
+      }
+      .participationBoard.open .dockIdeaSummary,
+      .participationBoard.open .proposalMetric {
+        display: none !important;
+      }
+      .participationBoard.open .walletMetric {
+        margin-left: auto !important;
+      }
+      .participationBoard.open .participationError {
+        flex: 0 0 auto !important;
+      }
+      .participationBoard.open .boardToggle,
+      .participationBoard.open .viewerMetric,
+      .participationBoard.open .walletMetric {
+        height: 28px !important;
+      }
+      .participationBoard.open .boardToggle {
+        width: 29px !important;
+      }
+      .participationBoard.open .viewerMetric {
+        padding-inline: 7px !important;
+      }
+
+      /* Let the proposal list carry the visual hierarchy; chrome stays quiet. */
+      .persistentIdeas {
+        background: linear-gradient(180deg, rgba(255,255,255,.009), transparent 34%) !important;
+      }
+      .persistentIdeaForm {
+        padding: 0 0 7px !important;
+      }
+      .persistentProposalList {
+        gap: 4px !important;
+      }
+      .persistentProposal {
+        min-height: 44px !important;
+        padding: 6px 7px !important;
+        border-radius: 7px !important;
+      }
+      .persistentProposalText > span {
+        font-size: 11px !important;
+        line-height: 1.22 !important;
+      }
+      .persistentProposalText > i {
+        opacity: .46 !important;
+        letter-spacing: .01em !important;
+      }
+      .proposalVote {
+        min-width: 40px !important;
+        height: 27px !important;
+        padding-inline: 6px !important;
+        border-radius: 6px !important;
+      }
+      .proposalVote svg {
+        width: 11px !important;
+        height: 11px !important;
+      }
+      .ownIdeaActions > button {
+        width: 26px !important;
+        height: 26px !important;
+        border-radius: 6px !important;
+      }
+
+      /* World state is reference material: compact until intentionally opened. */
+      .persistentWorld {
+        background: rgba(0,0,0,.055) !important;
+      }
+      .worldLocationCard {
+        min-height: 0 !important;
+      }
+      .persistentWorldItems > button {
+        min-height: 44px !important;
+      }
+      .persistentThreads {
+        margin-top: 1px !important;
+      }
+      .persistentThreads > span:nth-child(n+5) {
+        display: none !important;
+      }
+
+      /* Rail state: selected is brighter and indexed, live is independent. */
+      .episodeCard.active {
+        opacity: 1 !important;
+        filter: brightness(1.05) !important;
+      }
+      .episodeCard:not(.active) .episodeThumb {
+        filter: saturate(.86) brightness(.9) !important;
+      }
+      .episodeCard.active .episodeThumb::after {
+        bottom: -4px !important;
+        width: 24px !important;
+        height: 2px !important;
+        box-shadow: 0 1px 4px rgba(215,164,59,.18) !important;
+      }
+
+      /* v25: scene index + ranked control surface. */
+      .participationSheet {
+        background:
+          linear-gradient(180deg, rgba(255,255,255,.018), transparent 18%),
+          #111316 !important;
+        border-color: rgba(200,201,203,.11) !important;
+        box-shadow: 0 -16px 48px rgba(0,0,0,.34), inset 0 1px rgba(255,255,255,.035) !important;
+      }
+      .participationColumns {
+        grid-template-columns: minmax(230px, .58fr) minmax(0, 1.42fr) !important;
+      }
+      .persistentWorld {
+        padding: 9px 10px 10px !important;
+        gap: 5px !important;
+        border-right-color: rgba(255,255,255,.055) !important;
+        background: rgba(0,0,0,.09) !important;
+      }
+      .worldLocationCard {
+        padding: 8px 9px !important;
+        border: 0 !important;
+        border-bottom: 1px solid rgba(255,255,255,.055) !important;
+        border-radius: 0 !important;
+        background: transparent !important;
+        box-shadow: none !important;
+      }
+      .worldLocationCard:hover {
+        background: rgba(255,255,255,.025) !important;
+      }
+      .worldLocationCard > b {
+        color: rgba(245,245,242,.93) !important;
+        font-size: 11px !important;
+      }
+      .worldLocationCard > span {
+        -webkit-line-clamp: 1 !important;
+        opacity: .58 !important;
+        font-size: 9px !important;
+      }
+      .persistentWorldItems {
+        grid-template-columns: 1fr !important;
+        gap: 0 !important;
+      }
+      .persistentWorldItems > button {
+        min-height: 34px !important;
+        display: grid !important;
+        grid-template-columns: minmax(88px,.72fr) minmax(0,1.28fr) !important;
+        align-items: center !important;
+        gap: 8px !important;
+        padding: 5px 8px !important;
+        border: 0 !important;
+        border-bottom: 1px solid rgba(255,255,255,.04) !important;
+        border-radius: 0 !important;
+        background: transparent !important;
+        box-shadow: none !important;
+        text-align: left !important;
+      }
+      .persistentWorldItems > button:hover {
+        background: rgba(255,255,255,.025) !important;
+      }
+      .persistentWorldItems > button > b {
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+        color: rgba(239,239,236,.88) !important;
+      }
+      .persistentWorldItems > button > span {
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+        white-space: nowrap !important;
+        opacity: .48 !important;
+        text-align: right !important;
+      }
+      .persistentWorldItems.props > button {
+        opacity: .72 !important;
+      }
+      .persistentThreads {
+        display: flex !important;
+        align-items: center !important;
+        gap: 5px !important;
+        min-height: 23px !important;
+        padding: 3px 6px 0 !important;
+        overflow: hidden !important;
+      }
+      .persistentThreads > span {
+        flex: 1 1 0 !important;
+        min-width: 0 !important;
+        padding: 0 !important;
+        font-size: 8px !important;
+        opacity: .38 !important;
+      }
+      .persistentThreads > span::before { content: none !important; }
+      .persistentThreads > button {
+        flex: 0 0 auto !important;
+        height: 20px !important;
+        min-width: 26px !important;
+        padding: 0 6px !important;
+        border: 1px solid rgba(215,164,59,.18) !important;
+        border-radius: 5px !important;
+        background: rgba(215,164,59,.045) !important;
+        color: var(--pump-gold) !important;
+        font: 700 8px/1 ui-monospace, SFMono-Regular, Menlo, monospace !important;
+      }
+
+      .persistentIdeas {
+        padding: 9px 10px 10px !important;
+      }
+      .persistentIdeaForm {
+        gap: 0 !important;
+        padding-bottom: 7px !important;
+      }
+      .persistentIdeaForm > input {
+        height: 32px !important;
+        border-radius: 7px 0 0 7px !important;
+        border-right: 0 !important;
+        background: rgba(0,0,0,.16) !important;
+      }
+      .persistentIdeaForm > button {
+        width: 34px !important;
+        height: 32px !important;
+        border-radius: 0 7px 7px 0 !important;
+        background: rgba(255,255,255,.025) !important;
+      }
+      .persistentProposalList { gap: 2px !important; }
+      .persistentProposal {
+        position: relative !important;
+        grid-template-columns: 24px minmax(0,1fr) auto !important;
+        min-height: 42px !important;
+        padding: 5px 6px !important;
+        border: 0 !important;
+        border-bottom: 1px solid rgba(255,255,255,.055) !important;
+        border-radius: 0 !important;
+        background: transparent !important;
+        box-shadow: none !important;
+      }
+      .persistentProposal:hover {
+        background: rgba(255,255,255,.018) !important;
+      }
+      .persistentProposal.leader::before {
+        content: "" !important;
+        position: absolute !important;
+        left: 0 !important;
+        top: 9px !important;
+        bottom: 9px !important;
+        width: 2px !important;
+        border-radius: 2px !important;
+        background: linear-gradient(180deg,var(--pump-gold-hi),var(--pump-gold-low)) !important;
+        opacity: .9 !important;
+      }
+      .persistentProposal.own::after {
+        content: "" !important;
+        position: absolute !important;
+        right: 5px !important;
+        top: 5px !important;
+        width: 4px !important;
+        height: 4px !important;
+        border-radius: 50% !important;
+        background: var(--pump-silver) !important;
+        opacity: .55 !important;
+      }
+      .proposalRank {
+        width: 20px !important;
+        text-align: center !important;
+        font-size: 8px !important;
+        opacity: .42 !important;
+      }
+      .persistentProposal.leader .proposalRank {
+        color: var(--pump-gold-hi) !important;
+        opacity: .9 !important;
+      }
+      .persistentProposalText { gap: 2px !important; }
+      .persistentProposalText > span {
+        font-size: 10.5px !important;
+        line-height: 1.18 !important;
+      }
+      .persistentProposalText > i {
+        display: flex !important;
+        align-items: center !important;
+        gap: 5px !important;
+        font-size: 7px !important;
+        opacity: .42 !important;
+      }
+      .persistentProposalText > i > code {
+        color: var(--pump-gold-low) !important;
+      }
+      .proposalVote {
+        min-width: 36px !important;
+        height: 25px !important;
+        gap: 3px !important;
+        border-color: rgba(255,255,255,.075) !important;
+        background: rgba(255,255,255,.02) !important;
+      }
+      .proposalVote:hover {
+        border-color: rgba(215,164,59,.28) !important;
+        background: rgba(215,164,59,.045) !important;
+      }
+      .proposalTotal {
+        min-width: 20px !important;
+        text-align: right !important;
+        color: var(--pump-gold-hi) !important;
+        font-size: 10px !important;
+      }
+      .ownIdeaActions { gap: 3px !important; }
+      .ownIdeaActions > button {
+        width: 24px !important;
+        height: 24px !important;
+        border-radius: 5px !important;
+        background: rgba(255,255,255,.018) !important;
+      }
+
+      /* The drawer grab is a hardware seam, not a draggable-app affordance. */
+      .drawerGrab { height: 18px !important; }
+      .drawerGrab > i {
+        width: 34px !important;
+        height: 2px !important;
+        opacity: .38 !important;
+        box-shadow: none !important;
+      }
+
+
+      /* v26: rail + actions read as instrumentation, not thumbnail/button placeholders. */
+      .episodeList > .programShelfSlot {
+        position: relative !important;
+        flex-basis: 54px !important;
+        grid-template-columns: 24px minmax(0, 1fr) 22px !important;
+        gap: 6px !important;
+        padding: 6px 7px !important;
+        border-color: rgba(215,164,59,.12) !important;
+        border-radius: 9px !important;
+        background:
+          linear-gradient(180deg, rgba(215,164,59,.025), transparent 58%),
+          rgba(255,255,255,.012) !important;
+        box-shadow: inset 0 1px rgba(255,255,255,.025) !important;
+        overflow: hidden !important;
+      }
+      .programShelfState {
+        width: 22px !important;
+        height: 36px !important;
+        display: grid !important;
+        place-items: center !important;
+        border-right: 1px solid rgba(255,255,255,.05) !important;
+        color: rgba(190,191,188,.48) !important;
+        font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, monospace !important;
+      }
+      .programShelfSlot.phase-locked .programShelfState,
+      .programShelfSlot.phase-planning .programShelfState,
+      .programShelfSlot.phase-rendering .programShelfState,
+      .programShelfSlot.phase-finalizing .programShelfState {
+        color: var(--pump-gold-hi) !important;
+        text-shadow: 0 0 7px rgba(215,164,59,.22) !important;
+      }
+      .programShelfSlot.phase-planning::after,
+      .programShelfSlot.phase-rendering::after,
+      .programShelfSlot.phase-finalizing::after {
+        content: "" !important;
+        position: absolute !important;
+        left: 7px !important;
+        right: 7px !important;
+        bottom: 0 !important;
+        height: 1px !important;
+        background: linear-gradient(90deg, transparent, var(--pump-gold-hi), transparent) !important;
+        opacity: .7 !important;
+        animation: programRailSweep 1.35s ease-in-out infinite alternate !important;
+      }
+      @keyframes programRailSweep {
+        from { transform: translateX(-42%); opacity: .28; }
+        to { transform: translateX(42%); opacity: .85; }
+      }
+      .programShelfCopy {
+        min-width: 0 !important;
+        display: flex !important;
+        align-items: center !important;
+        overflow: hidden !important;
+      }
+      .programShelfCopy > span {
+        display: -webkit-box !important;
+        -webkit-box-orient: vertical !important;
+        -webkit-line-clamp: 2 !important;
+        overflow: hidden !important;
+        color: rgba(236,236,232,.72) !important;
+        font-size: 8.5px !important;
+        line-height: 1.16 !important;
+      }
+      .programShelfCopy > i {
+        width: 32px !important;
+        height: 1px !important;
+        background: rgba(255,255,255,.08) !important;
+      }
+      .programShelfSlot > b {
+        align-self: center !important;
+        color: rgba(222,222,216,.58) !important;
+        font-size: 9px !important;
+        opacity: 1 !important;
+      }
+      .programShelfVisual,
+      .programShelfPulse { display: none !important; }
+
+      /* Proposal actions are readouts first, buttons second. */
+      .proposalVote {
+        min-width: 34px !important;
+        height: 28px !important;
+        padding: 0 3px !important;
+        border: 0 !important;
+        border-radius: 4px !important;
+        background: transparent !important;
+        box-shadow: none !important;
+      }
+      .proposalVote:hover {
+        background: rgba(215,164,59,.055) !important;
+      }
+      .proposalVote > b {
+        min-width: 14px !important;
+        text-align: right !important;
+        font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace !important;
+      }
+      .proposalVote svg {
+        width: 10px !important;
+        height: 10px !important;
+        opacity: .7 !important;
+      }
+      .ownIdeaActions > button {
+        width: 22px !important;
+        height: 22px !important;
+        border-color: transparent !important;
+        background: transparent !important;
+        box-shadow: none !important;
+      }
+      .ownIdeaActions > button:hover {
+        border-color: rgba(255,255,255,.07) !important;
+        background: rgba(255,255,255,.025) !important;
+      }
+      .proposalTotal {
+        font: 700 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace !important;
+      }
+      .persistentProposalText > i > small {
+        font: 650 7px/1 ui-monospace, SFMono-Regular, Menlo, monospace !important;
+        letter-spacing: .015em !important;
+        opacity: .74 !important;
+      }
+
+      /* Closed dock: leader is the signal; supporting counters stay visually subordinate. */
+      .participationBoard:not(.open) .dockIdeaSummary > span {
+        color: rgba(237,237,232,.76) !important;
+      }
+      .participationBoard:not(.open) .dockIdeaSummary > b {
+        font: 750 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace !important;
+      }
+      .participationBoard:not(.open) .proposalMetric,
+      .participationBoard:not(.open) .viewerMetric {
+        opacity: .72 !important;
+      }
+
+      /* v27: onboarding + score clarity. */
+      .participationBoard:not(.open) .participationDock {
+        grid-template-columns: auto auto minmax(0, 1fr) auto auto auto !important;
+      }
+      .participationBoard:not(.open) .boardToggle {
+        width: auto !important;
+        min-width: 78px !important;
+        padding: 0 9px !important;
+        display: inline-flex !important;
+        align-items: center !important;
+        justify-content: center !important;
+        gap: 6px !important;
+        border: 1px solid rgba(215,164,59,.18) !important;
+        background: rgba(215,164,59,.045) !important;
+        color: rgba(241,211,132,.9) !important;
+      }
+      .boardToggle > span {
+        font: 760 8px/1 ui-monospace, SFMono-Regular, Menlo, monospace !important;
+        letter-spacing: .07em !important;
+        white-space: nowrap !important;
+      }
+      .boardToggle > svg {
+        width: 12px !important;
+        height: 12px !important;
+      }
+      .participationBoard.open .boardToggle > span { display: none !important; }
+      .participationBoard.open .boardToggle > svg { transform: rotate(180deg) !important; }
+      .persistentProposalText > i > small { display: none !important; }
+      .persistentProposalText > i > code {
+        font-size: 7.5px !important;
+        opacity: .86 !important;
+      }
+      .proposalTotal {
+        min-width: 36px !important;
+        padding-inline: 5px !important;
+        text-align: right !important;
+        white-space: nowrap !important;
+        cursor: help !important;
+      }
+      .proposalVote {
+        min-width: 42px !important;
+        flex: 0 0 auto !important;
+      }
+      .proposalVote > b {
+        min-width: 22px !important;
+        white-space: nowrap !important;
+      }
+      .walletMetric > b {
+        max-width: 48px !important;
+        overflow: hidden !important;
+        text-overflow: ellipsis !important;
+      }
+
       @media (max-width: 820px) {
         .minimalTop .wordmark { width: 58px !important; height: 58px !important; }
-        .knobControl { width: 44px !important; height: 36px !important; min-width: 44px !important; min-height: 36px !important; }
+        .knobControl { width: 42px !important; height: 32px !important; min-width: 42px !important; min-height: 32px !important; }
         .participationBoard {
           width: calc(100vw - 24px);
         }
         .participationDock {
-          grid-template-columns: 36px auto minmax(0, 1fr) auto auto;
+          grid-template-columns: auto auto minmax(0, 1fr) auto auto;
+        }
+        .participationBoard:not(.open) .boardToggle {
+          min-width: 70px !important;
+          padding-inline: 7px !important;
         }
         .proposalMetric { display: none; }
         .participationSheet {
-          height: min(68vh, 620px);
+          height: min(68vh, 620px) !important;
+          max-height: min(68vh, 620px) !important;
           min-height: 360px;
         }
         .participationColumns {

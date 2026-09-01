@@ -20,6 +20,7 @@ export const httpMeasure = createMeasure("http");
 export const dbMeasure = createMeasure("db");
 export const falMeasure = createMeasure("fal");
 export const showrunnerMeasure = createMeasure("showrunner");
+export const referenceMeasure = createMeasure("reference");
 export const reconcileMeasure = createMeasure("reconcile");
 export const workerMeasure = createMeasure("worker");
 export const pumpMeasure = createMeasure("pumpfun");

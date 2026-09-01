@@ -1,33 +1,10 @@
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-
-function flattenConfig(section: string, values: Record<string, unknown>) {
-  const prefix = section.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
-  for (const [key, value] of Object.entries(values)) {
-    if (value == null || typeof value === "object") continue;
-    const envKey = `${prefix}_${key.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`;
-    process.env[envKey] = String(value);
-  }
-}
+import { loadTomlEnvironment } from "../server/config-file.ts";
 
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
-
-async function loadRootConfig() {
-  const configPath = resolve(PROJECT_ROOT, ".config.toml");
-  if (!existsSync(configPath)) return;
-  const parsed = Bun.TOML.parse(await Bun.file(configPath).text()) as Record<
-    string,
-    unknown
-  >;
-  for (const [section, value] of Object.entries(parsed)) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      flattenConfig(section, value as Record<string, unknown>);
-    }
-  }
-}
+await loadTomlEnvironment(PROJECT_ROOT, ".config.toml");
 
 function cleanEpisodeArg(value: string | undefined) {
   if (!value) return null;
@@ -36,8 +13,6 @@ function cleanEpisodeArg(value: string | undefined) {
   const episode = Number(normalized);
   return Number.isInteger(episode) && episode >= 1 ? episode : null;
 }
-
-await loadRootConfig();
 
 const { db, dbPath } = await import("../server/db.ts");
 const { ROOM_NAME } = await import("../server/lease.ts");

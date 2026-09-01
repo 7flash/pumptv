@@ -11,6 +11,7 @@ import type {
 } from "../shared/contracts.ts";
 import { EMPTY_WORLD_STATE, normalizeWorldState } from "./world-state.ts";
 import { PumpTVShowrunnerPrompt } from "./showrunner-prompt.tsx";
+import type { ReferenceContext } from "./reference-tools.ts";
 
 const MODEL = process.env.JSX_AI_MODEL || "runtime-default";
 
@@ -20,6 +21,7 @@ export type ShowrunnerResult = {
   inputTokens: number | null;
   outputTokens: number | null;
   nextWorldState: WorldState;
+  referenceContext?: ReferenceContext;
 };
 
 const StageShotArgs = z.object({
@@ -68,7 +70,7 @@ function deterministicEmergencyPlan(input: {
   const last = input.recentStory.at(-1) || "the established scene";
   return {
     premise: clean(input.directive, 500),
-    action: `Continue directly from ${clean(last, 300)} and make the Pump.fun suggestion happen through one clear physical action.`,
+    action: `Continue directly from ${clean(last, 300)} and make the selected viewer idea happen through one clear physical action.`,
     transition:
       "Continue the exact visible pose, motion, eyelines and spatial relationships first, then introduce the new idea causally inside the same scene.",
     continuity: input.hasAnchor
@@ -243,6 +245,7 @@ export async function planNextShot(input: {
   hasAnchor: boolean;
   worldState?: WorldState;
   generationMode?: GenerationMode;
+  referenceContext?: ReferenceContext;
 }): Promise<ShowrunnerResult> {
   const worldState = input.worldState || EMPTY_WORLD_STATE;
   const generationMode = input.generationMode || "full";
@@ -279,6 +282,7 @@ export async function planNextShot(input: {
           hasAnchor={input.hasAnchor}
           worldState={worldState}
           maxTokens={generationMode === "fast" ? 1800 : 2800}
+          referenceContext={input.referenceContext}
         />,
       ),
   );
@@ -340,5 +344,6 @@ export async function planNextShot(input: {
     inputTokens: result?.usage?.inputTokens ?? null,
     outputTokens: result?.usage?.outputTokens ?? null,
     nextWorldState,
+    referenceContext: input.referenceContext,
   };
 }

@@ -1,7 +1,3 @@
-import {
-  runPumpfunChatIngestor,
-  stopPumpfunChatIngestor,
-} from "./server/pumpfun.ts";
 import { runRoomWorker, stopRoomWorker } from "./server/worker.ts";
 import { lifecycleMeasure } from "./server/observability.ts";
 
@@ -24,7 +20,6 @@ function pidIsAlive(pid: number) {
     process.kill(pid, 0);
     return true;
   } catch (error: any) {
-    // EPERM means the process exists but this process is not allowed to signal it.
     return error?.code === "EPERM";
   }
 }
@@ -37,7 +32,6 @@ function stop(reason = "signal") {
     ownerWatchdog = null;
   }
   lifecycleMeasure.measureSync("Worker stopping", () => ({ reason }));
-  stopPumpfunChatIngestor();
   stopRoomWorker();
 }
 
@@ -49,8 +43,6 @@ if (ownerPid) {
   ownerWatchdog = setInterval(() => {
     if (pidIsAlive(ownerPid)) return;
     stop(`web owner pid ${ownerPid} exited`);
-    // Network awaits inside generation cannot be cancelled reliably. The worker is
-    // disposable: recovery on the next start requeues any generating directive.
     setTimeout(() => process.exit(0), 25);
   }, 500);
 } else {
@@ -66,9 +58,6 @@ if (ownerPid) {
 process.once("SIGINT", () => stop("SIGINT"));
 process.once("SIGTERM", () => stop("SIGTERM"));
 
-await Promise.all([
-  runRoomWorker().finally(() => stopPumpfunChatIngestor()),
-  runPumpfunChatIngestor(),
-]);
+await runRoomWorker();
 
 if (ownerWatchdog) clearInterval(ownerWatchdog);

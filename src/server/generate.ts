@@ -3,6 +3,7 @@ import type { Clip, GenerationMode, Resolution } from "../shared/contracts.ts";
 import { falMeasure } from "./observability.ts";
 import { OPENING, renderH3Prompt } from "./prompt.ts";
 import { planNextShot } from "./showrunner.tsx";
+import { resolveExternalReferences } from "./reference-tools.ts";
 import { extractVideoFrame, sampleClipFrames } from "./video-frames.ts";
 import {
   claimQueuedDirective,
@@ -45,7 +46,7 @@ export async function generateNextClip(input: {
   const claimed = episode === 0 ? null : await claimQueuedDirective(episode);
 
   if (episode > 0 && !claimed) {
-    throw new Error("No Pump.fun prompt is queued for the next episode.");
+    throw new Error("No triggered proposal is queued for the next episode.");
   }
 
   const directive = claimed?.text || OPENING;
@@ -58,6 +59,8 @@ export async function generateNextClip(input: {
     const anchorFrameUrl = await continuityFrame(input.previousClip);
 
     await setGenerationStage("planning");
+    const referenceContext =
+      episode === 0 ? undefined : await resolveExternalReferences(directive);
     const showrunnerStartedAt = performance.now();
     const showrunner = await planNextShot({
       directive,
@@ -66,6 +69,7 @@ export async function generateNextClip(input: {
       hasAnchor: Boolean(anchorFrameUrl),
       worldState,
       generationMode: mode,
+      referenceContext,
     });
     const showrunnerMs = elapsed(showrunnerStartedAt);
 
@@ -159,7 +163,10 @@ export async function generateNextClip(input: {
         startsAtMs,
         durationSeconds: CLIP_SECONDS,
         showrunnerModel: showrunner.model,
-        showrunnerPlanJson: JSON.stringify(showrunner.plan),
+        showrunnerPlanJson: JSON.stringify({
+          ...showrunner.plan,
+          _references: showrunner.referenceContext || null,
+        }),
         showrunnerInputTokens: showrunner.inputTokens,
         showrunnerOutputTokens: showrunner.outputTokens,
         generationMode: mode,

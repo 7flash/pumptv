@@ -59,8 +59,7 @@ function lightKey() {
       `SELECT running, resolution, workerState, lastError,
               heartbeatAtMs, generationStage, generationStartedAtMs,
               generationMode, generationPauseKind, generationPauseReason,
-              generationRetryAtMs, generationFailureCount,
-              pumpChatState, pumpChatError
+              generationRetryAtMs, generationFailureCount
        FROM rooms
        WHERE name = ?
        ORDER BY id ASC LIMIT 1`,
@@ -94,8 +93,6 @@ function lightKey() {
         ? null
         : Number(room.generationRetryAtMs),
       Number(room.generationFailureCount || 0),
-      room.pumpChatState || null,
-      room.pumpChatError || null,
     ],
     published: [Number(published.count || 0), Number(published.maxId || 0)],
     clips: tableStamp("clips"),

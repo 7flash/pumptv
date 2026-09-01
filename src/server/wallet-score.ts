@@ -1,10 +1,6 @@
 import { walletMeasure } from "./observability.ts";
 
-const MINT = (
-  process.env.PUMPTV_TOKEN_MINT ||
-  process.env.PUMPTV_PUMPFUN_MINT ||
-  ""
-).trim();
+const MINT = (process.env.PUMPTV_TOKEN_MINT || "").trim();
 const RPC_URL =
   (process.env.PUMPTV_SOLANA_RPC_URL || "").trim() ||
   "https://api.mainnet-beta.solana.com";
@@ -26,10 +22,13 @@ export function normalizeSolanaAddress(value: unknown) {
   return /^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address) ? address : null;
 }
 
-export async function tokenBalanceForWallet(address: string) {
+export async function tokenBalanceForWallet(
+  address: string,
+  options: { fresh?: boolean } = {},
+) {
   if (!MINT) return 0;
   const cached = cache.get(address);
-  if (cached && Date.now() - cached.checkedAtMs < CACHE_MS)
+  if (!options.fresh && cached && Date.now() - cached.checkedAtMs < CACHE_MS)
     return cached.tokenBalance;
 
   const response = await walletMeasure.measure(
@@ -74,10 +73,13 @@ export async function tokenBalanceForWallet(address: string) {
   return tokenBalance;
 }
 
-export async function walletVotingPower(address: string | null | undefined) {
+export async function walletVotingPower(
+  address: string | null | undefined,
+  options: { fresh?: boolean } = {},
+) {
   if (!address) return { tokenBalance: 0, power: 1 };
   const normalized = normalizeSolanaAddress(address);
   if (!normalized) throw new Error("Invalid Solana wallet");
-  const tokenBalance = await tokenBalanceForWallet(normalized);
+  const tokenBalance = await tokenBalanceForWallet(normalized, options);
   return { tokenBalance, power: 1 + tokenBalance };
 }

@@ -2,9 +2,11 @@ import {
   getProcess,
   handleRun,
   isProcessRunning,
+  removeProcessByName,
   terminateProcess,
 } from "bgrun";
-import { existsSync } from "node:fs";
+import { resolve } from "node:path";
+import { readTomlEnvironment } from "./config-file.ts";
 import { PROJECT_ROOT } from "./project-paths.ts";
 import { lifecycleMeasure } from "./observability.ts";
 import { clearWebHeartbeat, touchWebHeartbeat } from "./repository.ts";
@@ -65,6 +67,14 @@ async function processIsAlive(proc: any) {
   }
 }
 
+function recordCanBeTerminatedAsWorker(proc: any) {
+  const pid = Number(proc?.pid || 0);
+  if (!Number.isSafeInteger(pid) || pid <= 0 || pid === process.pid)
+    return false;
+  const command = String(proc?.command || "");
+  return command.includes("src/worker.ts");
+}
+
 function startWebLifecycle() {
   if (lifecycleTimer) return;
   lifecycleMeasure.measureSync("Web owns generation worker", () => ({
@@ -99,6 +109,27 @@ async function stopWorkerPid(pid: number) {
   }
 }
 
+async function forgetWorkerRecord() {
+  const existing = getProcess(WORKER_NAME) as any;
+  if (!existing) return;
+
+  await lifecycleMeasure.measure(
+    {
+      start: () => `Forget stale ${WORKER_NAME} bgrun record`,
+      end: () => ({ name: WORKER_NAME }),
+    },
+    async () => {
+      // Important: bgrun reconciles dead records before a new run. A stale
+      // pumptv-worker record can be matched to the live web PID because both
+      // processes share the same project directory. If that old record carries
+      // historical port metadata, reconciliation may then clean the web port.
+      // Remove only the worker registry row before handleRun() so the next run
+      // is created from the portless .worker.toml with no PID/port history.
+      await removeProcessByName(WORKER_NAME);
+    },
+  );
+}
+
 async function stopOwnedWorker() {
   if (shuttingDown) return;
   shuttingDown = true;
@@ -114,12 +145,14 @@ async function stopOwnedWorker() {
 
   try {
     const proc = getProcess(WORKER_NAME) as any;
-    if (proc?.pid && (await processIsAlive(proc))) {
+    if (recordCanBeTerminatedAsWorker(proc) && (await processIsAlive(proc))) {
       lifecycleMeasure.measureSync("Stop owned worker", () => ({
         pid: Number(proc.pid),
       }));
       await stopWorkerPid(Number(proc.pid));
     }
+    // Keep the stopped bgrun row/log paths for postmortem inspection. The next
+    // web owner removes that stale row immediately before creating a fresh run.
   } catch (error) {
     lifecycleMeasure.measureSync("Owned worker stop failed", () => ({
       error: cleanError(error),
@@ -135,13 +168,53 @@ function installShutdownHooks() {
   process.once("SIGTERM", () => stopAndExit(0));
 }
 
-async function startWorkerWithBgrun(): Promise<ManagedWorkerStatus> {
-  if (!existsSync(`${PROJECT_ROOT}/${WORKER_CONFIG_PATH}`)) {
-    throw new Error(
-      `Missing ${WORKER_CONFIG_PATH}. Copy example.worker.toml to ${WORKER_CONFIG_PATH} and configure the worker runtime.`,
-    );
-  }
+async function validateWorkerConfig() {
+  return lifecycleMeasure.measure(
+    {
+      start: () => "Validate worker config",
+      end: (summary) => summary,
+    },
+    async () => {
+      const workerEnv = await readTomlEnvironment(
+        PROJECT_ROOT,
+        WORKER_CONFIG_PATH,
+        { required: true },
+      );
 
+      const webRoom = process.env.PUMPTV_ROOM || "main";
+      const workerRoom = workerEnv.PUMPTV_ROOM || "main";
+      if (workerRoom !== webRoom) {
+        throw new Error(
+          `${WORKER_CONFIG_PATH} PUMPTV_ROOM=${workerRoom} does not match web PUMPTV_ROOM=${webRoom}`,
+        );
+      }
+
+      const webDb = resolve(
+        PROJECT_ROOT,
+        process.env.PUMPTV_DB_PATH || ".data/pumptv.sqlite",
+      );
+      const workerDb = resolve(
+        PROJECT_ROOT,
+        workerEnv.PUMPTV_DB_PATH || ".data/pumptv.sqlite",
+      );
+      if (workerDb !== webDb) {
+        throw new Error(
+          `${WORKER_CONFIG_PATH} PUMPTV_DB_PATH resolves to ${workerDb}, but web uses ${webDb}`,
+        );
+      }
+
+      return {
+        room: workerRoom,
+        db: workerDb,
+        fal: workerEnv.FAL_KEY ? "present" : "missing",
+        model: workerEnv.JSX_AI_MODEL || "default",
+      };
+    },
+  );
+}
+
+async function startWorkerWithBgrun(): Promise<ManagedWorkerStatus> {
+  await validateWorkerConfig();
   const command = workerCommand();
   const started = await lifecycleMeasure.measure(
     {
@@ -189,7 +262,9 @@ async function startWorkerWithBgrun(): Promise<ManagedWorkerStatus> {
 async function ensureOnce(): Promise<ManagedWorkerStatus> {
   try {
     const existing = getProcess(WORKER_NAME) as any;
-    const alive = await processIsAlive(existing);
+    const alive =
+      recordCanBeTerminatedAsWorker(existing) &&
+      (await processIsAlive(existing));
 
     if (alive && !firstEnsure) {
       return snapshot({
@@ -214,6 +289,11 @@ async function ensureOnce(): Promise<ManagedWorkerStatus> {
       }));
       await stopWorkerPid(Number(existing.pid));
     }
+
+    // Always clear the previous worker row, even when its PID is already dead.
+    // This is what prevents bgrun's dead-PID reconciliation from attaching the
+    // worker name to the current web process and cleaning the web port.
+    if (existing) await forgetWorkerRecord();
 
     return await startWorkerWithBgrun();
   } catch (error) {

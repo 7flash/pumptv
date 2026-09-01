@@ -16,6 +16,36 @@ function ownerKey(value: unknown) {
   return `web:${id}`;
 }
 
+export function GET(request: Request) {
+  return measuredRoute(request, async () => {
+    try {
+      const url = new URL(request.url);
+      const address = normalizeSolanaAddress(
+        url.searchParams.get("walletAddress"),
+      );
+      if (!address) throw new Error("Invalid Solana wallet");
+      const fresh = /^(1|true|yes)$/i.test(
+        url.searchParams.get("refresh") || "",
+      );
+      const score = await httpMeasure.measure(
+        {
+          start: () =>
+            `Inspect wallet score ${address.slice(0, 5)}…${address.slice(-4)}`,
+          end: (value) => ({
+            tokenBalance: "[omitted]",
+            power: value.power,
+            fresh,
+          }),
+        },
+        () => walletVotingPower(address, { fresh }),
+      );
+      return Response.json({ walletAddress: address, ...score });
+    } catch (error) {
+      return Response.json({ error: errorText(error) }, { status: 400 });
+    }
+  });
+}
+
 export function POST(request: Request) {
   return measuredRoute(request, async () => {
     try {
@@ -33,16 +63,25 @@ export function POST(request: Request) {
       const score = await httpMeasure.measure(
         {
           start: () => "Read wallet token balance",
-          end: (value) => value,
+          end: (value) => ({ tokenBalance: "[omitted]", power: value.power }),
         },
         () => walletVotingPower(address),
       );
-      await httpMeasure.measure("Apply wallet score", () =>
-        attachWebWallet({
-          ownerKey: ownerKey(body.ownerId ?? body.viewerId),
-          walletAddress: address,
-          weight: score.power,
-        }),
+      await httpMeasure.measure(
+        {
+          start: () => "Apply wallet score",
+          end: (round) => ({
+            roundId: round?.id ?? null,
+            proposals: round?.proposals.length ?? 0,
+            power: score.power,
+          }),
+        },
+        () =>
+          attachWebWallet({
+            ownerKey: ownerKey(body.ownerId ?? body.viewerId),
+            walletAddress: address,
+            weight: score.power,
+          }),
       );
       return Response.json({ walletAddress: address, ...score });
     } catch (error) {

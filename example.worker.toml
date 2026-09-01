@@ -9,9 +9,14 @@ key = ""
 runtime = "codex"
 model = "gpt-5.4"
 
+# Optional but recommended. Used only by the generation worker to resolve
+# current/obscure viewer references before the showrunner stages the shot.
+[exa]
+api_key = ""
+
 [pumptv]
-db_path = ".data/pumptv.sqlite"
-room = "main"
+db_path = ".data/pumptv.sqlite" # must match .config.toml
+room = "main"                  # must match .config.toml
 resolution = "480P"
 
 min_generation_interval_ms = 0
@@ -20,16 +25,6 @@ web_heartbeat_ttl_ms = 6000
 worker_heartbeat_ms = 1000
 idle_poll_ms = 500
 error_backoff_ms = 2000
-
-# Optional Pump.fun ingress. Leave blank when proposals only come from the web.
-pumpfun_mint = ""
-pumpfun_prefix = "!next"
-pumpfun_vote_prefix = "!vote"
-max_proposals_per_round = 40
-pumpfun_lease_ttl_ms = 30000
-pumpfun_lease_poll_ms = 1000
-pumpfun_max_prompt_length = 500
-pumpfun_user_cooldown_ms = 0
 
 [measure]
 silent = 0

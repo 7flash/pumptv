@@ -1,29 +1,9 @@
-import { existsSync } from "node:fs";
-import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { loadTomlEnvironment } from "../server/config-file.ts";
 import type { PromptRound, StreamState } from "../shared/contracts.ts";
 
-function flattenConfig(section: string, values: Record<string, unknown>) {
-  const prefix = section.toUpperCase().replace(/[^A-Z0-9]+/g, "_");
-  for (const [key, value] of Object.entries(values)) {
-    if (value == null || typeof value === "object") continue;
-    process.env[`${prefix}_${key.toUpperCase().replace(/[^A-Z0-9]+/g, "_")}`] =
-      String(value);
-  }
-}
-
 const PROJECT_ROOT = fileURLToPath(new URL("../../", import.meta.url));
-const configPath = resolve(PROJECT_ROOT, ".config.toml");
-if (existsSync(configPath)) {
-  const parsed = Bun.TOML.parse(await Bun.file(configPath).text()) as Record<
-    string,
-    unknown
-  >;
-  for (const [section, value] of Object.entries(parsed)) {
-    if (value && typeof value === "object" && !Array.isArray(value))
-      flattenConfig(section, value as Record<string, unknown>);
-  }
-}
+await loadTomlEnvironment(PROJECT_ROOT, ".config.toml");
 
 const repo = await import("../server/repository.ts");
 const { db } = await import("../server/db.ts");
@@ -33,7 +13,7 @@ const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function usage() {
   console.log(
-    `PumpTV control\n\n  bun run control -- status\n  bun run control -- watch\n  bun run control -- json\n  bun run control -- set-votes <proposalId> <count|auto>\n  bun run control -- trigger\n  bun run control -- force <proposalId>\n  bun run control -- inject <prompt...>\n  bun run control -- inject-force <prompt...>\n  bun run control -- clear-queue\n`,
+    `PumpTV control\n\n  bun run control -- status\n  bun run control -- watch\n  bun run control -- json\n  bun run control -- resolve <prompt...>\n  bun run control -- set-votes <proposalId> <count|auto>\n  bun run control -- trigger\n  bun run control -- force <proposalId>\n  bun run control -- inject <prompt...>\n  bun run control -- inject-force <prompt...>\n  bun run control -- clear-queue\n`,
   );
 }
 
@@ -120,6 +100,17 @@ if (command === "status") {
   }
 } else if (command === "json") {
   console.log(JSON.stringify(await repo.getStreamState(), null, 2));
+} else if (command === "resolve") {
+  const text = args.join(" ").trim();
+  if (!text) {
+    usage();
+    process.exit(1);
+  }
+  await loadTomlEnvironment(PROJECT_ROOT, ".worker.toml", { required: true });
+  const { resolveExternalReferences } =
+    await import("../server/reference-tools.ts");
+  const context = await resolveExternalReferences(text);
+  console.log(JSON.stringify(context, null, 2));
 } else if (command === "set-votes") {
   const id = Number((args[0] || "").replace(/^#/, ""));
   if (!Number.isInteger(id) || id < 1 || !args[1]) {

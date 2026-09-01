@@ -10,8 +10,8 @@
 port = 3006
 
 [pumptv]
-db_path = ".data/pumptv.sqlite"
-room = "main"
+db_path = ".data/pumptv.sqlite" # must match .worker.toml
+room = "main"                  # must match .worker.toml
 admin_token = ""
 resolution = "480P"
 
