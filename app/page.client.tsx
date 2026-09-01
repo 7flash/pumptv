@@ -81,11 +81,12 @@ let mediaTargetObserver: ResizeObserver | null = null;
 let observedGlass: HTMLElement | null = null;
 let lastMediaRect = "";
 
-// A cold refresh is the only time the current episode has no warm inactive deck.
-// Download that first clip completely before handing it to the video decoder so
-// playback starts from a local blob instead of racing the network while visible.
-const videoLoadSerial = new WeakMap<HTMLVideoElement, number>();
-const videoObjectUrls = new WeakMap<HTMLVideoElement, string>();
+// Cold refreshes get a one-time decoder prime on the hidden deck. The visible
+// playback then starts on the other, fresh decoder. This deliberately mirrors
+// the user workaround that makes playback smooth after switching away/back,
+// without showing or rewinding the priming decoder.
+let coldStartPrime: { clipId: number; promise: Promise<void> } | null = null;
+let coldStartAttemptedClipId: number | null = null;
 
 function liveNowMs() {
   return Date.now() + serverOffsetMs;
@@ -778,34 +779,8 @@ async function boot() {
   }, 100);
 }
 
-function releaseVideoObjectUrl(video: HTMLVideoElement) {
-  const url = videoObjectUrls.get(video);
-  if (!url) return;
-  videoObjectUrls.delete(video);
-  try {
-    URL.revokeObjectURL(url);
-  } catch {}
-}
-
-function attachVideoSource(
-  video: HTMLVideoElement,
-  clip: Clip,
-  slot: number,
-  source: string,
-  objectUrl: boolean,
-) {
-  if (video.dataset.clipId !== String(clip.id)) {
-    if (objectUrl) {
-      try {
-        URL.revokeObjectURL(source);
-      } catch {}
-    }
-    return;
-  }
-
-  releaseVideoObjectUrl(video);
-  if (objectUrl) videoObjectUrls.set(video, source);
-  video.src = source;
+function attachVideoSource(video: HTMLVideoElement, clip: Clip, slot: number) {
+  video.src = clip.videoUrl;
   video.oncanplay = () => {
     if (video.dataset.clipId !== String(clip.id)) return;
     video.dataset.ready = "1";
@@ -818,37 +793,6 @@ function attachVideoSource(
   };
   video.onended = () => handleDeckEnded(slot, clip.id);
   video.load();
-}
-
-async function attachColdVideoSource(
-  video: HTMLVideoElement,
-  clip: Clip,
-  slot: number,
-  serial: number,
-) {
-  try {
-    const response = await fetch(clip.videoUrl, { cache: "force-cache" });
-    if (!response.ok) throw new Error(`video prefetch ${response.status}`);
-    const blob = await response.blob();
-    if (
-      videoLoadSerial.get(video) !== serial ||
-      video.dataset.clipId !== String(clip.id)
-    )
-      return;
-    const objectUrl = URL.createObjectURL(blob);
-    attachVideoSource(video, clip, slot, objectUrl, true);
-  } catch (cause) {
-    if (
-      videoLoadSerial.get(video) !== serial ||
-      video.dataset.clipId !== String(clip.id)
-    )
-      return;
-    console.warn(
-      `[pumptv/media] cold prefetch failed for EP ${clip.episode + 1}; using direct URL`,
-      cause,
-    );
-    attachVideoSource(video, clip, slot, clip.videoUrl, false);
-  }
 }
 
 function configureVideo(video: HTMLVideoElement, clip: Clip, slot: number) {
@@ -864,20 +808,147 @@ function configureVideo(video: HTMLVideoElement, clip: Clip, slot: number) {
   video.playsInline = true;
   video.muted = true;
   video.poster = clipPoster(clip);
-
-  const serial = (videoLoadSerial.get(video) || 0) + 1;
-  videoLoadSerial.set(video, serial);
-  releaseVideoObjectUrl(video);
   video.removeAttribute("src");
   video.load();
+  attachVideoSource(video, clip, slot);
+}
 
-  const coldRefresh = activeVideoClipId == null && replayClipId == null;
-  if (coldRefresh) {
-    void attachColdVideoSource(video, clip, slot, serial);
+function bufferedFromStart(video: HTMLVideoElement) {
+  for (let index = 0; index < video.buffered.length; index += 1) {
+    const start = video.buffered.start(index);
+    const end = video.buffered.end(index);
+    if (start <= 0.08) return Math.max(0, end);
+  }
+  return 0;
+}
+
+async function waitForColdRunway(
+  video: HTMLVideoElement,
+  clipId: number,
+  timeoutMs = 4_000,
+) {
+  const startedAt = performance.now();
+  while (video.dataset.clipId === String(clipId)) {
+    const duration = Number.isFinite(video.duration) ? video.duration : 5;
+    const goal = Math.min(2.25, Math.max(0.75, duration - 0.2));
+    if (
+      video.readyState >= HTMLMediaElement.HAVE_FUTURE_DATA &&
+      bufferedFromStart(video) >= goal
+    )
+      return;
+    if (performance.now() - startedAt >= timeoutMs) return;
+    await new Promise<void>((resolve) => setTimeout(resolve, 40));
+  }
+}
+
+async function waitForPrimedFrames(video: HTMLVideoElement, count = 3) {
+  const callback = (video as any).requestVideoFrameCallback;
+  if (typeof callback !== "function") {
+    const startedAt = performance.now();
+    while (
+      video.currentTime < 0.12 &&
+      performance.now() - startedAt < 650 &&
+      !video.paused
+    )
+      await new Promise<void>((resolve) => setTimeout(resolve, 20));
     return;
   }
 
-  attachVideoSource(video, clip, slot, clip.videoUrl, false);
+  await new Promise<void>((resolve) => {
+    let frames = 0;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      resolve();
+    };
+    const next = () => {
+      if (settled) return;
+      frames += 1;
+      if (frames >= count) finish();
+      else callback.call(video, next);
+    };
+    const timeout = setTimeout(finish, 900);
+    callback.call(video, next);
+  });
+}
+
+async function primeColdLiveClip(
+  clip: Clip,
+  nodes: Array<HTMLVideoElement | null>,
+) {
+  const warmSlot = activeVideoSlot;
+  const playbackSlot = 1 - warmSlot;
+  const warm = nodes[warmSlot];
+  const playback = nodes[playbackSlot];
+  if (!warm || !playback) return;
+
+  configureVideo(warm, clip, warmSlot);
+  await waitForColdRunway(warm, clip.id);
+  if (
+    desiredClip()?.id !== clip.id ||
+    replayClipId != null ||
+    activeVideoClipId != null
+  )
+    return;
+
+  try {
+    warm.currentTime = 0;
+  } catch {}
+  warm.muted = true;
+  try {
+    await warm.play();
+    await waitForPrimedFrames(warm);
+  } catch {}
+  warm.pause();
+  warm.muted = true;
+
+  if (
+    desiredClip()?.id !== clip.id ||
+    replayClipId != null ||
+    activeVideoClipId != null
+  )
+    return;
+
+  // Use a fresh decoder for what the viewer actually sees. The first decoder
+  // has already warmed the browser's media/network path, but none of its
+  // playback state is reused.
+  configureVideo(playback, clip, playbackSlot);
+  await waitForColdRunway(playback, clip.id, 2_500);
+  if (
+    desiredClip()?.id !== clip.id ||
+    replayClipId != null ||
+    activeVideoClipId != null
+  )
+    return;
+
+  try {
+    playback.currentTime = 0;
+  } catch {}
+  const serial = ++switchSerial;
+  pendingActivation = { clipId: clip.id, slot: playbackSlot, serial };
+  try {
+    await activateVideoSlot(playbackSlot, clip, playback, nodes, serial);
+  } finally {
+    if (pendingActivation?.serial === serial) pendingActivation = null;
+  }
+}
+
+function startColdLivePrime(clip: Clip, nodes: Array<HTMLVideoElement | null>) {
+  if (coldStartPrime?.clipId === clip.id) return;
+  const promise = primeColdLiveClip(clip, nodes)
+    .catch((cause) => {
+      console.warn(
+        `[pumptv/media] cold decoder prime failed for EP ${clip.episode + 1}`,
+        cause,
+      );
+    })
+    .finally(() => {
+      if (coldStartPrime?.promise === promise) coldStartPrime = null;
+      syncVideoDeck();
+    });
+  coldStartPrime = { clipId: clip.id, promise };
 }
 
 function targetTimeFor(_clip: Clip) {
@@ -1009,7 +1080,7 @@ async function activateVideoSlot(
     return;
   }
 
-  const previous = nodes[activeVideoSlot];
+  const previous = activeVideoClipId == null ? null : nodes[activeVideoSlot];
 
   try {
     video.currentTime = targetTimeFor(clip);
@@ -1126,6 +1197,20 @@ function syncVideoDeck() {
   const wanted = desiredClip();
   const nodes = videoNodes();
   if (!nodes[0] || !nodes[1]) return;
+
+  if (
+    wanted &&
+    activeVideoClipId == null &&
+    replayClipId == null &&
+    !playbackPaused
+  ) {
+    if (coldStartPrime?.clipId === wanted.id) return;
+    if (coldStartAttemptedClipId !== wanted.id) {
+      coldStartAttemptedClipId = wanted.id;
+      startColdLivePrime(wanted, nodes);
+      return;
+    }
+  }
 
   if (!wanted) {
     for (const video of nodes) {
@@ -1502,6 +1587,11 @@ function installInteractionLayer() {
       redraw();
       return;
     }
+    if (trayOpen) {
+      trayOpen = false;
+      redraw();
+      return;
+    }
     if (infoOpen) {
       infoOpen = false;
       syncLocalUiState();
@@ -1649,10 +1739,6 @@ function KnobControl(props: {
       type="button"
       data-action={props.action}
       data-control={props.action}
-      data-rich-tooltip="1"
-      data-tooltip-kicker="CONTROL"
-      data-tooltip-body={props.title}
-      data-tooltip-side="left"
       aria-label={props.title}
       aria-pressed={Boolean(props.active)}
     >
@@ -1827,9 +1913,6 @@ function OutsideTool(props: {
       type="button"
       data-action={props.action}
       data-control={props.action}
-      data-rich-tooltip="1"
-      data-tooltip-kicker="CONTROL"
-      data-tooltip-body={props.title}
       aria-label={props.title}
       aria-pressed={Boolean(props.active)}
     >
@@ -2189,10 +2272,6 @@ function CurrentPrompt({ clip }: { clip: Clip | null }) {
       className="currentPrompt"
       data-current-prompt
       data-empty={clip ? undefined : ""}
-      data-rich-tooltip={clip ? "1" : undefined}
-      data-tooltip-kicker={clip ? `EP ${clip.episode + 1}` : undefined}
-      data-tooltip-body={clip?.directive || undefined}
-      data-tooltip-meta={clip ? clipAuthor(clip) : undefined}
     >
       <span data-current-prompt-text>{clip?.directive || ""}</span>
       <i data-current-prompt-author>{clip ? clipAuthor(clip) : ""}</i>
@@ -2213,7 +2292,15 @@ function formatScore(value: number) {
   return `${(score / 1_000_000_000).toFixed(score < 10_000_000_000 ? 1 : 0)}B`;
 }
 
-type BoardIconName = "viewer" | "wallet" | "send" | "edit" | "cancel" | "world";
+type BoardIconName =
+  | "viewer"
+  | "wallet"
+  | "send"
+  | "edit"
+  | "cancel"
+  | "upvote"
+  | "suggestions"
+  | "world";
 
 function BoardIcon({ name }: { name: BoardIconName }) {
   if (name === "viewer")
@@ -2240,6 +2327,19 @@ function BoardIcon({ name }: { name: BoardIconName }) {
         <path className="stroke" d="m7 7 10 10M17 7 7 17" />
       </svg>
     );
+  if (name === "upvote")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path className="stroke" d="M12 19V6M6.5 11.5 12 6l5.5 5.5" />
+      </svg>
+    );
+  if (name === "suggestions")
+    return (
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        <path className="stroke" d="M5 5.5h14v10H9.5L5 19v-13.5Z" />
+        <path className="stroke" d="M8.5 9h7M8.5 12h4.5" />
+      </svg>
+    );
   return <TrayIcon name="world" />;
 }
 
@@ -2255,14 +2355,6 @@ function ProposalCard({
   return (
     <div
       className={`persistentProposal ${own ? "own" : ""} ${pending ? "pending" : ""}`}
-      data-action={own ? undefined : "vote"}
-      data-proposal-id={own ? undefined : proposal.id}
-      role={own ? undefined : "button"}
-      tabIndex={own ? undefined : 0}
-      data-rich-tooltip="1"
-      data-tooltip-kicker={own ? "YOUR IDEA" : "SUGGESTION"}
-      data-tooltip-body={proposal.text}
-      data-tooltip-meta={`${authorLabel(proposal.author, proposal.authorAddress)} · ${formatScore(proposal.voteCount)} pts${own ? " · edit or cancel" : " · click to vote"}`}
     >
       <div className="persistentProposalText">
         <span>{proposal.text}</span>
@@ -2270,31 +2362,35 @@ function ProposalCard({
           <i>{authorLabel(proposal.author, proposal.authorAddress)}</i>
         ) : null}
       </div>
-      <b>{formatScore(proposal.voteCount)}</b>
       {own ? (
-        <div className="ownIdeaActions">
-          <button
-            type="button"
-            data-action="edit-own"
-            data-rich-tooltip="1"
-            data-tooltip-kicker="IDEA"
-            data-tooltip-body="Edit"
-            aria-label="Edit idea"
-          >
-            <BoardIcon name="edit" />
-          </button>
-          <button
-            type="button"
-            data-action="cancel-own"
-            data-rich-tooltip="1"
-            data-tooltip-kicker="IDEA"
-            data-tooltip-body="Cancel"
-            aria-label="Cancel idea"
-          >
-            <BoardIcon name="cancel" />
-          </button>
-        </div>
-      ) : null}
+        <>
+          <b>{formatScore(proposal.voteCount)}</b>
+          <div className="ownIdeaActions">
+            <button type="button" data-action="edit-own" aria-label="Edit idea">
+              <BoardIcon name="edit" />
+            </button>
+            <button
+              type="button"
+              data-action="cancel-own"
+              aria-label="Cancel idea"
+            >
+              <BoardIcon name="cancel" />
+            </button>
+          </div>
+        </>
+      ) : (
+        <button
+          type="button"
+          className="proposalVote"
+          data-action="vote"
+          data-proposal-id={proposal.id}
+          disabled={pending}
+          aria-label={`Upvote suggestion with your score. Current score ${formatScore(proposal.voteCount)}`}
+        >
+          <BoardIcon name="upvote" />
+          <b>{formatScore(proposal.voteCount)}</b>
+        </button>
+      )}
     </div>
   );
 }
@@ -2322,9 +2418,6 @@ function PersistentIdeas() {
           type="submit"
           data-action="submit-idea"
           disabled={ideaSubmitting || !ideaDraft.trim()}
-          data-rich-tooltip="1"
-          data-tooltip-kicker="IDEA"
-          data-tooltip-body={own ? "Save changes" : "Submit suggestion"}
           aria-label={own ? "Save idea" : "Submit idea"}
         >
           <BoardIcon name="send" />
@@ -2389,9 +2482,6 @@ function WorldDetailModal() {
           type="button"
           data-action="close-world-detail"
           aria-label="Close"
-          data-rich-tooltip="1"
-          data-tooltip-kicker="WORLD"
-          data-tooltip-body="Close"
         >
           ×
         </button>
@@ -2485,51 +2575,61 @@ function PersistentWorld() {
 
 function ParticipationBoard() {
   const round = currentBoardRound();
-  const targetEpisode = round?.targetEpisode ?? program?.targetEpisode ?? 0;
+  const candidates = sortedCandidates(round);
+  const leader = candidates[0] || null;
   const walletTitle = walletAddress
     ? `${shortAddress(walletAddress)} · ${walletTokenBalance} tokens · score ${walletPower}`
     : "Connect Phantom";
+
   return (
-    <section className="participationBoard">
-      <div className="participationMeta">
+    <section className={`participationBoard ${trayOpen ? "open" : ""}`}>
+      <div className="participationDock">
+        <button
+          className="boardToggle"
+          type="button"
+          data-action="tray-toggle"
+          aria-label={trayOpen ? "Collapse panel" : "Expand panel"}
+          aria-expanded={trayOpen}
+        >
+          <TrayIcon name="chevron" />
+        </button>
+
         <span
           className="viewerMetric"
-          data-rich-tooltip="1"
-          data-tooltip-kicker="LIVE"
-          data-tooltip-body={`${room?.viewerCount ?? 0} viewers`}
+          aria-label={`${room?.viewerCount ?? 0} viewers`}
         >
           <BoardIcon name="viewer" />
           <b>{room?.viewerCount ?? 0}</b>
         </span>
-        <span
-          className="episodeMetric"
-          data-rich-tooltip="1"
-          data-tooltip-kicker={`EP ${targetEpisode + 1}`}
-          data-tooltip-body="Next episode"
+
+        <button
+          className="dockIdeaSummary"
+          type="button"
+          data-action="tray-toggle"
+          aria-label="Open suggestions and world state"
         >
-          <b>{targetEpisode + 1}</b>
-          {round?.votingStartedAtMs && round.closesAtMs > liveNowMs() ? (
-            <strong data-vote-countdown>
-              {formatClock(round.closesAtMs - liveNowMs())}
-            </strong>
-          ) : null}
+          {leader ? (
+            <>
+              <span>{leader.text}</span>
+              <b>{formatScore(leader.voteCount)}</b>
+            </>
+          ) : (
+            <i>•••</i>
+          )}
+        </button>
+
+        <span
+          className="proposalMetric"
+          aria-label={`${candidates.length} suggestions`}
+        >
+          <BoardIcon name="suggestions" />
+          <b>{candidates.length}</b>
         </span>
+
         <button
           type="button"
           className={`walletMetric ${walletAddress ? "connected" : ""}`}
           data-action="wallet"
-          data-rich-tooltip="1"
-          data-tooltip-kicker={walletAddress ? "PHANTOM" : "WALLET"}
-          data-tooltip-body={
-            walletAddress
-              ? shortAddress(walletAddress) || "Connected"
-              : "Connect Phantom"
-          }
-          data-tooltip-meta={
-            walletAddress
-              ? `${formatScore(walletTokenBalance)} tokens · ${formatScore(walletPower)} score`
-              : "Optional score boost"
-          }
           aria-label={walletTitle}
         >
           <BoardIcon name="wallet" />
@@ -2537,6 +2637,7 @@ function ParticipationBoard() {
             <b>{walletScoreLoading ? "…" : formatScore(walletPower)}</b>
           ) : null}
         </button>
+
         {participationError ? (
           <i
             className="participationError"
@@ -2548,10 +2649,17 @@ function ParticipationBoard() {
           </i>
         ) : null}
       </div>
-      <div className="participationColumns">
-        <PersistentWorld />
-        <PersistentIdeas />
+
+      <div className="participationSheet" aria-hidden={!trayOpen}>
+        <div className="drawerGrab" aria-hidden="true">
+          <i />
+        </div>
+        <div className="participationColumns">
+          <PersistentWorld />
+          <PersistentIdeas />
+        </div>
       </div>
+
       <WorldDetailModal />
     </section>
   );
@@ -2570,12 +2678,7 @@ function TactileTV({ clip }: { clip: Clip | null }) {
       <div className="tvScreenFrame">
         <div className="tvGlass">
           {!clip ? (
-            <div
-              className="tvIdle"
-              data-rich-tooltip="1"
-              data-tooltip-kicker="PUMPTV"
-              data-tooltip-body={tooltipStatus()}
-            >
+            <div className="tvIdle">
               <div className={`idleOrb ${state}`}>
                 <span>●</span>
               </div>
@@ -2588,9 +2691,6 @@ function TactileTV({ clip }: { clip: Clip | null }) {
               className="liveReturn"
               type="button"
               data-action="live"
-              data-rich-tooltip="1"
-              data-tooltip-kicker="LIVE"
-              data-tooltip-body="Return to live"
               aria-label="Return to live"
             >
               ●
@@ -2600,14 +2700,7 @@ function TactileTV({ clip }: { clip: Clip | null }) {
       </div>
 
       <div className="tvHardware">
-        <button
-          className={`powerLamp ${state}`}
-          data-rich-tooltip="1"
-          data-tooltip-kicker="STATUS"
-          data-tooltip-body={tooltipStatus()}
-          data-tooltip-side="left"
-          aria-label={tooltipStatus()}
-        />
+        <button className={`powerLamp ${state}`} aria-label={tooltipStatus()} />
         <div className="knobStack">
           <KnobControl
             active={!playbackPaused}
@@ -2662,17 +2755,7 @@ function ProgramShelfSlot() {
             ? `Episode ${program.targetEpisode + 1} ready`
             : `Waiting for episode ${program.targetEpisode + 1}`);
   return (
-    <div
-      className={`programShelfSlot phase-${phase}`}
-      data-rich-tooltip="1"
-      data-tooltip-kicker={`EP ${program.targetEpisode + 1}`}
-      data-tooltip-body={title}
-      data-tooltip-meta={
-        candidateCount > 0 ? `${candidateCount} suggestions` : ""
-      }
-      data-tooltip-side="left"
-      aria-label={title}
-    >
+    <div className={`programShelfSlot phase-${phase}`} aria-label={title}>
       <span className="programShelfVisual">
         <i className="programShelfPulse" />
         {candidateCount > 0 ? <small>{candidateCount}</small> : null}
@@ -2683,51 +2766,38 @@ function ProgramShelfSlot() {
 }
 
 function EpisodeShelf() {
-  const published = [...publishedTimeline()].reverse();
+  const now = liveNowMs();
+  const episodes = [...timeline]
+    .filter((clip) => Boolean(clip.videoUrl))
+    .sort((a, b) => b.episode - a.episode || b.id - a.id);
   const shown = visibleClip();
   const live = latestPublishedClip();
 
   return (
     <aside className="episodeShelf" aria-label="Episodes">
-      <div
-        className="brandStamp"
-        data-rich-tooltip="1"
-        data-tooltip-kicker="PUMPTV"
-        data-tooltip-body="Live generative television"
-        data-tooltip-side="left"
-      >
-        <span>P</span>
-      </div>
       <button
         className={`liveCap ${replayClipId == null ? "active" : ""}`}
         type="button"
         data-action="live"
-        data-rich-tooltip="1"
-        data-tooltip-kicker="LIVE"
-        data-tooltip-body={live?.directive || "Current episode"}
-        data-tooltip-meta={
-          live ? `EP ${live.episode + 1} · ${clipAuthor(live)}` : ""
-        }
-        data-tooltip-side="left"
         aria-label="Live"
       >
         <span>●</span>
       </button>
       <div className="episodeList">
-        <ProgramShelfSlot />
-        {published.map((clip) => {
+        {episodes.map((clip) => {
           const active = shown?.id === clip.id;
           const isLive = live?.id === clip.id && replayClipId == null;
+          const future = clip.startsAtMs > now + 250;
           const thumb =
             clip.startFrameUrl || clip.endFrameUrl || clip.anchorFrameUrl;
           return (
             <button
-              className={`episodeCard ${active ? "active" : ""} ${isLive ? "live" : ""}`}
+              className={`episodeCard ${active ? "active" : ""} ${isLive ? "live" : ""} ${future ? "future" : ""}`}
               type="button"
               data-action="episode"
               data-episode-id={clip.id}
               data-rich-tooltip="1"
-              data-tooltip-kicker={`EP ${clip.episode + 1}${isLive ? " · LIVE" : ""}`}
+              data-tooltip-kicker={`EP ${clip.episode + 1}${isLive ? " · LIVE" : future ? " · READY" : ""}`}
               data-tooltip-body={clip.directive}
               data-tooltip-meta={[
                 clipAuthor(clip),
@@ -2755,22 +2825,6 @@ function EpisodeShelf() {
           );
         })}
       </div>
-      <div
-        className={`pumpLink ${room?.pumpfun.state || "disabled"}`}
-        data-rich-tooltip="1"
-        data-tooltip-kicker="PUMP.FUN"
-        data-tooltip-body={
-          room?.pumpfun.enabled
-            ? `Chat ${room.pumpfun.state}`
-            : "Chat not configured"
-        }
-        data-tooltip-meta={
-          room?.pumpfun.mint ? shortAddress(room.pumpfun.mint) || "" : ""
-        }
-        data-tooltip-side="left"
-      >
-        $
-      </div>
     </aside>
   );
 }
@@ -2778,6 +2832,85 @@ function EpisodeShelf() {
 function OutsideInterfaceStyles() {
   return (
     <style>{`
+      /* Episode history is part of the TV hardware, not neon UI chrome. */
+      .episodeCard,
+      .episodeCard.active,
+      .episodeCard.live,
+      .episodeCard.active.live,
+      .programShelfSlot,
+      .liveCap {
+        outline: none !important;
+        border-color: rgba(255,255,255,.09) !important;
+      }
+
+      .episodeCard,
+      .episodeCard.active,
+      .episodeCard.live,
+      .episodeCard.active.live {
+        box-shadow: none !important;
+      }
+
+      .episodeCard.active,
+      .episodeCard.live,
+      .episodeCard.active.live {
+        background: rgba(255,255,255,.045) !important;
+      }
+
+      .episodeCard::before,
+      .episodeCard::after,
+      .episodeThumb::before,
+      .episodeThumb::after {
+        border-color: rgba(255,255,255,.1) !important;
+        box-shadow: none !important;
+      }
+
+      .episodeCard.active,
+      .episodeCard.live,
+      .episodeCard.active.live {
+        background: rgba(255,255,255,.045) !important;
+      }
+
+      .episodeCard::before,
+      .episodeCard::after,
+      .episodeThumb::before,
+      .episodeThumb::after {
+        border-color: rgba(255,255,255,.1) !important;
+        box-shadow: none !important;
+      }
+
+      .episodeCard .episodeThumb,
+      .episodeCard.active .episodeThumb,
+      .episodeCard.live .episodeThumb,
+      .episodeCard.active.live .episodeThumb {
+        border-color: rgba(255,255,255,.09) !important;
+        outline: none !important;
+        box-shadow: inset 0 1px rgba(255,255,255,.035), 0 5px 16px rgba(0,0,0,.18) !important;
+        transition: transform 130ms ease, filter 130ms ease, border-color 130ms ease !important;
+      }
+
+      .episodeCard:hover .episodeThumb {
+        border-color: rgba(255,255,255,.18) !important;
+        filter: brightness(1.06);
+      }
+
+      .episodeCard.active .episodeThumb {
+        border-color: rgba(255,255,255,.28) !important;
+        transform: translateY(-1px);
+        filter: brightness(1.08) contrast(1.02);
+        box-shadow: inset 0 1px rgba(255,255,255,.07), 0 7px 20px rgba(0,0,0,.28) !important;
+      }
+
+      .episodeCard > b,
+      .episodeCard.active > b,
+      .episodeCard.live > b {
+        color: rgba(255,255,255,.58) !important;
+        text-shadow: none !important;
+      }
+
+      .episodeCard.active > b {
+        color: rgba(255,255,255,.9) !important;
+      }
+
       .richHoverTooltip {
         position: fixed;
         z-index: 9999;
@@ -3526,30 +3659,69 @@ function OutsideInterfaceStyles() {
         opacity: .7;
       }
 
+      .watchDeck {
+        overflow: visible !important;
+      }
+
       .participationBoard {
         width: min(1040px, calc(100vw - 150px));
-        margin: 12px auto 0;
+        margin: 10px auto 0;
         position: relative;
-        z-index: 8;
-        border: 1px solid rgba(255,255,255,.11);
-        border-radius: 18px;
-        background: rgba(9,10,13,.72);
-        box-shadow: inset 0 1px rgba(255,255,255,.035), 0 15px 45px rgba(0,0,0,.2);
-        backdrop-filter: blur(18px);
+        z-index: 48;
+        overflow: visible;
       }
 
-      .participationMeta {
-        min-height: 42px;
-        display: flex;
+      .participationDock {
+        min-height: 46px;
+        display: grid;
+        grid-template-columns: 34px auto auto minmax(80px, 1fr) auto auto;
         align-items: center;
-        gap: 10px;
-        padding: 6px 9px;
-        border-bottom: 1px solid rgba(255,255,255,.07);
+        gap: 8px;
+        padding: 6px 8px;
+        position: relative;
+        z-index: 3;
+        border: 1px solid rgba(255,255,255,.12);
+        border-radius: 15px;
+        background:
+          linear-gradient(180deg, rgba(25,27,32,.9), rgba(10,11,14,.9));
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.055),
+          0 12px 38px rgba(0,0,0,.24);
+        backdrop-filter: blur(20px) saturate(1.15);
       }
 
+      .boardToggle,
+      .dockIdeaSummary,
+      .walletMetric {
+        border: 0;
+        color: inherit;
+        font: inherit;
+      }
+
+      .boardToggle {
+        width: 34px;
+        height: 34px;
+        display: grid;
+        place-items: center;
+        padding: 0;
+        border-radius: 10px;
+        background: rgba(255,255,255,.035);
+        color: rgba(255,255,255,.62);
+        cursor: pointer;
+      }
+
+      .boardToggle:hover,
+      .participationBoard.open .boardToggle {
+        background: rgba(255,255,255,.075);
+        color: rgba(255,255,255,.9);
+      }
+
+      .boardToggle svg,
       .participationMeta svg,
       .persistentIdeaForm svg,
-      .ownIdeaActions svg {
+      .ownIdeaActions svg,
+      .viewerMetric svg,
+      .walletMetric svg {
         width: 17px;
         height: 17px;
         fill: none;
@@ -3559,26 +3731,75 @@ function OutsideInterfaceStyles() {
         stroke-linejoin: round;
       }
 
+      .boardToggle svg {
+        transition: transform 260ms cubic-bezier(.2,.75,.2,1);
+      }
+
+      .participationBoard.open .boardToggle svg {
+        transform: rotate(180deg);
+      }
+
       .viewerMetric,
       .episodeMetric,
       .walletMetric {
-        height: 30px;
+        height: 32px;
         display: inline-flex;
         align-items: center;
         gap: 6px;
         color: rgba(255,255,255,.62);
         font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        white-space: nowrap;
       }
 
-      .viewerMetric svg,
-      .walletMetric svg { width: 16px; height: 16px; }
+      .viewerMetric,
+      .episodeMetric {
+        padding: 0 3px;
+      }
 
       .episodeMetric {
-        margin-left: auto;
-        gap: 8px;
+        gap: 7px;
       }
 
-      .episodeMetric > strong { opacity: .88; }
+      .episodeMetric > strong {
+        opacity: .9;
+      }
+
+      .dockIdeaSummary {
+        min-width: 0;
+        height: 32px;
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) auto;
+        align-items: center;
+        gap: 9px;
+        padding: 0 10px;
+        border-radius: 10px;
+        background: rgba(255,255,255,.025);
+        color: rgba(255,255,255,.72);
+        text-align: left;
+        cursor: pointer;
+      }
+
+      .dockIdeaSummary:hover {
+        background: rgba(255,255,255,.055);
+        color: rgba(255,255,255,.92);
+      }
+
+      .dockIdeaSummary > span {
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        font-size: 11px;
+        line-height: 1;
+      }
+
+      .dockIdeaSummary > b,
+      .dockIdeaSummary > i {
+        font: 720 9px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-style: normal;
+        opacity: .58;
+        white-space: nowrap;
+      }
 
       .walletMetric {
         border: 1px solid transparent;
@@ -3591,8 +3812,8 @@ function OutsideInterfaceStyles() {
       .walletMetric:hover,
       .walletMetric.connected {
         border-color: rgba(255,255,255,.1);
-        background: rgba(255,255,255,.04);
-        color: rgba(255,255,255,.84);
+        background: rgba(255,255,255,.045);
+        color: rgba(255,255,255,.86);
       }
 
       .participationError {
@@ -3606,20 +3827,65 @@ function OutsideInterfaceStyles() {
         font-style: normal;
       }
 
+      .participationSheet {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: calc(100% + 8px);
+        height: clamp(310px, 48vh, 540px);
+        z-index: 2;
+        overflow: hidden;
+        border: 1px solid rgba(255,255,255,.135);
+        border-radius: 20px;
+        background:
+          radial-gradient(circle at 50% 110%, rgba(255,255,255,.04), transparent 42%),
+          linear-gradient(180deg, rgba(20,22,27,.955), rgba(8,9,12,.965));
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.065),
+          0 -10px 44px rgba(0,0,0,.24),
+          0 28px 80px rgba(0,0,0,.5);
+        backdrop-filter: blur(26px) saturate(1.18);
+        opacity: 0;
+        visibility: hidden;
+        pointer-events: none;
+        transform: translateY(18px) scale(.985,.94);
+        transform-origin: 50% 100%;
+        transition:
+          opacity 180ms ease,
+          transform 320ms cubic-bezier(.16,.84,.24,1),
+          visibility 0s linear 320ms;
+      }
+
+      .participationBoard.open .participationSheet {
+        opacity: 1;
+        visibility: visible;
+        pointer-events: auto;
+        transform: translateY(0) scale(1);
+        transition:
+          opacity 190ms ease,
+          transform 330ms cubic-bezier(.16,.84,.24,1),
+          visibility 0s linear 0s;
+      }
+
       .participationColumns {
+        height: 100%;
+        min-height: 0;
         display: grid;
         grid-template-columns: minmax(0, .92fr) minmax(0, 1.08fr);
-        min-height: 230px;
       }
 
       .persistentWorld,
       .persistentIdeas {
         min-width: 0;
-        padding: 12px;
+        min-height: 0;
+        padding: 14px;
+        overflow: auto;
+        overscroll-behavior: contain;
+        scrollbar-width: thin;
       }
 
       .persistentWorld {
-        border-right: 1px solid rgba(255,255,255,.07);
+        border-right: 1px solid rgba(255,255,255,.075);
         display: grid;
         align-content: start;
         gap: 8px;
@@ -3631,7 +3897,7 @@ function OutsideInterfaceStyles() {
         text-align: left;
         border: 1px solid transparent;
         color: inherit;
-        background: rgba(255,255,255,.025);
+        background: rgba(255,255,255,.026);
         cursor: pointer;
       }
 
@@ -3644,8 +3910,8 @@ function OutsideInterfaceStyles() {
 
       .worldLocationCard:hover,
       .persistentWorldItems > button:hover {
-        border-color: rgba(255,255,255,.1);
-        background: rgba(255,255,255,.05);
+        border-color: rgba(255,255,255,.11);
+        background: rgba(255,255,255,.055);
       }
 
       .worldLocationCard > b { font-size: 13px; }
@@ -3705,6 +3971,11 @@ function OutsideInterfaceStyles() {
         display: grid;
         grid-template-columns: minmax(0,1fr) 38px;
         gap: 7px;
+        position: sticky;
+        top: 0;
+        z-index: 2;
+        padding-bottom: 7px;
+        background: linear-gradient(180deg, rgba(15,17,21,.98) 68%, rgba(15,17,21,0));
       }
 
       .persistentIdeaForm > input {
@@ -3715,7 +3986,7 @@ function OutsideInterfaceStyles() {
         border-radius: 11px;
         outline: none;
         padding: 0 11px;
-        background: rgba(255,255,255,.03);
+        background: rgba(255,255,255,.035);
         color: inherit;
         font: inherit;
         font-size: 12px;
@@ -3723,7 +3994,7 @@ function OutsideInterfaceStyles() {
 
       .persistentIdeaForm > input:focus {
         border-color: rgba(255,255,255,.22);
-        background: rgba(255,255,255,.05);
+        background: rgba(255,255,255,.055);
       }
 
       .persistentIdeaForm > input::placeholder { color: rgba(255,255,255,.27); }
@@ -3732,7 +4003,7 @@ function OutsideInterfaceStyles() {
       .ownIdeaActions > button {
         border: 1px solid rgba(255,255,255,.09);
         border-radius: 10px;
-        background: rgba(255,255,255,.035);
+        background: rgba(255,255,255,.04);
         color: rgba(255,255,255,.65);
         cursor: pointer;
       }
@@ -3760,19 +4031,18 @@ function OutsideInterfaceStyles() {
         padding: 9px 10px;
         border: 1px solid transparent;
         border-radius: 11px;
-        background: rgba(255,255,255,.028);
-        cursor: pointer;
+        background: rgba(255,255,255,.03);
       }
 
       .persistentProposal:hover {
         border-color: rgba(255,255,255,.1);
-        background: rgba(255,255,255,.05);
+        background: rgba(255,255,255,.055);
       }
 
       .persistentProposal.own {
         grid-template-columns: minmax(0,1fr) auto auto;
         border-color: rgba(255,255,255,.11);
-        background: rgba(255,255,255,.055);
+        background: rgba(255,255,255,.06);
         cursor: default;
       }
 
@@ -3803,6 +4073,32 @@ function OutsideInterfaceStyles() {
       .persistentProposal > b {
         font: 760 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         opacity: .78;
+      }
+
+      .proposalVote {
+        height: 30px;
+        min-width: 52px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 5px;
+        padding: 0 8px;
+        border: 1px solid rgba(255,255,255,.1);
+        border-radius: 9px;
+        background: rgba(255,255,255,.045);
+        color: rgba(255,255,255,.78);
+        cursor: pointer;
+      }
+      .proposalVote:hover {
+        transform: translateY(-1px);
+        background: rgba(255,255,255,.09);
+        border-color: rgba(255,255,255,.18);
+      }
+      .proposalVote:active { transform: translateY(0); }
+      .proposalVote:disabled { opacity: .4; cursor: default; }
+      .proposalVote svg { width: 13px; height: 13px; }
+      .proposalVote > b {
+        font: 760 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       }
 
       .ownIdeaActions { display: flex; gap: 4px; }
@@ -3860,14 +4156,272 @@ function OutsideInterfaceStyles() {
         opacity: .72;
       }
 
+
+      /* v12: make the history rail own its vertical space. Removing decorative
+         rail children in v11 exposed the old intrinsic-height behavior, which
+         could collapse .episodeList to roughly one card. */
+      .episodeShelf {
+        height: 100dvh !important;
+        max-height: 100dvh !important;
+        min-height: 0 !important;
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: stretch !important;
+        overflow: hidden !important;
+        box-sizing: border-box !important;
+      }
+
+      .episodeShelf > .liveCap {
+        flex: 0 0 auto !important;
+      }
+
+      .episodeShelf > .episodeList {
+        flex: 1 1 0 !important;
+        height: 0 !important;
+        min-height: 0 !important;
+        max-height: none !important;
+        overflow-x: hidden !important;
+        overflow-y: auto !important;
+        overscroll-behavior: contain;
+        display: flex !important;
+        flex-direction: column !important;
+        align-items: stretch !important;
+        gap: 8px !important;
+        padding-bottom: 12px !important;
+        scrollbar-width: thin;
+      }
+
+      .episodeList > .episodeCard {
+        flex: 0 0 auto !important;
+        width: 100% !important;
+        min-width: 0 !important;
+      }
+
+      .episodeCard.future {
+        opacity: .58;
+      }
+
+      /* v12 drawer: one intentional dock row, with the sheet floating upward
+         over the set instead of reflowing the TV. */
+      .participationBoard {
+        width: min(1080px, calc(100vw - 176px));
+        margin-top: 14px;
+        z-index: 58;
+      }
+
+      .participationDock {
+        min-height: 48px;
+        grid-template-columns: 36px auto minmax(0, 1fr) auto auto auto;
+        gap: 9px;
+        padding: 6px 9px;
+        border-radius: 16px;
+        background:
+          linear-gradient(180deg, rgba(27,29,34,.94), rgba(11,12,15,.94));
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.065),
+          inset 0 -1px rgba(0,0,0,.32),
+          0 10px 34px rgba(0,0,0,.28);
+      }
+
+      .viewerMetric,
+      .proposalMetric,
+      .walletMetric {
+        height: 34px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        gap: 6px;
+        white-space: nowrap;
+        color: rgba(255,255,255,.62);
+        font: 700 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+
+      .viewerMetric,
+      .proposalMetric {
+        min-width: 40px;
+        padding: 0 5px;
+      }
+
+      .proposalMetric svg {
+        width: 16px;
+        height: 16px;
+        fill: none;
+        stroke: currentColor;
+        stroke-width: 1.7;
+        stroke-linecap: round;
+        stroke-linejoin: round;
+      }
+
+      .episodeMetric { display: none !important; }
+
+      .dockIdeaSummary {
+        height: 34px;
+        padding: 0 12px;
+        border: 1px solid rgba(255,255,255,.045);
+        background: rgba(255,255,255,.022);
+      }
+
+      .dockIdeaSummary:hover {
+        border-color: rgba(255,255,255,.095);
+      }
+
+      .participationSheet {
+        bottom: calc(100% + 10px);
+        height: min(64vh, 660px);
+        min-height: 370px;
+        border-radius: 22px;
+        background:
+          radial-gradient(circle at 72% 115%, rgba(255,255,255,.05), transparent 42%),
+          linear-gradient(180deg, rgba(24,26,31,.975), rgba(8,9,12,.982));
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.075),
+          inset 0 -1px rgba(0,0,0,.5),
+          0 -14px 50px rgba(0,0,0,.2),
+          0 34px 100px rgba(0,0,0,.58);
+        transform: translateY(26px) scale(.988,.93);
+      }
+
+      .drawerGrab {
+        height: 20px;
+        display: grid;
+        place-items: center;
+        border-bottom: 1px solid rgba(255,255,255,.055);
+        background: rgba(255,255,255,.012);
+      }
+
+      .drawerGrab > i {
+        width: 42px;
+        height: 3px;
+        border-radius: 999px;
+        background: rgba(255,255,255,.15);
+      }
+
+      .participationColumns {
+        height: calc(100% - 20px);
+        grid-template-columns: minmax(0, .88fr) minmax(0, 1.12fr);
+      }
+
+      .persistentWorld,
+      .persistentIdeas {
+        padding: 16px;
+      }
+
+      .persistentWorld {
+        gap: 10px;
+        background: linear-gradient(90deg, rgba(255,255,255,.012), transparent 58%);
+      }
+
+      .worldLocationCard {
+        padding: 13px 14px;
+        border-radius: 14px;
+        background: rgba(255,255,255,.035);
+      }
+
+      .worldLocationCard > b {
+        font-size: 14px;
+      }
+
+      .worldLocationCard > span {
+        display: -webkit-box;
+        -webkit-line-clamp: 3;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+        font-size: 11px;
+        line-height: 1.45;
+      }
+
+      .persistentWorldItems {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 7px;
+      }
+
+      .persistentWorldItems > button {
+        min-height: 58px;
+        align-content: center;
+        padding: 10px 11px;
+        border-radius: 12px;
+        background: rgba(255,255,255,.028);
+      }
+
+      .persistentIdeas {
+        gap: 9px;
+      }
+
+      .persistentIdeaForm {
+        grid-template-columns: minmax(0, 1fr) 42px;
+        gap: 8px;
+        padding-bottom: 10px;
+        background: linear-gradient(180deg, rgba(18,20,24,.99) 74%, rgba(18,20,24,0));
+      }
+
+      .persistentIdeaForm > input,
+      .persistentIdeaForm > button {
+        height: 42px;
+      }
+
+      .persistentIdeaForm > button {
+        width: 42px;
+      }
+
+      .persistentProposalList {
+        gap: 7px;
+      }
+
+      .persistentProposal {
+        min-height: 50px;
+        padding: 10px 11px;
+        border-color: rgba(255,255,255,.035);
+        background: rgba(255,255,255,.028);
+      }
+
+      .persistentProposal.own {
+        border-color: rgba(255,255,255,.14);
+        background: rgba(255,255,255,.06);
+      }
+
+      .persistentProposalText > span {
+        white-space: normal;
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        line-height: 1.35;
+      }
+
       @media (max-width: 760px) {
         .participationBoard {
           width: min(94vw, 680px);
           margin-top: 8px;
         }
 
-        .participationColumns { grid-template-columns: 1fr; }
-        .persistentWorld { border-right: 0; border-bottom: 1px solid rgba(255,255,255,.07); }
+        .participationDock {
+          grid-template-columns: 32px auto auto minmax(0,1fr) auto;
+          gap: 5px;
+          padding-inline: 6px;
+        }
+
+        .participationDock > .participationError { display: none; }
+        .walletMetric > b { display: none; }
+        .dockIdeaSummary { padding-inline: 8px; }
+
+        .participationSheet {
+          height: min(68vh, 560px);
+          border-radius: 17px;
+        }
+
+        .participationColumns {
+          display: block;
+          overflow: auto;
+        }
+
+        .persistentWorld,
+        .persistentIdeas {
+          overflow: visible;
+        }
+
+        .persistentWorld {
+          border-right: 0;
+          border-bottom: 1px solid rgba(255,255,255,.07);
+        }
         .persistentWorldItems { grid-template-columns: 1fr 1fr; }
         .participationTray {
           width: min(94vw, 680px);
@@ -3897,6 +4451,36 @@ function OutsideInterfaceStyles() {
           grid-column: 1;
         }
       }
+
+      @media (max-width: 820px) {
+        .participationBoard {
+          width: calc(100vw - 24px);
+        }
+        .participationDock {
+          grid-template-columns: 36px auto minmax(0, 1fr) auto auto;
+        }
+        .proposalMetric { display: none; }
+        .participationSheet {
+          height: min(68vh, 620px);
+          min-height: 360px;
+        }
+        .participationColumns {
+          grid-template-columns: 1fr;
+          overflow-y: auto;
+        }
+        .persistentWorld {
+          border-right: 0;
+          border-bottom: 1px solid rgba(255,255,255,.07);
+          overflow: visible;
+        }
+        .persistentIdeas {
+          overflow: visible;
+        }
+        .episodeShelf > .episodeList {
+          height: auto !important;
+        }
+      }
+
     `}</style>
   );
 }
@@ -3909,13 +4493,7 @@ function App() {
       <OutsideInterfaceStyles />
       <section className="watchDeck">
         <div className="minimalTop">
-          <div
-            className="wordmark"
-            data-rich-tooltip="1"
-            data-tooltip-kicker="PUMPTV"
-            data-tooltip-body="Live generative television"
-            aria-label="PumpTV"
-          >
+          <div className="wordmark" aria-label="PumpTV">
             <span>P</span>
           </div>
           <div className="tinyStatus">
@@ -3926,12 +4504,7 @@ function App() {
               data-tooltip-body={tooltipStatus()}
             />
             {transport !== "live" ? (
-              <i
-                className="transportDot"
-                data-rich-tooltip="1"
-                data-tooltip-kicker="NETWORK"
-                data-tooltip-body={transport}
-              />
+              <i className="transportDot" aria-label={transport} />
             ) : null}
           </div>
         </div>

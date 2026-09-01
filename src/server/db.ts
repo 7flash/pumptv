@@ -60,6 +60,7 @@ const openedDb = dbMeasure.measureSync(
           authorAddress: z.string().nullable().default(null),
           sourceRoom: z.string().nullable().default(null),
           proposalId: z.number().nullable().default(null),
+          triggered: z.boolean().default(false),
         }),
         promptRounds: z.object({
           targetEpisode: z.number(),
@@ -146,9 +147,26 @@ function ensureColumn(table: string, column: string, sqlType: string) {
   db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${sqlType}`);
 }
 
-dbMeasure.measureSync("Migrate weighted proposal board", () => {
+dbMeasure.measureSync("Migrate persistent proposal board", () => {
   ensureColumn("proposals", "ownerWeight", "REAL NOT NULL DEFAULT 1");
   ensureColumn("proposalVotes", "weight", "REAL NOT NULL DEFAULT 1");
+  // v11 makes generation an explicit operator action. Existing queued rows from
+  // older auto-close builds intentionally migrate as untriggered.
+  ensureColumn("directives", "triggered", "INTEGER NOT NULL DEFAULT 0");
+  // Any open board created by the old timed-vote UI becomes untimed on upgrade.
+  db.exec(
+    `UPDATE promptRounds
+     SET votingStartedAtMs = NULL, closesAtMs = 0
+     WHERE status = 'open'`,
+  );
+  // Old builds could queue/mark generation without an operator trigger. Do not
+  // let those rows spring back to life after this migration.
+  db.exec(
+    `UPDATE directives
+     SET status = 'used', usedEpisode = NULL, triggered = 0
+     WHERE COALESCE(triggered, 0) = 0
+       AND status IN ('queued', 'generating')`,
+  );
 });
 
 dbMeasure.measureSync("Create directive source index", () =>

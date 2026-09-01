@@ -6,7 +6,6 @@ import { workerMeasure } from "./observability.ts";
 import { dbPath } from "./db.ts";
 import {
   clearGenerationPause,
-  closePromptRoundIfDue,
   ensureOpenPromptRound,
   getLatestClip,
   getRoomRow,
@@ -97,15 +96,10 @@ async function generationTick() {
     // Viewers can start suggesting EP 2 while the opening is still rendering.
     await ensureOpenPromptRound(1);
   } else {
-    await closePromptRoundIfDue();
     if (!(await hasQueuedDirective())) {
       await ensureOpenPromptRound(await nextEpisode());
       await setWorkerState("idle", null, "full");
-      const round = await getOpenPromptRound();
-      const untilClose = round?.closesAtMs
-        ? Math.max(80, round.closesAtMs - Date.now())
-        : IDLE_POLL_MS;
-      return { generated: false, sleepMs: Math.min(IDLE_POLL_MS, untilClose) };
+      return { generated: false, sleepMs: IDLE_POLL_MS };
     }
     // Never render more than one episode ahead of the published/live edge.
     if (latest.startsAtMs > Date.now()) {
@@ -142,7 +136,6 @@ async function generationTick() {
     const lockedOpening = !lockedLatest;
     if (!lockedRoom.running) return { generated: false, sleepMs: IDLE_POLL_MS };
     if (!lockedOpening) {
-      await closePromptRoundIfDue();
       if (!(await hasQueuedDirective())) {
         await setWorkerState("idle", null, "full");
         return { generated: false, sleepMs: IDLE_POLL_MS };

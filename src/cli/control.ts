@@ -168,24 +168,12 @@ if (command === "status") {
     ).count || 0,
   );
 
-  const now = Date.now();
   db.exec("BEGIN IMMEDIATE");
   try {
     db.exec(
       `UPDATE directives
-       SET status = 'used', usedEpisode = NULL
+       SET status = 'used', usedEpisode = NULL, triggered = 0
        WHERE status IN ('queued', 'generating')`,
-    );
-    db.exec(
-      `UPDATE proposals SET status = 'lost'
-       WHERE status = 'open'`,
-    );
-    db.exec(
-      `UPDATE promptRounds
-       SET status = 'closed',
-           closedAtMs = COALESCE(closedAtMs, ${now}),
-           winnerProposalId = NULL
-       WHERE status = 'open'`,
     );
     db.exec(
       `UPDATE rooms
@@ -205,7 +193,7 @@ if (command === "status") {
   }
 
   console.log(
-    `[control] discarded ${before} queued/generating prompt${before === 1 ? "" : "s"}; next generation now requires a fresh winner/trigger`,
+    `[control] discarded ${before} queued/generating prompt${before === 1 ? "" : "s"}; proposal board preserved; next generation requires bun run control -- trigger`,
   );
 } else if (command === "inject") {
   const text = args.join(" ").trim();

@@ -100,7 +100,7 @@ try {
             // Explicit opt-in: replay the prompts that originally produced the removed episodes.
             db.exec(
               `UPDATE directives
-               SET status = 'queued', usedEpisode = NULL
+               SET status = 'queued', usedEpisode = NULL, triggered = 1
                WHERE usedEpisode >= ${fromInternal}`,
             );
           } else {
@@ -108,7 +108,7 @@ try {
             // a generation backlog; a fresh Pump.fun winner/operator trigger is required.
             db.exec(
               `UPDATE directives
-               SET status = 'used', usedEpisode = NULL
+               SET status = 'used', usedEpisode = NULL, triggered = 0
                WHERE usedEpisode >= ${fromInternal}`,
             );
           }

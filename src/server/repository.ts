@@ -116,7 +116,8 @@ function nextPendingDirectiveWithVotes() {
                    ELSE (SELECT COALESCE(p.operatorVoteOverride, (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = d.proposalId) + COALESCE(p.ownerWeight, 1)) FROM proposals p WHERE p.id = d.proposalId)
               END AS voteCount
        FROM directives d
-       WHERE d.status IN ('generating', 'queued')
+       WHERE COALESCE(d.triggered, 0) = 1
+         AND d.status IN ('generating', 'queued')
        ORDER BY CASE d.status WHEN 'generating' THEN 0 ELSE 1 END, d.id ASC
        LIMIT 1`,
       )[0] || null,
@@ -634,19 +635,6 @@ export async function upsertWebProposal(input: {
       }
       if (!proposal) throw new Error("Could not save idea");
 
-      const roundRow = db.raw<any>(
-        `SELECT votingStartedAtMs FROM promptRounds WHERE id = ? LIMIT 1`,
-        round.id,
-      )[0];
-      if (roundRow && !roundRow.votingStartedAtMs) {
-        const now = Date.now();
-        db.exec(
-          `UPDATE promptRounds SET votingStartedAtMs = ?, closesAtMs = ? WHERE id = ?`,
-          now,
-          now + VOTE_WINDOW_MS,
-          round.id,
-        );
-      }
       db.exec("COMMIT");
       const loaded = loadRoundById(round.id);
       return (
@@ -831,19 +819,6 @@ export async function submitPumpfunProposal(input: {
         sourceId: input.sourceId,
         weight: 1,
       });
-      const row = db.raw<any>(
-        `SELECT * FROM promptRounds WHERE id = ? LIMIT 1`,
-        round.id,
-      )[0];
-      if (row && !row.votingStartedAtMs) {
-        const now = Date.now();
-        db.exec(
-          `UPDATE promptRounds SET votingStartedAtMs = ?, closesAtMs = ? WHERE id = ?`,
-          now,
-          now + VOTE_WINDOW_MS,
-          round.id,
-        );
-      }
       db.exec("COMMIT");
       const loaded = loadRoundById(round.id);
       if (!loaded) throw new Error("Could not reload proposal round");
@@ -977,8 +952,8 @@ function carryProposalBoardForward(input: {
     targetEpisode: input.targetEpisode,
     status: "open",
     openedAtMs: input.now,
-    votingStartedAtMs: survivors.length ? input.now : null,
-    closesAtMs: survivors.length ? input.now + VOTE_WINDOW_MS : 0,
+    votingStartedAtMs: null,
+    closesAtMs: 0,
     closedAtMs: null,
     winnerProposalId: null,
   });
@@ -1068,6 +1043,7 @@ export async function closePromptRound(
           authorAddress: winner.authorAddress,
           sourceRoom: winner.sourceRoom,
           proposalId: winner.id,
+          triggered: true,
         });
       }
       if (!directive) throw new Error("Could not create winning directive");
@@ -1134,7 +1110,7 @@ export async function forceProposalAsNext(
       let directive = existing;
       if (directive) {
         db.exec(
-          `UPDATE directives SET text = ?, sourceId = ?, author = ?, authorAddress = ?, sourceRoom = ?, proposalId = ? WHERE id = ?`,
+          `UPDATE directives SET text = ?, sourceId = ?, author = ?, authorAddress = ?, sourceRoom = ?, proposalId = ?, triggered = 1 WHERE id = ?`,
           proposal.text,
           `round:${round.id}:proposal:${proposalId}`,
           proposal.author ?? null,
@@ -1158,6 +1134,7 @@ export async function forceProposalAsNext(
           authorAddress: proposal.authorAddress ?? null,
           sourceRoom: proposal.sourceRoom ?? null,
           proposalId,
+          triggered: true,
         });
       }
       if (!directive) throw new Error("Could not persist forced winner");
@@ -1173,16 +1150,10 @@ export async function forceProposalAsNext(
   });
 }
 
-export async function closePromptRoundIfDue(now = Date.now()) {
-  const round = await getOpenPromptRound();
-  if (
-    !round ||
-    !round.proposals.length ||
-    !round.votingStartedAtMs ||
-    round.closesAtMs > now
-  )
-    return null;
-  return closePromptRound();
+export async function closePromptRoundIfDue(_now = Date.now()) {
+  // Persistent proposals never auto-lock. Generation begins only when an
+  // operator explicitly calls `control trigger` / force.
+  return null;
 }
 
 export async function operatorInjectProposal(text: string) {
@@ -1271,7 +1242,7 @@ export async function claimQueuedDirective(episode: number) {
   const queued = await dbMeasure.measureSync("Get queued directive", () =>
     db.directives
       .select()
-      .where({ status: "queued" })
+      .where({ status: "queued", triggered: true })
       .orderBy("id", "ASC")
       .first(),
   );
@@ -1292,7 +1263,7 @@ export async function hasQueuedDirective() {
   const row = await dbMeasure.measureSync("Check queued directive", () =>
     db.directives
       .select("id")
-      .where({ status: "queued" })
+      .where({ status: "queued", triggered: true })
       .orderBy("id", "ASC")
       .first(),
   );
@@ -1605,7 +1576,10 @@ export async function getStreamState(): Promise<StreamState> {
       getRoomRow(),
       getTimeline(),
       dbMeasure.measureSync("Count queued Pump.fun prompts", () =>
-        db.directives.select().where({ status: "queued" }).count(),
+        db.directives
+          .select()
+          .where({ status: "queued", triggered: true })
+          .count(),
       ),
       getRecentGenerationTimings(),
       getOpenPromptRound(),
