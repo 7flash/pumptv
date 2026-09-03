@@ -36,8 +36,7 @@ test("explicit typography requests are preserved while exact facts stay final-fr
       ...basePlan,
       visualDetails: "A receipt reading JIMOTHY slides from the printer.",
     },
-    directive:
-      "Print the word JIMOTHY on the receipt, then reveal the current BTC price.",
+    directive: "Print the word JIMOTHY on the receipt, then reveal the current BTC price.",
     factOverlayText: "BTC $77,594.91",
     factKeyframeProvided: true,
   });

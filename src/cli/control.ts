@@ -298,6 +298,8 @@ function usage() {
   bun run control -- resolve [--refresh] [--force] <prompt...>
   bun run control -- prompt <episode|latest> [--json] [--local]
   bun run control -- wallet [--refresh] <address>
+  bun run control -- reward-wallet --local
+  bun run control -- rewards --local
   bun run control -- remove --proposal <id>
   bun run control -- ban --proposal <id> [--reason <text>]
   bun run control -- ban-ip <ip> [--reason <text>]
@@ -511,6 +513,16 @@ if (command === "doctor") {
     fresh: args.includes("--refresh"),
   });
   console.log(JSON.stringify({ walletAddress: address, ...result }, null, 2));
+} else if (command === "reward-wallet") {
+  const { rewardWalletInfo } = await import("../server/rewards.ts");
+  console.log(JSON.stringify(rewardWalletInfo(), null, 2));
+} else if (command === "rewards") {
+  const rows = db.raw<any>(
+    `SELECT id, roundId, proposalId, walletAddress, amountLamports, status,
+            signature, lastError, claimedAtMs, sentAtMs, createdAt, updatedAt
+     FROM ideaRewards ORDER BY id DESC LIMIT 50`,
+  );
+  console.log(JSON.stringify(rows, null, 2));
 } else if (command === "prompt" || command === "episode") {
   const jsonOutput = args.includes("--json");
   const target = args.find((arg) => arg !== "--json") || "latest";

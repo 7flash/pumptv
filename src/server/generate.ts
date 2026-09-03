@@ -9,7 +9,11 @@ import type {
   WorldStateAudit,
 } from "../shared/contracts.ts";
 import { falMeasure, generationMeasure } from "./observability.ts";
-import { OPENING, renderH3Prompt, sanitizeShotPlanForH3 } from "./prompt.ts";
+import {
+  OPENING,
+  renderH3Prompt,
+  sanitizeShotPlanForH3,
+} from "./prompt.ts";
 import { planNextShot } from "./showrunner.tsx";
 import { resolveExternalReferences } from "./reference-tools.ts";
 import type { ReferenceContext } from "./reference-tools.ts";
@@ -58,10 +62,7 @@ function elapsed(startedAt: number) {
   return Math.max(0, Math.round(performance.now() - startedAt));
 }
 
-async function stage(
-  observer: StageObserver | undefined,
-  value: ActiveGenerationStage,
-) {
+async function stage(observer: StageObserver | undefined, value: ActiveGenerationStage) {
   if (observer) await observer(value);
 }
 

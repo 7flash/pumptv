@@ -6,6 +6,7 @@ import { acquireRoomLease, releaseRoomLease, renewRoomLease } from "./lease.ts";
 import { workerMeasure } from "./observability.ts";
 import { dbPath } from "./db.ts";
 import { PrewarmController } from "./prewarm.ts";
+import { kickRewardProcessor } from "./rewards.ts";
 import {
   autoTriggerNextProposalIfDue,
   claimQueuedDirective,
@@ -47,6 +48,14 @@ const owner = `${hostname()}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`;
 const prewarm = new PrewarmController(`prewarm:${owner}`);
 let stopping = false;
 
+function serviceWinnerRewards() {
+  void kickRewardProcessor().catch((error) => {
+    workerMeasure.measureSync("Winner reward processor failed", () => ({
+      error: error instanceof Error ? error.message : String(error),
+    }));
+  });
+}
+
 async function maybeAutoLock(now = Date.now()) {
   let queued = await hasQueuedDirective();
   if (!queued) {
@@ -59,13 +68,13 @@ async function maybeAutoLock(now = Date.now()) {
 async function waitForPrewarmIfWinnerIsAlreadyRendering(
   queuedDirective: Directive | null,
 ) {
-  if (!(await prewarm.shouldWaitForLockedDirective(queuedDirective)))
-    return false;
+  if (!(await prewarm.shouldWaitForLockedDirective(queuedDirective))) return false;
   await setWorkerState("idle", null, "full");
   return true;
 }
 
 async function generationTick() {
+  serviceWinnerRewards();
   await touchWorkerHeartbeat();
   const room = await getRoomRow();
 
@@ -220,9 +229,7 @@ async function generationTick() {
       } else {
         const claimed = await claimQueuedDirective(episode);
         if (!claimed)
-          throw new Error(
-            "No triggered proposal is queued for the next episode.",
-          );
+          throw new Error("No triggered proposal is queued for the next episode.");
 
         let usedPrewarm = false;
         clip = await workerMeasure.measure(
@@ -237,10 +244,7 @@ async function generationTick() {
             }),
           },
           async () => {
-            const promotion = await prewarm.promoteIfReady({
-              episode,
-              claimed,
-            });
+            const promotion = await prewarm.promoteIfReady({ episode, claimed });
             if (promotion.kind === "promoted") {
               usedPrewarm = true;
               return promotion.clip;
@@ -309,6 +313,7 @@ async function generationTick() {
 
 export async function runRoomWorker() {
   await clearExpiredPrewarmSlot();
+  serviceWinnerRewards();
 
   workerMeasure.measureSync(
     {

@@ -45,6 +45,12 @@ token_mint = ""
 solana_rpc_url = "https://api.mainnet-beta.solana.com"
 wallet_score_cache_ms = 20000
 
+# Winning web ideas with a connected Solana wallet receive an automatic SOL reward.
+# Solard owns the reward wallet/signing; fund this wallet before enabling payouts.
+winner_reward_sol = 0.01
+reward_wallet_name = "pumptv-winner-rewards"
+reward_sending_stale_ms = 180000
+
 # Shared worker ownership/health settings used by the web process.
 web_heartbeat_ttl_ms = 6000
 

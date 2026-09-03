@@ -1,9 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { PromptRound } from "../shared/contracts.ts";
-import {
-  shouldStartPrewarm,
-  speculativeDirectiveMatches,
-} from "./prewarm-policy.ts";
+import { shouldStartPrewarm, speculativeDirectiveMatches } from "./prewarm-policy.ts";
 
 function round(overrides: Partial<PromptRound> = {}): PromptRound {
   return {

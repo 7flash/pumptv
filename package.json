@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@fal-ai/client": "^1.6.2",
+    "@solard/sdk": "^0.2.9",
     "measure-fn": "^5.2.0",
     "sqlite-zod-orm": "^3.33.0",
     "tradjs": "^4.3.0",

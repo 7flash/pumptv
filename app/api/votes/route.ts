@@ -20,6 +20,7 @@ import {
   normalizeSolanaAddress,
   walletVotingPower,
 } from "../../../src/server/wallet-score.ts";
+import { participationCohortKey } from "../../../src/server/participant-identity.ts";
 
 function anonymousKey(value: unknown) {
   const id = sanitizeLine(String(value || ""), 180);
@@ -29,18 +30,6 @@ function anonymousKey(value: unknown) {
 
 function voterKey(value: unknown, walletAddress: string | null) {
   return walletAddress ? `wallet:${walletAddress}` : anonymousKey(value);
-}
-
-function participantKey(
-  originIpHash: string | null,
-  walletAddress: string | null,
-  subjectKey: string,
-) {
-  return originIpHash
-    ? `ip:${originIpHash}`
-    : walletAddress
-      ? `wallet:${walletAddress}`
-      : subjectKey;
 }
 
 export function POST(request: Request) {
@@ -82,11 +71,11 @@ export function POST(request: Request) {
             voterKey: subjectKey,
             weight: power,
             walletAddress,
-            participantKey: participantKey(
+            participantKey: participationCohortKey({
               originIpHash,
               walletAddress,
               subjectKey,
-            ),
+            }),
           }),
       );
       if (!round) {

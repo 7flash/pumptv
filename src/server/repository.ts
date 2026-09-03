@@ -23,11 +23,7 @@ import { arbitrationMeasure, dbMeasure } from "./observability.ts";
 import { EMPTY_WORLD_STATE, parseWorldStateJson } from "./world-state.ts";
 import { getViewerCount } from "./presence.ts";
 import { deriveLiveProgramState } from "./program-state.ts";
-import {
-  decisionPolicyFromEnv,
-  nextDecisionDeadline,
-  type DecisionActivity,
-} from "./decision-policy.ts";
+import { decisionPolicyFromEnv, nextDecisionDeadline, type DecisionActivity } from "./decision-policy.ts";
 
 const PUMPFUN_MINT = (process.env.PUMPTV_PUMPFUN_MINT || "").trim();
 const PUMPFUN_PREFIX = process.env.PUMPTV_PUMPFUN_PREFIX ?? "!next";
@@ -41,6 +37,10 @@ const MAX_PROPOSALS_PER_ROUND = Math.max(
 );
 const AUTO_TRIGGER_ENABLED = process.env.PUMPTV_AUTO_TRIGGER !== "0";
 const DECISION_POLICY = decisionPolicyFromEnv();
+const winnerRewardSol = Number(process.env.PUMPTV_WINNER_REWARD_SOL ?? 0.01);
+const WINNER_REWARD_LAMPORTS = Number.isFinite(winnerRewardSol)
+  ? Math.max(0, Math.round(winnerRewardSol * 1_000_000_000))
+  : 10_000_000;
 
 export class DecisionWindowClosedError extends Error {}
 
@@ -336,81 +336,69 @@ export async function claimPrewarmSlot(input: {
   proposalId: number;
   ttlMs: number;
 }) {
-  return (
-    dbMeasure.measureSync(
-      {
-        start: () => `Claim prewarm #${input.proposalId}`,
-        end: (claimed) => ({
-          claimed,
-          roundId: input.roundId,
-          proposalId: input.proposalId,
-        }),
-      },
-      () => {
-        const now = Date.now();
-        db.exec("BEGIN IMMEDIATE");
-        try {
-          const room =
-            db.raw<any>(
-              `SELECT * FROM rooms WHERE name = ? ORDER BY id ASC LIMIT 1`,
-              ROOM_NAME,
-            )[0] || null;
-          if (!room) {
-            db.exec("COMMIT");
-            return false;
-          }
-          if (
-            room.prewarmOwner &&
-            room.prewarmOwner !== input.owner &&
-            Number(room.prewarmLeaseUntilMs || 0) > now
-          ) {
-            db.exec("COMMIT");
-            return false;
-          }
-          db.exec(
-            `UPDATE rooms
+  return dbMeasure.measureSync(
+    {
+      start: () => `Claim prewarm #${input.proposalId}`,
+      end: (claimed) => ({ claimed, roundId: input.roundId, proposalId: input.proposalId }),
+    },
+    () => {
+      const now = Date.now();
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        const room = db.raw<any>(
+          `SELECT * FROM rooms WHERE name = ? ORDER BY id ASC LIMIT 1`,
+          ROOM_NAME,
+        )[0] || null;
+        if (!room) {
+          db.exec("COMMIT");
+          return false;
+        }
+        if (
+          room.prewarmOwner &&
+          room.prewarmOwner !== input.owner &&
+          Number(room.prewarmLeaseUntilMs || 0) > now
+        ) {
+          db.exec("COMMIT");
+          return false;
+        }
+        db.exec(
+          `UPDATE rooms
            SET prewarmOwner = ?, prewarmLeaseUntilMs = ?,
                prewarmRoundId = ?, prewarmProposalId = ?,
                prewarmStartedAtMs = ?, prewarmStage = 'planning'
            WHERE id = ?`,
-            input.owner,
-            now + input.ttlMs,
-            input.roundId,
-            input.proposalId,
-            now,
-            room.id,
-          );
-          db.exec("COMMIT");
-          return true;
-        } catch (error) {
-          try {
-            db.exec("ROLLBACK");
-          } catch {}
-          throw error;
-        }
-      },
-    ) ?? false
-  );
+          input.owner,
+          now + input.ttlMs,
+          input.roundId,
+          input.proposalId,
+          now,
+          room.id,
+        );
+        db.exec("COMMIT");
+        return true;
+      } catch (error) {
+        try { db.exec("ROLLBACK"); } catch {}
+        throw error;
+      }
+    },
+  ) ?? false;
 }
 
 export async function renewPrewarmSlot(owner: string, ttlMs: number) {
   const room = await getRoomRow();
-  return (
-    dbMeasure.measureSync("Renew prewarm slot", () => {
-      db.exec(
-        `UPDATE rooms SET prewarmLeaseUntilMs = ? WHERE id = ? AND prewarmOwner = ?`,
-        Date.now() + ttlMs,
-        room.id,
-        owner,
-      );
-      const current =
-        db.raw<any>(
-          `SELECT prewarmOwner FROM rooms WHERE id = ? LIMIT 1`,
-          room.id,
-        )[0] || null;
-      return current?.prewarmOwner === owner;
-    }) ?? false
-  );
+  return dbMeasure.measureSync("Renew prewarm slot", () => {
+    db.exec(
+      `UPDATE rooms SET prewarmLeaseUntilMs = ? WHERE id = ? AND prewarmOwner = ?`,
+      Date.now() + ttlMs,
+      room.id,
+      owner,
+    );
+    const current = db.raw<any>(
+      `SELECT prewarmOwner FROM rooms WHERE id = ? LIMIT 1`,
+      room.id,
+    )[0] || null;
+    return current?.prewarmOwner === owner;
+  }) ?? false;
 }
 
 export async function setPrewarmStage(owner: string, stage: PrewarmStage) {
@@ -432,14 +420,17 @@ export async function clearPrewarmSlot(owner?: string) {
   const room = await getRoomRow();
   if (owner && room.prewarmOwner !== owner) return false;
   return dbMeasure.measureSync("Clear prewarm slot", () =>
-    db.rooms.select().where({ id: room.id }).updateAll({
-      prewarmRoundId: null,
-      prewarmProposalId: null,
-      prewarmStartedAtMs: null,
-      prewarmStage: "idle",
-      prewarmOwner: null,
-      prewarmLeaseUntilMs: 0,
-    }),
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({
+        prewarmRoundId: null,
+        prewarmProposalId: null,
+        prewarmStartedAtMs: null,
+        prewarmStage: "idle",
+        prewarmOwner: null,
+        prewarmLeaseUntilMs: 0,
+      }),
   );
 }
 
@@ -448,14 +439,17 @@ export async function clearExpiredPrewarmSlot(now = Date.now()) {
   if (!room.prewarmOwner || Number(room.prewarmLeaseUntilMs || 0) > now)
     return false;
   return dbMeasure.measureSync("Clear expired prewarm slot", () =>
-    db.rooms.select().where({ id: room.id }).updateAll({
-      prewarmRoundId: null,
-      prewarmProposalId: null,
-      prewarmStartedAtMs: null,
-      prewarmStage: "idle",
-      prewarmOwner: null,
-      prewarmLeaseUntilMs: 0,
-    }),
+    db.rooms
+      .select()
+      .where({ id: room.id })
+      .updateAll({
+        prewarmRoundId: null,
+        prewarmProposalId: null,
+        prewarmStartedAtMs: null,
+        prewarmStage: "idle",
+        prewarmOwner: null,
+        prewarmLeaseUntilMs: 0,
+      }),
   );
 }
 
@@ -680,7 +674,8 @@ function loadRoundById(id: number): PromptRound | null {
     openedAtMs: Number(row.openedAtMs),
     votingStartedAtMs:
       row.votingStartedAtMs == null ? null : Number(row.votingStartedAtMs),
-    contestedAtMs: row.contestedAtMs == null ? null : Number(row.contestedAtMs),
+    contestedAtMs:
+      row.contestedAtMs == null ? null : Number(row.contestedAtMs),
     decisionMode,
     participantCount,
     closesAtMs: Number(row.closesAtMs || 0),
@@ -728,8 +723,8 @@ function armAutoTriggerForRound(
   });
   const contestedAtMs =
     round.decisionMode === "voting"
-      ? (round.contestedAtMs ?? now)
-      : (round.contestedAtMs ?? null);
+      ? round.contestedAtMs ?? now
+      : round.contestedAtMs ?? null;
   const startedAtMs = firstArm ? now : round.votingStartedAtMs;
 
   if (
@@ -972,10 +967,7 @@ async function roundForNewSuggestion() {
   // rendering, new submissions do not silently create a future auto-running
   // board. The next turn opens after the canonical clip is committed.
   const pending = nextPendingDirectiveWithVotes();
-  if (
-    pending &&
-    (pending.status === "queued" || pending.status === "generating")
-  )
+  if (pending && (pending.status === "queued" || pending.status === "generating"))
     throw new DecisionWindowClosedError(
       "The next episode is already being made. Wait for the next turn.",
     );
@@ -1664,6 +1656,28 @@ export async function triggerNextProposal(
           triggered: true,
         });
         if (!directive) throw new Error("Could not create winning directive");
+
+        if (selected.authorAddress && WINNER_REWARD_LAMPORTS > 0) {
+          const existingReward = db.raw<any>(
+            `SELECT id FROM ideaRewards WHERE roundId = ? AND proposalId = ? LIMIT 1`,
+            round.id,
+            selected.id,
+          )[0] || null;
+          if (!existingReward) {
+            const reward = db.ideaRewards.insert({
+              roundId: round.id,
+              proposalId: selected.id,
+              walletAddress: selected.authorAddress,
+              amountLamports: WINNER_REWARD_LAMPORTS,
+              status: "pending",
+              signature: null,
+              lastError: null,
+              claimedAtMs: null,
+              sentAtMs: null,
+            });
+            if (!reward) throw new Error("Could not enqueue winner reward");
+          }
+        }
 
         db.exec("COMMIT");
 

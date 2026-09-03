@@ -41,6 +41,12 @@ const indexes = [
    ON proposals(roundId, normalizedText)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS proposal_votes_round_voter_unique
    ON proposalVotes(roundId, voterKey)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS idea_rewards_round_proposal_unique
+   ON ideaRewards(roundId, proposalId)`,
+  `CREATE INDEX IF NOT EXISTS idea_rewards_wallet_idx
+   ON ideaRewards(walletAddress, id DESC)`,
+  `CREATE INDEX IF NOT EXISTS idea_rewards_status_idx
+   ON ideaRewards(status, id)`,
   `CREATE INDEX IF NOT EXISTS proposal_votes_round_handle_idx
    ON proposalVotes(roundId, voterHandle)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS proposals_round_web_owner_unique

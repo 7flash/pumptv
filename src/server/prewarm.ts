@@ -1,9 +1,4 @@
-import type {
-  Clip,
-  Directive,
-  PromptRound,
-  Resolution,
-} from "../shared/contracts.ts";
+import type { Clip, Directive, PromptRound, Resolution } from "../shared/contracts.ts";
 import {
   CandidateContinuityError,
   commitRenderedClipCandidate,
@@ -42,7 +37,9 @@ type PrewarmJob = {
 };
 
 export type PrewarmPromotion =
-  { kind: "none" } | { kind: "promoted"; clip: Clip } | { kind: "rejected" };
+  | { kind: "none" }
+  | { kind: "promoted"; clip: Clip }
+  | { kind: "rejected" };
 
 export class PrewarmController {
   readonly policy: PrewarmPolicy;
@@ -116,8 +113,7 @@ export class PrewarmController {
       return;
     }
     if (
-      normalizedDirective(proposal.text) !==
-      normalizedDirective(job.directiveText)
+      normalizedDirective(proposal.text) !== normalizedDirective(job.directiveText)
     ) {
       await this.retire(job, "speculated proposal text changed");
     }
@@ -165,18 +161,15 @@ export class PrewarmController {
     };
     this.job = job;
 
-    job.leaseHeartbeat = setInterval(
-      () => {
-        void renewPrewarmSlot(this.owner, this.policy.leaseTtlMs)
-          .then((stillOwned) => {
-            if (!stillOwned && !job.discarded) {
-              void this.retire(job, "prewarm lease lost").catch(() => {});
-            }
-          })
-          .catch(() => {});
-      },
-      Math.max(1_000, Math.floor(this.policy.leaseTtlMs / 3)),
-    );
+    job.leaseHeartbeat = setInterval(() => {
+      void renewPrewarmSlot(this.owner, this.policy.leaseTtlMs)
+        .then((stillOwned) => {
+          if (!stillOwned && !job.discarded) {
+            void this.retire(job, "prewarm lease lost").catch(() => {});
+          }
+        })
+        .catch(() => {});
+    }, Math.max(1_000, Math.floor(this.policy.leaseTtlMs / 3)));
 
     job.promise = prewarmMeasure
       .measure(
@@ -239,10 +232,7 @@ export class PrewarmController {
     const job = this.job;
     if (!directive || !job || job.discarded) return false;
     if (!this.matchesDirective(job, directive)) {
-      await this.retire(
-        job,
-        "locked winner differs from speculative candidate",
-      );
+      await this.retire(job, "locked winner differs from speculative candidate");
       return false;
     }
     return !job.candidate && !job.error;

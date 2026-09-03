@@ -104,6 +104,19 @@ const openedDb = dbMeasure.measureSync(
           participantKey: z.string().nullable().default(null),
           weight: z.number().default(1),
         }),
+        ideaRewards: z.object({
+          roundId: z.number(),
+          proposalId: z.number(),
+          walletAddress: z.string(),
+          amountLamports: z.number(),
+          status: z
+            .enum(["pending", "sending", "sent", "uncertain", "skipped"])
+            .default("pending"),
+          signature: z.string().nullable().default(null),
+          lastError: z.string().nullable().default(null),
+          claimedAtMs: z.number().nullable().default(null),
+          sentAtMs: z.number().nullable().default(null),
+        }),
         worldStateSnapshots: z.object({
           episode: z.number(),
           clipId: z.number(),

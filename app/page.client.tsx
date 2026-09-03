@@ -62,6 +62,20 @@ let participationError: string | null = null;
 let worldDetailId: string | null = null;
 let worldDetailKind: "location" | "character" | "prop" | null = null;
 
+type WinnerReward = {
+  proposalId: number;
+  amountSol: number;
+  status: "pending" | "sending" | "sent" | "uncertain" | "skipped";
+  signature: string | null;
+  lastError: string | null;
+  claimedAtMs?: number | null;
+  sentAtMs?: number | null;
+};
+let winnerReward: WinnerReward | null = null;
+let winnerNoticeProposalId: number | null = null;
+let winnerNoticeDismissed = false;
+let rewardPollAtMs = 0;
+
 type PhantomPublicKey = { toString(): string };
 type PhantomProvider = {
   isPhantom?: boolean;
@@ -138,6 +152,51 @@ function visibleClip() {
       ? null
       : timeline.find((clip) => clip.id === activeVideoClipId)) || desiredClip()
   );
+}
+
+function incomingLiveClipPending() {
+  if (replayClipId != null || liveSlotState !== "intermission") return false;
+  const latest = latestPublishedClip();
+  return Boolean(latest && latest.id !== activeVideoClipId);
+}
+
+function enterLiveIntermission(reason: string) {
+  if (replayClipId != null || liveSlotState === "intermission") return;
+  liveSlotState = "intermission";
+  mediaMeasure.measureSync("Enter live intermission", () => ({
+    reason,
+    clipId: activeVideoClipId,
+  }));
+  syncLocalUiState();
+  const active = videoNodes()[activeVideoSlot];
+  if (active) {
+    active.pause();
+    active.muted = true;
+  }
+  redraw();
+}
+
+function reconcileLiveEdge() {
+  if (
+    replayClipId != null ||
+    playbackPaused ||
+    liveSlotState === "intermission"
+  )
+    return;
+  const latest = latestPublishedClip();
+  if (!latest || latest.id !== activeVideoClipId || clipAfter(latest)) return;
+  const active = videoNodes()[activeVideoSlot];
+  if (!active) return;
+  const duration = Number.isFinite(active.duration)
+    ? active.duration
+    : latest.durationSeconds;
+  const atEnd =
+    active.ended ||
+    (active.paused &&
+      duration > 0 &&
+      active.currentTime >= Math.max(0, duration - 0.12));
+  if (atEnd)
+    enterLiveIntermission(active.ended ? "media-ended" : "edge-reconciled");
 }
 
 function clipAfter(clip: Clip | null) {
@@ -271,6 +330,21 @@ function applyState(state: StreamState) {
   nextDirective = state.nextDirective;
   program = state.program;
   worldState = state.worldState;
+  if (
+    walletAddress &&
+    state.program.directive?.proposalId &&
+    state.program.directive.authorAddress === walletAddress
+  ) {
+    const proposalId = state.program.directive.proposalId;
+    if (winnerNoticeProposalId !== proposalId) {
+      winnerNoticeProposalId = proposalId;
+      winnerNoticeDismissed =
+        sessionStorage.getItem(
+          `pumptv-reward-dismissed:${walletAddress}:${proposalId}`,
+        ) === "1";
+    }
+    void refreshWinnerReward();
+  }
   syncIdeaDraftFromBoard();
 
   if (initialCatchupPending) {
@@ -308,7 +382,13 @@ function phantomProvider(): PhantomProvider | null {
 
 function walletFromPublicKey(value?: PhantomPublicKey | null) {
   const address = value?.toString?.().trim() || "";
-  walletAddress = address || null;
+  const next = address || null;
+  if (walletAddress !== next) {
+    winnerReward = null;
+    winnerNoticeProposalId = null;
+    winnerNoticeDismissed = false;
+  }
+  walletAddress = next;
   walletState = walletAddress ? "connected" : "idle";
 }
 
@@ -323,10 +403,14 @@ function installPhantomEvents() {
     participationError = null;
     redraw();
     void refreshWalletScore();
+    void refreshWinnerReward();
   });
   provider.on("disconnect", () => {
     walletAddress = null;
     walletState = "idle";
+    winnerReward = null;
+    winnerNoticeProposalId = null;
+    winnerNoticeDismissed = false;
     redraw();
   });
   provider.on("accountChanged", (publicKey) => {
@@ -334,7 +418,10 @@ function installPhantomEvents() {
     walletTokenBalance = 0;
     walletPower = 1;
     redraw();
-    if (walletAddress) void refreshWalletScore();
+    if (walletAddress) {
+      void refreshWalletScore();
+      void refreshWinnerReward();
+    }
   });
 }
 
@@ -359,7 +446,10 @@ async function connectPhantom(interactive: boolean) {
     );
     walletFromPublicKey(result?.publicKey || provider.publicKey || null);
     redraw();
-    if (walletAddress) await refreshWalletScore();
+    if (walletAddress) {
+      await refreshWalletScore();
+      await refreshWinnerReward();
+    }
     return Boolean(walletAddress);
   } catch (cause: any) {
     walletAddress = null;
@@ -464,6 +554,35 @@ async function refreshWalletScore() {
   } finally {
     walletScoreLoading = false;
     redraw();
+  }
+}
+
+async function refreshWinnerReward() {
+  if (!walletAddress) return;
+  const address = walletAddress;
+  try {
+    const payload = await json<{ reward: WinnerReward | null }>(
+      `/api/rewards/mine?walletAddress=${encodeURIComponent(address)}`,
+      { cache: "no-store" },
+    );
+    if (walletAddress !== address) return;
+    winnerReward = payload.reward;
+    if (payload.reward) {
+      const recentSent =
+        payload.reward.status !== "sent" ||
+        !payload.reward.sentAtMs ||
+        Date.now() - payload.reward.sentAtMs < 10 * 60_000;
+      if (recentSent || winnerNoticeProposalId === payload.reward.proposalId) {
+        winnerNoticeProposalId = payload.reward.proposalId;
+        winnerNoticeDismissed =
+          sessionStorage.getItem(
+            `pumptv-reward-dismissed:${address}:${payload.reward.proposalId}`,
+          ) === "1";
+      }
+    }
+    redraw();
+  } catch {
+    // Reward status is non-critical viewer metadata. The worker owns payment.
   }
 }
 
@@ -913,7 +1032,12 @@ async function boot() {
 
   timer = setInterval(() => {
     syncVideoDeck();
+    reconcileLiveEdge();
     updateLiveMeters();
+    if (walletAddress && Date.now() - rewardPollAtMs >= 3_000) {
+      rewardPollAtMs = Date.now();
+      void refreshWinnerReward();
+    }
   }, 100);
 }
 
@@ -1513,18 +1637,9 @@ function handleDeckEnded(slot: number, clipId: number) {
     return;
   }
 
-  // Live TV is intentionally finite at the edge of the archive. Once the
-  // newest published episode ends we stop on its final painted frame and let
-  // the empty next-program slot carry voting / generation status. We never
-  // cover a still-playing episode with that UI and we never silently loop it.
-  liveSlotState = "intermission";
-  syncLocalUiState();
-  const active = videoNodes()[slot];
-  if (active) {
-    active.pause();
-    active.muted = true;
-  }
-  redraw();
+  // The `ended` event is the fast path. `reconcileLiveEdge()` is the fallback
+  // for browsers that miss it during a deck transition/background wake.
+  enterLiveIntermission("ended-event");
 }
 
 function togglePlayback() {
@@ -1675,7 +1790,20 @@ function installInteractionLayer() {
           syncLocalUiState();
         }
       } else if (action === "tray-toggle") toggleTray();
-      else if (action === "tray-ideas") openTray("ideas");
+      else if (action === "close-tray") {
+        if (trayOpen) {
+          trayOpen = false;
+          redraw();
+        }
+      } else if (action === "close-reward") {
+        winnerNoticeDismissed = true;
+        if (walletAddress && winnerNoticeProposalId)
+          sessionStorage.setItem(
+            `pumptv-reward-dismissed:${walletAddress}:${winnerNoticeProposalId}`,
+            "1",
+          );
+        redraw();
+      } else if (action === "tray-ideas") openTray("ideas");
       else if (action === "tray-world") openTray("world");
       else if (action === "wallet") void connectPhantom(true);
       else if (action === "submit-idea") void submitIdea();
@@ -1973,7 +2101,16 @@ function CandidateRows({
             tabIndex={interactive ? 0 : undefined}
           >
             <em>{index + 1}</em>
-            <div className="rankIdea">
+            <div
+              className="rankIdea"
+              data-rich-tooltip="1"
+              data-tooltip-kicker={`IDEA #${candidate.id}`}
+              data-tooltip-body={candidate.text}
+              data-tooltip-meta={authorLabel(
+                candidate.author,
+                candidate.authorAddress,
+              )}
+            >
               <span>{candidate.text}</span>
               <i>{authorLabel(candidate.author, candidate.authorAddress)}</i>
               <small
@@ -2522,7 +2659,13 @@ function ProposalCard({
       data-proposal-id={proposal.id}
     >
       <em className="proposalRank">{rank}</em>
-      <div className="persistentProposalText">
+      <div
+        className="persistentProposalText"
+        data-rich-tooltip="1"
+        data-tooltip-kicker={`IDEA #${proposal.id}`}
+        data-tooltip-body={proposal.text}
+        data-tooltip-meta={authorLabel(proposal.author, proposal.authorAddress)}
+      >
         <span>{proposal.text}</span>
         <i>
           <code>#{proposal.id}</code>
@@ -2829,6 +2972,16 @@ function ParticipationBoard() {
           type="button"
           data-action="tray-toggle"
           aria-label="Open suggestions and world state"
+          data-rich-tooltip={leader ? "1" : undefined}
+          data-tooltip-kicker={
+            leader ? `LEADING IDEA #${leader.id}` : undefined
+          }
+          data-tooltip-body={leader?.text}
+          data-tooltip-meta={
+            leader
+              ? authorLabel(leader.author, leader.authorAddress)
+              : undefined
+          }
         >
           {leader ? (
             <>
@@ -2882,6 +3035,15 @@ function ParticipationBoard() {
         ) : null}
       </div>
 
+      {trayOpen ? (
+        <button
+          type="button"
+          className="participationShade"
+          data-action="close-tray"
+          aria-label="Close participation panel"
+        />
+      ) : null}
+
       <div className="participationSheet" aria-hidden={!trayOpen}>
         <div className="drawerGrab" aria-hidden="true">
           <i />
@@ -2898,7 +3060,12 @@ function ParticipationBoard() {
 }
 
 function YourTurnOverlay() {
-  if (replayClipId != null || liveSlotState !== "intermission" || !program)
+  if (
+    replayClipId != null ||
+    liveSlotState !== "intermission" ||
+    incomingLiveClipPending() ||
+    !program
+  )
     return null;
 
   // Once the decision closes, the center of the TV stops being an interaction
@@ -2954,15 +3121,16 @@ function YourTurnOverlay() {
 function GenerationPulse() {
   if (replayClipId != null || liveSlotState !== "intermission" || !program)
     return null;
-  if (
-    program.phase !== "locked" &&
-    program.phase !== "planning" &&
-    program.phase !== "rendering" &&
-    program.phase !== "finalizing" &&
-    program.phase !== "ready"
-  )
-    return null;
-  const label = program.phase === "ready" ? "LOADING" : "GENERATING";
+  const mediaLoading = incomingLiveClipPending();
+  const serverBusy =
+    program.phase === "locked" ||
+    program.phase === "planning" ||
+    program.phase === "rendering" ||
+    program.phase === "finalizing" ||
+    program.phase === "ready";
+  if (!mediaLoading && !serverBusy) return null;
+  const label =
+    mediaLoading || program.phase === "ready" ? "LOADING" : "GENERATING";
   return (
     <div
       className="generationPulse"
@@ -2972,6 +3140,38 @@ function GenerationPulse() {
       <i aria-hidden="true" />
       <span>{label}</span>
     </div>
+  );
+}
+
+function WinnerRewardNotice() {
+  if (!walletAddress || !winnerNoticeProposalId || winnerNoticeDismissed)
+    return null;
+  const reward =
+    winnerReward?.proposalId === winnerNoticeProposalId ? winnerReward : null;
+  const amount = reward?.amountSol ?? 0.01;
+  const status =
+    reward?.status === "sent"
+      ? "SENT"
+      : reward?.status === "uncertain"
+        ? "PAYMENT PENDING"
+        : "SENDING";
+  return (
+    <aside
+      className={`winnerRewardNotice ${reward?.status || "pending"}`}
+      role="status"
+      aria-live="polite"
+    >
+      <button
+        type="button"
+        data-action="close-reward"
+        aria-label="Dismiss reward notification"
+      >
+        ×
+      </button>
+      <b>YOUR IDEA WON</b>
+      <strong>{amount.toFixed(2)} SOL</strong>
+      <span>{status}</span>
+    </aside>
   );
 }
 
@@ -6125,6 +6325,91 @@ function OutsideInterfaceStyles() {
         to { opacity: 1; transform: scale(1.08); }
       }
 
+      /* v47: one readable participation surface, no nested mini-scrolls. */
+      .participationShade {
+        position: fixed;
+        inset: 0;
+        z-index: 109;
+        border: 0;
+        padding: 0;
+        background: rgba(0,0,0,.26);
+        cursor: default;
+      }
+      .participationBoard.open .participationSheet {
+        z-index: 110 !important;
+      }
+      .persistentProposal {
+        align-items: start !important;
+      }
+      .persistentProposalText {
+        min-width: 0 !important;
+        cursor: help;
+      }
+      .persistentProposalText > span {
+        display: block !important;
+        white-space: normal !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        overflow-wrap: anywhere !important;
+        word-break: break-word !important;
+      }
+      .persistentThreads {
+        max-height: none !important;
+        overflow: visible !important;
+        padding-right: 0 !important;
+        scrollbar-width: auto !important;
+      }
+      .persistentThreadRow > span {
+        overflow-wrap: anywhere !important;
+      }
+      .winnerRewardNotice {
+        position: fixed;
+        left: 50%;
+        top: max(18px, env(safe-area-inset-top));
+        z-index: 180;
+        transform: translateX(-50%);
+        min-width: min(330px, calc(100vw - 28px));
+        display: grid;
+        grid-template-columns: 1fr auto;
+        gap: 5px 14px;
+        padding: 13px 38px 13px 14px;
+        border: 1px solid rgba(226,185,83,.28);
+        border-radius: 14px;
+        background: rgba(10,11,13,.94);
+        box-shadow: 0 18px 48px rgba(0,0,0,.46), inset 0 1px rgba(255,255,255,.05);
+        backdrop-filter: blur(18px);
+      }
+      .winnerRewardNotice > button {
+        position: absolute;
+        right: 9px;
+        top: 8px;
+        width: 24px;
+        height: 24px;
+        border: 0;
+        background: transparent;
+        color: rgba(255,255,255,.52);
+        font-size: 18px;
+        cursor: pointer;
+      }
+      .winnerRewardNotice > b {
+        grid-column: 1 / -1;
+        color: var(--pump-gold-hi);
+        font: 800 9px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: .16em;
+      }
+      .winnerRewardNotice > strong {
+        color: rgba(249,249,244,.98);
+        font: 820 18px/1.05 ui-monospace, SFMono-Regular, Menlo, monospace;
+      }
+      .winnerRewardNotice > span {
+        align-self: end;
+        color: rgba(235,235,230,.52);
+        font: 720 8px/1 ui-monospace, SFMono-Regular, Menlo, monospace;
+        letter-spacing: .1em;
+      }
+      .winnerRewardNotice.sent { border-color: rgba(140,215,158,.28); }
+      .winnerRewardNotice.uncertain { border-color: rgba(225,165,96,.34); }
+
       @media (max-width: 820px) {
         html, body, #pumptv-page {
           min-height: 100dvh !important;
@@ -6229,6 +6514,54 @@ function OutsideInterfaceStyles() {
           z-index: 120 !important;
           border-radius: 18px !important;
         }
+        .participationShade {
+          z-index: 119 !important;
+          background: rgba(0,0,0,.52) !important;
+          backdrop-filter: blur(2px);
+        }
+        .participationBoard.open .participationSheet { z-index: 120 !important; }
+        .participationSheet {
+          overflow: hidden !important;
+        }
+        .participationColumns {
+          display: block !important;
+          height: 100% !important;
+          min-height: 0 !important;
+          overflow-y: auto !important;
+          overflow-x: hidden !important;
+          overscroll-behavior: contain !important;
+          -webkit-overflow-scrolling: touch;
+          padding-bottom: max(16px, env(safe-area-inset-bottom)) !important;
+        }
+        .persistentWorld,
+        .persistentIdeas {
+          min-height: auto !important;
+          overflow: visible !important;
+        }
+        .persistentWorld {
+          border-bottom: 1px solid rgba(255,255,255,.07) !important;
+        }
+        .persistentThreads {
+          max-height: none !important;
+          overflow: visible !important;
+        }
+        .persistentIdeaForm {
+          position: sticky !important;
+          top: 0 !important;
+          z-index: 4 !important;
+        }
+        .persistentProposal {
+          grid-template-columns: 22px minmax(0,1fr) auto !important;
+          gap: 7px !important;
+        }
+        .persistentProposalText > span {
+          font-size: 12px !important;
+          line-height: 1.35 !important;
+        }
+        .winnerRewardNotice {
+          top: max(10px, env(safe-area-inset-top)) !important;
+          min-width: calc(100vw - 20px) !important;
+        }
         .knobControl { width: 42px !important; height: 32px !important; min-width: 42px !important; min-height: 32px !important; }
         .participationBoard {
           width: calc(100vw - 24px);
@@ -6294,6 +6627,7 @@ function App() {
           <TactileTV clip={clip} />
         </div>
         <ParticipationBoard />
+        <WinnerRewardNotice />
         {error ? (
           <div
             className="fatalBadge"

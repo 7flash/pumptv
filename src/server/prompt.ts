@@ -20,6 +20,7 @@ export type ShotPlan = {
   endingBeat: string;
 };
 
+
 function regexEscape(value: string) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
@@ -74,9 +75,7 @@ export function sanitizeShotPlanForH3(input: {
   factOverlayText?: string | null;
   factKeyframeProvided?: boolean;
 }): ShotPlan {
-  const preserveRequestedTypography = explicitTypographyRequest(
-    input.directive,
-  );
+  const preserveRequestedTypography = explicitTypographyRequest(input.directive);
   const cleanMotionField = (value: string) => {
     let next = redactExactFact(value, input.factOverlayText);
     if (!preserveRequestedTypography) next = suppressIncidentalTypography(next);
