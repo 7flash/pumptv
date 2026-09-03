@@ -32,6 +32,15 @@ auto_trigger_min_ms = 8000
 auto_trigger_idea_step_ms = 2000
 auto_trigger_vote_step_ms = 1000
 
+# Latency hiding. A speculative render never closes voting or mutates canon; it
+# is promoted only if the exact proposal/text actually wins. Solo rounds can
+# prewarm immediately for the full 20s head start. In already-contested rounds,
+# begin at most one speculative render when the ballot is near closing.
+prewarm_enabled = 1
+prewarm_solo_immediate = 1
+prewarm_voting_lead_ms = 12000
+prewarm_lease_ttl_ms = 30000
+
 # Browser state transport uses long polling. Only meaningful changes trigger a
 # full measured state query; idle requests return after the timeout.
 long_poll_check_ms = 400

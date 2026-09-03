@@ -8,6 +8,7 @@ import type {
   PumpChatState,
   PromptProposal,
   PromptRound,
+  PrewarmStage,
   Resolution,
   RoomState,
   StreamState,
@@ -196,6 +197,14 @@ function toRoom(
       row.generationStartedAtMs == null
         ? null
         : Number(row.generationStartedAtMs),
+    prewarm: {
+      roundId: row.prewarmRoundId == null ? null : Number(row.prewarmRoundId),
+      proposalId:
+        row.prewarmProposalId == null ? null : Number(row.prewarmProposalId),
+      stage: (row.prewarmStage || "idle") as PrewarmStage,
+      startedAtMs:
+        row.prewarmStartedAtMs == null ? null : Number(row.prewarmStartedAtMs),
+    },
     lastError: row.lastError ?? null,
     bufferedUntilMs,
     buffer:
@@ -339,6 +348,135 @@ export async function setGenerationStage(stage: GenerationStage) {
       .select()
       .where({ id: room.id })
       .updateAll({ generationStage: stage }),
+  );
+}
+
+export async function claimPrewarmSlot(input: {
+  owner: string;
+  roundId: number;
+  proposalId: number;
+  ttlMs: number;
+}) {
+  return (
+    dbMeasure.measureSync(
+      {
+        start: () => `Claim prewarm #${input.proposalId}`,
+        end: (claimed) => ({
+          claimed,
+          roundId: input.roundId,
+          proposalId: input.proposalId,
+        }),
+      },
+      () => {
+        const now = Date.now();
+        db.exec("BEGIN IMMEDIATE");
+        try {
+          const room =
+            db.raw<any>(
+              `SELECT * FROM rooms WHERE name = ? ORDER BY id ASC LIMIT 1`,
+              ROOM_NAME,
+            )[0] || null;
+          if (!room) {
+            db.exec("COMMIT");
+            return false;
+          }
+          if (
+            room.prewarmOwner &&
+            room.prewarmOwner !== input.owner &&
+            Number(room.prewarmLeaseUntilMs || 0) > now
+          ) {
+            db.exec("COMMIT");
+            return false;
+          }
+          db.exec(
+            `UPDATE rooms
+           SET prewarmOwner = ?, prewarmLeaseUntilMs = ?,
+               prewarmRoundId = ?, prewarmProposalId = ?,
+               prewarmStartedAtMs = ?, prewarmStage = 'planning'
+           WHERE id = ?`,
+            input.owner,
+            now + input.ttlMs,
+            input.roundId,
+            input.proposalId,
+            now,
+            room.id,
+          );
+          db.exec("COMMIT");
+          return true;
+        } catch (error) {
+          try {
+            db.exec("ROLLBACK");
+          } catch {}
+          throw error;
+        }
+      },
+    ) ?? false
+  );
+}
+
+export async function renewPrewarmSlot(owner: string, ttlMs: number) {
+  const room = await getRoomRow();
+  return (
+    dbMeasure.measureSync("Renew prewarm slot", () => {
+      db.exec(
+        `UPDATE rooms SET prewarmLeaseUntilMs = ? WHERE id = ? AND prewarmOwner = ?`,
+        Date.now() + ttlMs,
+        room.id,
+        owner,
+      );
+      const current =
+        db.raw<any>(
+          `SELECT prewarmOwner FROM rooms WHERE id = ? LIMIT 1`,
+          room.id,
+        )[0] || null;
+      return current?.prewarmOwner === owner;
+    }) ?? false
+  );
+}
+
+export async function setPrewarmStage(owner: string, stage: PrewarmStage) {
+  const room = await getRoomRow();
+  return dbMeasure.measureSync(
+    {
+      start: () => `Set prewarm stage · ${stage}`,
+      end: () => ({ stage }),
+    },
+    () =>
+      db.rooms
+        .select()
+        .where({ id: room.id, prewarmOwner: owner } as any)
+        .updateAll({ prewarmStage: stage }),
+  );
+}
+
+export async function clearPrewarmSlot(owner?: string) {
+  const room = await getRoomRow();
+  if (owner && room.prewarmOwner !== owner) return false;
+  return dbMeasure.measureSync("Clear prewarm slot", () =>
+    db.rooms.select().where({ id: room.id }).updateAll({
+      prewarmRoundId: null,
+      prewarmProposalId: null,
+      prewarmStartedAtMs: null,
+      prewarmStage: "idle",
+      prewarmOwner: null,
+      prewarmLeaseUntilMs: 0,
+    }),
+  );
+}
+
+export async function clearExpiredPrewarmSlot(now = Date.now()) {
+  const room = await getRoomRow();
+  if (!room.prewarmOwner || Number(room.prewarmLeaseUntilMs || 0) > now)
+    return false;
+  return dbMeasure.measureSync("Clear expired prewarm slot", () =>
+    db.rooms.select().where({ id: room.id }).updateAll({
+      prewarmRoundId: null,
+      prewarmProposalId: null,
+      prewarmStartedAtMs: null,
+      prewarmStage: "idle",
+      prewarmOwner: null,
+      prewarmLeaseUntilMs: 0,
+    }),
   );
 }
 
@@ -1816,6 +1954,22 @@ export async function claimQueuedDirective(episode: number) {
   return toDirective({ ...queued, status: "generating", usedEpisode: episode });
 }
 
+export async function peekQueuedDirective(): Promise<Directive | null> {
+  const row = await dbMeasure.measureSync(
+    "Peek explicitly triggered directive",
+    () =>
+      db.raw<any>(
+        `SELECT * FROM directives
+         WHERE status = 'queued'
+           AND COALESCE(triggered, 0) = 1
+           AND sourceId LIKE 'trigger:%'
+         ORDER BY id ASC
+         LIMIT 1`,
+      )[0] || null,
+  );
+  return row ? toDirective(row) : null;
+}
+
 export async function hasQueuedDirective() {
   const row = await dbMeasure.measureSync(
     "Check explicitly triggered directive",
@@ -2032,67 +2186,142 @@ export async function nextEpisode() {
   return row ? Number((row as any).episode) + 1 : 0;
 }
 
-export async function saveClipWithWorldState(
-  input: Omit<
-    Clip,
-    | "id"
-    | "directiveSource"
-    | "directiveAuthor"
-    | "directiveAuthorAddress"
-    | "directiveProposalId"
-    | "directiveVoteCount"
-  >,
+type PersistedClipInput = Omit<
+  Clip,
+  | "id"
+  | "directiveSource"
+  | "directiveAuthor"
+  | "directiveAuthorAddress"
+  | "directiveProposalId"
+  | "directiveVoteCount"
+>;
+
+type SnapshotMeta = {
+  plannedWorldState?: WorldState | null;
+  audit?: Omit<WorldStateAudit, "episode"> | null;
+};
+
+export class ClipCommitConflictError extends Error {}
+
+function latestClipIdentity() {
+  const row =
+    db.raw<any>(
+      `SELECT id, episode FROM clips ORDER BY episode DESC, id DESC LIMIT 1`,
+    )[0] || null;
+  return {
+    id: row == null ? null : Number(row.id),
+    episode: row == null ? null : Number(row.episode),
+  };
+}
+
+function persistClipTransaction(
+  input: PersistedClipInput,
   worldState: WorldState,
-  snapshotMeta?: {
-    plannedWorldState?: WorldState | null;
-    audit?: Omit<WorldStateAudit, "episode"> | null;
-  },
+  snapshotMeta: SnapshotMeta | undefined,
+  expected?: { episode: number; previousClipId: number | null },
+) {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    if (expected) {
+      const latest = latestClipIdentity();
+      const nextEpisode = latest.episode == null ? 0 : latest.episode + 1;
+      if (
+        nextEpisode !== expected.episode ||
+        latest.id !== expected.previousClipId
+      ) {
+        throw new ClipCommitConflictError(
+          `Clip continuity changed before commit: expected EP ${expected.episode + 1} after clip ${expected.previousClipId ?? "opening"}, now EP ${nextEpisode + 1} after clip ${latest.id ?? "opening"}.`,
+        );
+      }
+    }
+
+    const clipRow = db.clips.insert(input);
+    if (!clipRow) throw new Error("Failed to persist generated clip");
+
+    const audit = snapshotMeta?.audit ?? null;
+    const snapshot = db.worldStateSnapshots.insert({
+      episode: input.episode,
+      clipId: Number((clipRow as any).id),
+      stateJson: JSON.stringify(worldState),
+      plannedStateJson: snapshotMeta?.plannedWorldState
+        ? JSON.stringify(snapshotMeta.plannedWorldState)
+        : null,
+      showrunnerModel: input.showrunnerModel ?? null,
+      reconciliationJson: audit
+        ? JSON.stringify({
+            status: audit.status,
+            model: audit.model,
+            summary: audit.summary,
+            drift: audit.drift,
+            sampledFrameUrls: audit.sampledFrameUrls,
+          })
+        : null,
+      reconcilerModel: audit?.model ?? null,
+      reconcilerInputTokens: audit?.inputTokens ?? null,
+      reconcilerOutputTokens: audit?.outputTokens ?? null,
+      reconcilerCost: audit?.cost ?? null,
+    });
+    if (!snapshot) throw new Error("Failed to persist world state snapshot");
+
+    if (expected && input.directiveId != null) {
+      const directive =
+        db.raw<any>(
+          `SELECT id, status, usedEpisode FROM directives WHERE id = ? LIMIT 1`,
+          input.directiveId,
+        )[0] || null;
+      if (
+        !directive ||
+        directive.status !== "generating" ||
+        Number(directive.usedEpisode) !== expected.episode
+      ) {
+        throw new ClipCommitConflictError(
+          `Directive #${input.directiveId} is no longer the generating owner of EP ${expected.episode + 1}.`,
+        );
+      }
+      db.exec(
+        `UPDATE directives SET status = 'used' WHERE id = ?`,
+        input.directiveId,
+      );
+    }
+
+    db.exec("COMMIT");
+    return clipRow;
+  } catch (error) {
+    try {
+      db.exec("ROLLBACK");
+    } catch {}
+    throw error;
+  }
+}
+
+export async function saveClipWithWorldState(
+  input: PersistedClipInput,
+  worldState: WorldState,
+  snapshotMeta?: SnapshotMeta,
 ) {
   const row = await dbMeasure.measureSync(
     "Persist generated scene + reconciled world state",
-    () => {
-      db.exec("BEGIN IMMEDIATE");
-      try {
-        const clipRow = db.clips.insert(input);
-        if (!clipRow) throw new Error("Failed to persist generated clip");
-
-        const audit = snapshotMeta?.audit ?? null;
-        const snapshot = db.worldStateSnapshots.insert({
-          episode: input.episode,
-          clipId: Number((clipRow as any).id),
-          stateJson: JSON.stringify(worldState),
-          plannedStateJson: snapshotMeta?.plannedWorldState
-            ? JSON.stringify(snapshotMeta.plannedWorldState)
-            : null,
-          showrunnerModel: input.showrunnerModel ?? null,
-          reconciliationJson: audit
-            ? JSON.stringify({
-                status: audit.status,
-                model: audit.model,
-                summary: audit.summary,
-                drift: audit.drift,
-                sampledFrameUrls: audit.sampledFrameUrls,
-              })
-            : null,
-          reconcilerModel: audit?.model ?? null,
-          reconcilerInputTokens: audit?.inputTokens ?? null,
-          reconcilerOutputTokens: audit?.outputTokens ?? null,
-          reconcilerCost: audit?.cost ?? null,
-        });
-        if (!snapshot)
-          throw new Error("Failed to persist world state snapshot");
-
-        db.exec("COMMIT");
-        return clipRow;
-      } catch (error) {
-        try {
-          db.exec("ROLLBACK");
-        } catch {}
-        throw error;
-      }
-    },
+    () => persistClipTransaction(input, worldState, snapshotMeta),
   );
+  return toClip(row);
+}
 
+export async function saveClipWithWorldStateIfCurrent(
+  input: PersistedClipInput,
+  worldState: WorldState,
+  snapshotMeta: SnapshotMeta | undefined,
+  expected: { episode: number; previousClipId: number | null },
+) {
+  const row = await dbMeasure.measureSync(
+    {
+      start: () => `Commit EP ${expected.episode + 1} if continuity matches`,
+      end: (value) => ({
+        clipId: Number((value as any).id),
+        episode: expected.episode + 1,
+      }),
+    },
+    () => persistClipTransaction(input, worldState, snapshotMeta, expected),
+  );
   return toClip(row);
 }
 

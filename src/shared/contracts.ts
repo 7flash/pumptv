@@ -3,6 +3,7 @@ export type DirectiveStatus = "queued" | "generating" | "used";
 export type DirectiveSource = "web" | "pumpfun";
 export type WorkerState = "idle" | "generating" | "error";
 export type GenerationStage = "idle" | "planning" | "rendering" | "finalizing";
+export type PrewarmStage = GenerationStage | "ready";
 export type GenerationMode = "full" | "fast" | "emergency";
 export type BufferHealthState = "healthy" | "tight" | "critical" | "empty";
 export type PumpChatState =
@@ -185,6 +186,13 @@ export type ManagedWorkerStatus = {
   checkedAtMs: number;
 };
 
+export type PrewarmState = {
+  roundId: number | null;
+  proposalId: number | null;
+  stage: PrewarmStage;
+  startedAtMs: number | null;
+};
+
 export type RoomState = {
   name: string;
   running: boolean;
@@ -196,6 +204,7 @@ export type RoomState = {
   webHeartbeatAtMs: number | null;
   generationStage: GenerationStage;
   generationStartedAtMs: number | null;
+  prewarm: PrewarmState;
   lastError: string | null;
   bufferedUntilMs: number | null;
   buffer: BufferHealth;

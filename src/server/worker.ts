@@ -1,18 +1,22 @@
 import { hostname } from "node:os";
-import { generateNextClip } from "./generate.ts";
+import type { Directive } from "../shared/contracts.ts";
+import { generateClaimedClip } from "./generate.ts";
 import { classifyGenerationFailure } from "./generation-recovery.ts";
 import { acquireRoomLease, releaseRoomLease, renewRoomLease } from "./lease.ts";
 import { workerMeasure } from "./observability.ts";
 import { dbPath } from "./db.ts";
+import { PrewarmController } from "./prewarm.ts";
 import {
   autoTriggerNextProposalIfDue,
+  claimQueuedDirective,
+  clearExpiredPrewarmSlot,
   clearGenerationPause,
   ensureOpenPromptRound,
   getLatestClip,
   getRoomRow,
-  getOpenPromptRound,
   hasQueuedDirective,
   nextEpisode,
+  peekQueuedDirective,
   recoverGeneratingDirectives,
   setGenerationPause,
   setWorkerState,
@@ -40,7 +44,26 @@ const WORKER_HEARTBEAT_MS = Math.max(
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 const owner = `${hostname()}:${process.pid}:${crypto.randomUUID().slice(0, 8)}`;
+const prewarm = new PrewarmController(`prewarm:${owner}`);
 let stopping = false;
+
+async function maybeAutoLock(now = Date.now()) {
+  let queued = await hasQueuedDirective();
+  if (!queued) {
+    const automatic = await autoTriggerNextProposalIfDue(now);
+    queued = Boolean(automatic) || (await hasQueuedDirective());
+  }
+  return queued;
+}
+
+async function waitForPrewarmIfWinnerIsAlreadyRendering(
+  queuedDirective: Directive | null,
+) {
+  if (!(await prewarm.shouldWaitForLockedDirective(queuedDirective)))
+    return false;
+  await setWorkerState("idle", null, "full");
+  return true;
+}
 
 async function generationTick() {
   await touchWorkerHeartbeat();
@@ -73,6 +96,7 @@ async function generationTick() {
 
   if (room.generationPauseKind === "config") await clearGenerationPause();
   if (!room.running) {
+    await prewarm.stop("room stopped");
     await setWorkerState("idle", null, "full");
     return { generated: false, sleepMs: 1_000 };
   }
@@ -97,17 +121,27 @@ async function generationTick() {
     // Viewers can start suggesting EP 2 while the opening is still rendering.
     await ensureOpenPromptRound(1);
   } else {
-    let queued = await hasQueuedDirective();
-    if (!queued) {
-      const automatic = await autoTriggerNextProposalIfDue(now);
-      queued = Boolean(automatic) || (await hasQueuedDirective());
+    const queued = await maybeAutoLock(now);
+    const queuedDirective = queued ? await peekQueuedDirective() : null;
+
+    if (await waitForPrewarmIfWinnerIsAlreadyRendering(queuedDirective)) {
+      return { generated: false, sleepMs: Math.min(IDLE_POLL_MS, 250) };
     }
+
     if (!queued) {
-      await ensureOpenPromptRound(await nextEpisode());
+      const round = await ensureOpenPromptRound(await nextEpisode());
+      await prewarm.syncWithOpenRound(round);
+      await prewarm.maybeStart({
+        round,
+        previousClip: latest,
+        resolution: room.resolution,
+        now,
+      });
       await setWorkerState("idle", null, "full");
       return { generated: false, sleepMs: IDLE_POLL_MS };
     }
-    // Never render more than one episode ahead of the published/live edge.
+
+    // Never publish more than one episode ahead of the published/live edge.
     if (latest.startsAtMs > Date.now()) {
       await setWorkerState("idle", null, "full");
       return {
@@ -141,42 +175,97 @@ async function generationTick() {
     const lockedLatest = await getLatestClip();
     const lockedOpening = !lockedLatest;
     if (!lockedRoom.running) return { generated: false, sleepMs: IDLE_POLL_MS };
+
+    let queuedDirective: Directive | null = null;
     if (!lockedOpening) {
-      let queued = await hasQueuedDirective();
-      if (!queued) {
-        const automatic = await autoTriggerNextProposalIfDue();
-        queued = Boolean(automatic) || (await hasQueuedDirective());
-      }
+      const queued = await maybeAutoLock();
       if (!queued) {
         await setWorkerState("idle", null, "full");
         return { generated: false, sleepMs: IDLE_POLL_MS };
+      }
+
+      queuedDirective = await peekQueuedDirective();
+      if (await waitForPrewarmIfWinnerIsAlreadyRendering(queuedDirective)) {
+        return { generated: false, sleepMs: Math.min(IDLE_POLL_MS, 250) };
       }
       if (lockedLatest.startsAtMs > Date.now())
         return { generated: false, sleepMs: IDLE_POLL_MS };
     }
 
     const episode = await nextEpisode();
-    await setWorkerState("generating", null, "full");
-
     let clip;
+
     try {
-      clip = await workerMeasure.measure(
-        {
-          start: () =>
-            `Generate EP ${episode + 1} · ${lockedRoom.resolution} · ${lockedOpening ? "opening" : "triggered proposal"}`,
-          end: (result) => ({
-            episode: result.episode + 1,
-            totalMs: result.totalGenerationMs ?? null,
-            directive: result.directive,
-          }),
-        },
-        () =>
-          generateNextClip({
-            previousClip: lockedLatest,
-            resolution: lockedRoom.resolution,
-            mode: "full",
-          }),
-      );
+      if (lockedOpening) {
+        await setWorkerState("generating", null, "full");
+        clip = await workerMeasure.measure(
+          {
+            start: () =>
+              `Generate EP ${episode + 1} · ${lockedRoom.resolution} · opening`,
+            end: (result) => ({
+              episode: result.episode + 1,
+              totalMs: result.totalGenerationMs ?? null,
+              directive: result.directive,
+            }),
+          },
+          () =>
+            generateClaimedClip({
+              previousClip: null,
+              resolution: lockedRoom.resolution,
+              mode: "full",
+              episode,
+              directive: null,
+            }),
+        );
+      } else {
+        const claimed = await claimQueuedDirective(episode);
+        if (!claimed)
+          throw new Error(
+            "No triggered proposal is queued for the next episode.",
+          );
+
+        let usedPrewarm = false;
+        clip = await workerMeasure.measure(
+          {
+            start: () =>
+              `Resolve EP ${episode + 1} · ${lockedRoom.resolution} · proposal #${claimed.proposalId ?? "?"}`,
+            end: (result) => ({
+              episode: result.episode + 1,
+              totalMs: result.totalGenerationMs ?? null,
+              directive: result.directive,
+              prewarmed: usedPrewarm,
+            }),
+          },
+          async () => {
+            const promotion = await prewarm.promoteIfReady({
+              episode,
+              claimed,
+            });
+            if (promotion.kind === "promoted") {
+              usedPrewarm = true;
+              return promotion.clip;
+            }
+
+            const canonicalDirective =
+              promotion.kind === "rejected"
+                ? await claimQueuedDirective(episode)
+                : claimed;
+            if (!canonicalDirective)
+              throw new Error(
+                "Locked directive disappeared before canonical generation",
+              );
+
+            await setWorkerState("generating", null, "full");
+            return generateClaimedClip({
+              previousClip: lockedLatest,
+              resolution: lockedRoom.resolution,
+              mode: "full",
+              episode,
+              directive: canonicalDirective,
+            });
+          },
+        );
+      }
     } catch (error) {
       const failures = Number(lockedRoom.generationFailureCount || 0) + 1;
       const recovery = classifyGenerationFailure(error, failures);
@@ -219,6 +308,8 @@ async function generationTick() {
 }
 
 export async function runRoomWorker() {
+  await clearExpiredPrewarmSlot();
+
   workerMeasure.measureSync(
     {
       start: () => `PumpTV worker ${owner}`,
@@ -230,6 +321,7 @@ export async function runRoomWorker() {
       db: dbPath,
       fal: (process.env.FAL_KEY || "").trim() ? "present" : "missing",
       jsxAI: `${process.env.JSX_AI_RUNTIME || "default"}/${process.env.JSX_AI_MODEL || "runtime-default"}`,
+      prewarm: prewarm.policy,
     }),
   );
 
@@ -250,10 +342,12 @@ export async function runRoomWorker() {
     }
   }
 
+  await prewarm.stop();
   releaseRoomLease(owner);
 }
 
 export function stopRoomWorker() {
   stopping = true;
+  prewarm.stopSoon();
   releaseRoomLease(owner);
 }

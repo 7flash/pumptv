@@ -33,6 +33,14 @@ const openedDb = dbMeasure.measureSync(
             .enum(["idle", "planning", "rendering", "finalizing"])
             .default("idle"),
           generationStartedAtMs: z.number().nullable().default(null),
+          prewarmRoundId: z.number().nullable().default(null),
+          prewarmProposalId: z.number().nullable().default(null),
+          prewarmStartedAtMs: z.number().nullable().default(null),
+          prewarmStage: z
+            .enum(["idle", "planning", "rendering", "finalizing", "ready"])
+            .default("idle"),
+          prewarmOwner: z.string().nullable().default(null),
+          prewarmLeaseUntilMs: z.number().default(0),
           generationMode: z.enum(["full", "fast", "emergency"]).default("full"),
           generationPauseKind: z
             .enum(["config", "cooldown", "funds", "rate_limit", "provider"])

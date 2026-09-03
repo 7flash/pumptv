@@ -81,6 +81,7 @@ function lightKey() {
     db.raw<any>(
       `SELECT running, resolution, workerState, lastError,
               heartbeatAtMs, generationStage, generationStartedAtMs,
+              prewarmRoundId, prewarmProposalId, prewarmStage, prewarmStartedAtMs,
               generationMode, generationPauseKind, generationPauseReason,
               generationRetryAtMs, generationFailureCount
        FROM rooms
@@ -109,6 +110,10 @@ function lightKey() {
       room.generationStartedAtMs == null
         ? null
         : Number(room.generationStartedAtMs),
+      room.prewarmRoundId == null ? null : Number(room.prewarmRoundId),
+      room.prewarmProposalId == null ? null : Number(room.prewarmProposalId),
+      room.prewarmStage || "idle",
+      room.prewarmStartedAtMs == null ? null : Number(room.prewarmStartedAtMs),
       room.generationMode || null,
       room.generationPauseKind || null,
       room.generationPauseReason || null,

@@ -2964,6 +2964,13 @@ function YourTurnOverlay() {
     program.phase === "offline" ||
     program.phase === "setup" ||
     program.phase === "paused";
+  const prewarming = Boolean(
+    !busy &&
+    round &&
+    room?.prewarm?.roundId === round.id &&
+    room?.prewarm?.proposalId === round.proposals[0]?.id &&
+    room?.prewarm?.stage !== "idle",
+  );
 
   return (
     <div className={`yourTurnOverlay ${busy ? "busy" : "choose"}`}>
@@ -2989,6 +2996,9 @@ function YourTurnOverlay() {
             <>
               {decisionMode === "voting" ? "Voting ends in" : "Locks in in"}{" "}
               <b data-your-turn-countdown>{countdown}</b>
+              {prewarming ? (
+                <span className="yourTurnPrep"> · episode prep started</span>
+              ) : null}
             </>
           ) : busy && ideas ? (
             <>
@@ -6114,6 +6124,7 @@ function OutsideInterfaceStyles() {
         font: 650 10px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
       }
       .yourTurnMeta b { color: var(--pump-gold-hi); font-variant-numeric: tabular-nums; }
+      .yourTurnPrep { color: rgba(255,255,255,.68); font-style: normal; white-space: nowrap; }
       .yourTurnCard > button {
         min-height: 38px;
         margin-top: 2px;

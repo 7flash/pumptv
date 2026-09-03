@@ -349,6 +349,10 @@ function statusLines(state: StreamState, now = Date.now()) {
     lines.push(
       `generation: ${state.room.generationStage} · ${((now - p.generationStartedAtMs) / 1000).toFixed(1)}s`,
     );
+  if (state.room.prewarm?.stage && state.room.prewarm.stage !== "idle")
+    lines.push(
+      `prewarm: ${state.room.prewarm.stage} · round #${state.room.prewarm.roundId ?? "?"} · proposal #${state.room.prewarm.proposalId ?? "?"}${state.room.prewarm.startedAtMs ? ` · ${((now - state.room.prewarm.startedAtMs) / 1000).toFixed(1)}s` : ""}`,
+    );
   lines.push(...roundLines("decision", p.decisionRound, now));
   if (p.votingRound?.id !== p.decisionRound?.id)
     lines.push(...roundLines("voting", p.votingRound, now));
@@ -365,6 +369,11 @@ function stateSignature(state: StreamState) {
     target: state.program.targetEpisode,
     directive: state.program.directive?.id ?? null,
     stage: state.room.generationStage,
+    prewarm: [
+      state.room.prewarm?.roundId ?? null,
+      state.room.prewarm?.proposalId ?? null,
+      state.room.prewarm?.stage ?? "idle",
+    ],
     decision: state.program.decisionRound?.id ?? null,
     voting: state.program.votingRound?.id ?? null,
     proposals:

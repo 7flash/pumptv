@@ -44,6 +44,19 @@ export function deriveLiveProgramState(input: {
   let phase: LiveProgramState["phase"] = "idle";
   let reason: string | null = null;
 
+  const prewarm = room.prewarm ?? {
+    roundId: null,
+    proposalId: null,
+    stage: "idle" as const,
+    startedAtMs: null,
+  };
+  const lockedPrewarmMatches = Boolean(
+    nextDirective &&
+    prewarm.proposalId != null &&
+    nextDirective.proposalId === prewarm.proposalId &&
+    prewarm.stage !== "idle",
+  );
+
   if (!room.workerOnline) {
     phase = "offline";
     reason = "Generation worker offline";
@@ -52,15 +65,23 @@ export function deriveLiveProgramState(input: {
     reason = room.generation.reason || "Generation paused";
   } else if (nextClip) {
     phase = "ready";
+  } else if (countdownEndsAtMs) {
+    // Speculative rendering is deliberately invisible to arbitration: the UI
+    // stays in decision/voting mode until the server actually locks a winner.
+    phase = votingRound?.decisionMode === "voting" ? "voting" : "deciding";
   } else if (room.workerState === "generating") {
     phase = room.generationStage === "idle" ? "planning" : room.generationStage;
+  } else if (lockedPrewarmMatches) {
+    phase = prewarm.stage === "ready" ? "finalizing" : prewarm.stage;
   } else if (nextDirective) {
     phase = "locked";
-  } else if (countdownEndsAtMs) {
-    phase = votingRound?.decisionMode === "voting" ? "voting" : "deciding";
   } else {
     phase = "idle";
   }
+
+  const effectiveGenerationStartedAtMs = lockedPrewarmMatches
+    ? prewarm.startedAtMs
+    : room.generationStartedAtMs;
 
   return {
     phase,
@@ -68,7 +89,7 @@ export function deriveLiveProgramState(input: {
     targetEpisode,
     reason,
     countdownEndsAtMs,
-    generationStartedAtMs: room.generationStartedAtMs,
+    generationStartedAtMs: effectiveGenerationStartedAtMs,
     directive: nextDirective,
     decisionRound,
     votingRound,
