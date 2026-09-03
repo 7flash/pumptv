@@ -57,7 +57,7 @@ export function deriveLiveProgramState(input: {
   } else if (nextDirective) {
     phase = "locked";
   } else if (countdownEndsAtMs) {
-    phase = "voting";
+    phase = votingRound?.decisionMode === "voting" ? "voting" : "deciding";
   } else {
     phase = "idle";
   }

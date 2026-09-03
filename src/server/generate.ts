@@ -1,7 +1,7 @@
 import { fal } from "@fal-ai/client";
 import type { Clip, GenerationMode, Resolution } from "../shared/contracts.ts";
 import { falMeasure } from "./observability.ts";
-import { OPENING, renderH3Prompt } from "./prompt.ts";
+import { OPENING, renderH3Prompt, sanitizeShotPlanForH3 } from "./prompt.ts";
 import { planNextShot } from "./showrunner.tsx";
 import { resolveExternalReferences } from "./reference-tools.ts";
 import type { ReferenceContext } from "./reference-tools.ts";
@@ -115,15 +115,29 @@ export async function generateNextClip(input: {
     });
     const showrunnerMs = elapsed(showrunnerStartedAt);
 
+    const preKeyframePlan = sanitizeShotPlanForH3({
+      plan: showrunner.plan,
+      directive,
+      factOverlayText,
+      factKeyframeProvided: false,
+    });
+
     const factKeyframe = await generateFactEndKeyframe({
       anchorFrameUrl,
       factText: factOverlayText,
-      plan: showrunner.plan,
+      plan: preKeyframePlan,
       resolution: input.resolution,
     });
 
-    const prompt = renderH3Prompt({
+    const h3Plan = sanitizeShotPlanForH3({
       plan: showrunner.plan,
+      directive,
+      factOverlayText,
+      factKeyframeProvided: Boolean(factKeyframe?.url),
+    });
+
+    const prompt = renderH3Prompt({
+      plan: h3Plan,
       episode,
       hasAnchor: Boolean(anchorFrameUrl),
       worldState,
@@ -218,6 +232,7 @@ export async function generateNextClip(input: {
         showrunnerPlanJson: JSON.stringify({
           ...showrunner.plan,
           _references: showrunner.referenceContext || null,
+          _sanitizedH3Plan: h3Plan,
           _factOverlay: factOverlayText,
           _factKeyframe: factKeyframe,
         }),

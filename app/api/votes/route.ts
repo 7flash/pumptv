@@ -12,7 +12,10 @@ import {
   recordSubjectOrigin,
   releaseParticipationSlot,
 } from "../../../src/server/moderation.ts";
-import { castWebVote } from "../../../src/server/repository.ts";
+import {
+  castWebVote,
+  DecisionWindowClosedError,
+} from "../../../src/server/repository.ts";
 import {
   normalizeSolanaAddress,
   walletVotingPower,
@@ -26,6 +29,18 @@ function anonymousKey(value: unknown) {
 
 function voterKey(value: unknown, walletAddress: string | null) {
   return walletAddress ? `wallet:${walletAddress}` : anonymousKey(value);
+}
+
+function participantKey(
+  originIpHash: string | null,
+  walletAddress: string | null,
+  subjectKey: string,
+) {
+  return originIpHash
+    ? `ip:${originIpHash}`
+    : walletAddress
+      ? `wallet:${walletAddress}`
+      : subjectKey;
 }
 
 export function POST(request: Request) {
@@ -67,6 +82,11 @@ export function POST(request: Request) {
             voterKey: subjectKey,
             weight: power,
             walletAddress,
+            participantKey: participantKey(
+              originIpHash,
+              walletAddress,
+              subjectKey,
+            ),
           }),
       );
       if (!round) {
@@ -91,7 +111,9 @@ export function POST(request: Request) {
               ? 403
               : error instanceof ParticipationCooldownError
                 ? 429
-                : 400,
+                : error instanceof DecisionWindowClosedError
+                  ? 409
+                  : 400,
         },
       );
     }

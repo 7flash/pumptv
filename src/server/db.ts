@@ -67,6 +67,7 @@ const openedDb = dbMeasure.measureSync(
           status: z.enum(["open", "closed"]).default("open"),
           openedAtMs: z.number(),
           votingStartedAtMs: z.number().nullable().default(null),
+          contestedAtMs: z.number().nullable().default(null),
           closesAtMs: z.number(),
           closedAtMs: z.number().nullable().default(null),
           winnerProposalId: z.number().nullable().default(null),
@@ -81,6 +82,7 @@ const openedDb = dbMeasure.measureSync(
           author: z.string().nullable().default(null),
           authorAddress: z.string().nullable().default(null),
           sourceRoom: z.string().nullable().default(null),
+          participantKey: z.string().nullable().default(null),
           operatorVoteOverride: z.number().nullable().default(null),
           ownerWeight: z.number().default(1),
         }),
@@ -91,6 +93,7 @@ const openedDb = dbMeasure.measureSync(
           voterHandle: z.string().nullable().default(null),
           source: z.enum(["web", "pumpfun"]).default("web"),
           sourceId: z.string().nullable().default(null),
+          participantKey: z.string().nullable().default(null),
           weight: z.number().default(1),
         }),
         worldStateSnapshots: z.object({

@@ -14,6 +14,7 @@ import {
 } from "../../../src/server/moderation.ts";
 import {
   cancelWebProposal,
+  DecisionWindowClosedError,
   upsertWebProposal,
 } from "../../../src/server/repository.ts";
 import {
@@ -29,6 +30,18 @@ function anonymousKey(value: unknown) {
 
 function ownerKey(value: unknown, walletAddress: string | null) {
   return walletAddress ? `wallet:${walletAddress}` : anonymousKey(value);
+}
+
+function participantKey(
+  originIpHash: string | null,
+  walletAddress: string | null,
+  subjectKey: string,
+) {
+  return originIpHash
+    ? `ip:${originIpHash}`
+    : walletAddress
+      ? `wallet:${walletAddress}`
+      : subjectKey;
 }
 
 export function POST(request: Request) {
@@ -81,6 +94,11 @@ export function POST(request: Request) {
             ownerKey: subjectKey,
             walletAddress,
             ownerWeight: power,
+            participantKey: participantKey(
+              originIpHash,
+              walletAddress,
+              subjectKey,
+            ),
           }),
       );
 
@@ -109,7 +127,9 @@ export function POST(request: Request) {
               ? 403
               : error instanceof ParticipationCooldownError
                 ? 429
-                : 400,
+                : error instanceof DecisionWindowClosedError
+                  ? 409
+                  : 400,
         },
       );
     }

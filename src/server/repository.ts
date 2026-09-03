@@ -34,25 +34,44 @@ const MAX_PROPOSALS_PER_ROUND = Math.max(
   Number(process.env.PUMPTV_MAX_PROPOSALS_PER_ROUND || 40),
 );
 const AUTO_TRIGGER_ENABLED = process.env.PUMPTV_AUTO_TRIGGER !== "0";
-const AUTO_TRIGGER_BASE_MS = Math.max(
-  8_000,
-  Number(process.env.PUMPTV_AUTO_TRIGGER_BASE_MS || 30_000),
+const SOLO_DECISION_MS = Math.max(
+  5_000,
+  Number(process.env.PUMPTV_SOLO_DECISION_MS || 20_000),
 );
-const AUTO_TRIGGER_MIN_MS = Math.max(
+const VOTING_BASE_MS = Math.max(
+  8_000,
+  Number(process.env.PUMPTV_VOTING_BASE_MS || 15_000),
+);
+const VOTING_MIN_MS = Math.max(
   5_000,
   Math.min(
-    AUTO_TRIGGER_BASE_MS,
+    VOTING_BASE_MS,
     Number(process.env.PUMPTV_AUTO_TRIGGER_MIN_MS || 8_000),
   ),
 );
+const VOTING_GUARANTEE_MS = Math.max(
+  VOTING_MIN_MS,
+  Number(process.env.PUMPTV_VOTING_GUARANTEE_MS || 10_000),
+);
 const AUTO_TRIGGER_IDEA_STEP_MS = Math.max(
   0,
-  Number(process.env.PUMPTV_AUTO_TRIGGER_IDEA_STEP_MS || 7_000),
+  Number(process.env.PUMPTV_AUTO_TRIGGER_IDEA_STEP_MS || 2_000),
 );
 const AUTO_TRIGGER_VOTE_STEP_MS = Math.max(
   0,
-  Number(process.env.PUMPTV_AUTO_TRIGGER_VOTE_STEP_MS || 1_500),
+  Number(process.env.PUMPTV_AUTO_TRIGGER_VOTE_STEP_MS || 1_000),
 );
+
+export class DecisionWindowClosedError extends Error {}
+
+function assertRoundAcceptingActivity(round: PromptRound) {
+  if (round.status !== "open")
+    throw new DecisionWindowClosedError("This decision is already closed.");
+  if (round.closesAtMs > 0 && Date.now() >= round.closesAtMs)
+    throw new DecisionWindowClosedError(
+      "This decision is locking now. Wait for the next board before participating again.",
+    );
+}
 
 function toClip(row: any): Clip {
   return {
@@ -504,21 +523,39 @@ function proposalFromRow(row: any): PromptProposal {
   };
 }
 
+function participantIdentity(row: any) {
+  const explicit = String(row.participantKey || "").trim();
+  if (explicit) return explicit;
+  const sourceId = String(row.sourceId || "").trim();
+  if (sourceId) return `${row.source || "unknown"}:${sourceId}`;
+  return `proposal:${Number(row.id)}`;
+}
+
 function loadRoundById(id: number): PromptRound | null {
   const row =
     db.raw<any>(`SELECT * FROM promptRounds WHERE id = ? LIMIT 1`, id)[0] ||
     null;
   if (!row) return null;
-  const proposals = db
-    .raw<any>(
-      `SELECT p.*,
-              (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = p.id) AS realVoteCount,
-              (SELECT COUNT(*) FROM proposalVotes v WHERE v.proposalId = p.id) AS voterCount
+  const proposalRows = db.raw<any>(
+    `SELECT p.*,
+            (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = p.id) AS realVoteCount,
+            (SELECT COUNT(DISTINCT COALESCE(v.participantKey, v.voterKey)) FROM proposalVotes v WHERE v.proposalId = p.id) AS voterCount
      FROM proposals p WHERE p.roundId = ?
      ORDER BY COALESCE(p.operatorVoteOverride, COALESCE(p.ownerWeight, 1) + (SELECT COALESCE(SUM(v.weight), 0) FROM proposalVotes v WHERE v.proposalId = p.id)) DESC, p.id ASC`,
-      id,
-    )
-    .map(proposalFromRow);
+    id,
+  );
+  const proposals = proposalRows.map(proposalFromRow);
+  const participantCount = new Set(
+    proposalRows
+      .filter((proposal: any) => proposal.status === "open")
+      .map(participantIdentity),
+  ).size;
+  const decisionMode =
+    proposals.filter((proposal) => proposal.status === "open").length === 0
+      ? "waiting"
+      : participantCount >= 2
+        ? "voting"
+        : "solo";
   return {
     id: Number(row.id),
     targetEpisode: Number(row.targetEpisode),
@@ -526,6 +563,9 @@ function loadRoundById(id: number): PromptRound | null {
     openedAtMs: Number(row.openedAtMs),
     votingStartedAtMs:
       row.votingStartedAtMs == null ? null : Number(row.votingStartedAtMs),
+    contestedAtMs: row.contestedAtMs == null ? null : Number(row.contestedAtMs),
+    decisionMode,
+    participantCount,
     closesAtMs: Number(row.closesAtMs || 0),
     closedAtMs: row.closedAtMs == null ? null : Number(row.closedAtMs),
     winnerProposalId:
@@ -534,20 +574,17 @@ function loadRoundById(id: number): PromptRound | null {
   };
 }
 
-function autoTriggerDelayMs(round: PromptRound) {
-  const ideas = Math.max(1, round.proposals.length);
+function votingDelayMs(round: PromptRound) {
+  const ideas = Math.max(2, round.proposals.length);
   const outsideVoters = round.proposals.reduce(
     (sum, proposal) => sum + Math.max(0, Number(proposal.voterCount || 0)),
     0,
   );
   const accelerated =
-    AUTO_TRIGGER_BASE_MS -
-    Math.max(0, ideas - 1) * AUTO_TRIGGER_IDEA_STEP_MS -
+    VOTING_BASE_MS -
+    Math.max(0, ideas - 2) * AUTO_TRIGGER_IDEA_STEP_MS -
     Math.min(12, outsideVoters) * AUTO_TRIGGER_VOTE_STEP_MS;
-  return Math.max(
-    AUTO_TRIGGER_MIN_MS,
-    Math.min(AUTO_TRIGGER_BASE_MS, accelerated),
-  );
+  return Math.max(VOTING_MIN_MS, Math.min(VOTING_BASE_MS, accelerated));
 }
 
 function armAutoTriggerForRound(
@@ -560,45 +597,74 @@ function armAutoTriggerForRound(
   if (!round || round.status !== "open") return null;
 
   if (!round.proposals.length) {
-    if (round.votingStartedAtMs != null || round.closesAtMs !== 0) {
+    if (
+      round.votingStartedAtMs != null ||
+      round.contestedAtMs != null ||
+      round.closesAtMs !== 0
+    ) {
       db.exec(
-        `UPDATE promptRounds SET votingStartedAtMs = NULL, closesAtMs = 0 WHERE id = ?`,
+        `UPDATE promptRounds SET votingStartedAtMs = NULL, contestedAtMs = NULL, closesAtMs = 0 WHERE id = ?`,
         roundId,
       );
     }
     return null;
   }
 
-  const delayMs = autoTriggerDelayMs(round);
   const firstArm = round.votingStartedAtMs == null || round.closesAtMs <= 0;
-  const desiredDeadline = now + delayMs;
-  // Activity can accelerate a decision but can never keep extending it. This
-  // prevents a spammer from keeping the show permanently in intermission.
-  const deadline = firstArm
-    ? desiredDeadline
-    : Math.min(round.closesAtMs, desiredDeadline);
+  const enteringVoting =
+    round.decisionMode === "voting" && round.contestedAtMs == null;
+  let deadline = round.closesAtMs;
+  let contestedAtMs = round.contestedAtMs ?? null;
+
+  if (firstArm) {
+    deadline =
+      round.decisionMode === "voting"
+        ? now + VOTING_BASE_MS
+        : now + SOLO_DECISION_MS;
+  } else if (enteringVoting) {
+    // A challenger arriving late gets a real ballot, not a 1-second fake vote.
+    // This is the only activity allowed to extend a deadline.
+    deadline = Math.max(round.closesAtMs, now + VOTING_GUARANTEE_MS);
+  } else if (round.decisionMode === "voting") {
+    // Once voting is open, activity can only accelerate the existing deadline.
+    deadline = Math.min(round.closesAtMs, now + votingDelayMs(round));
+  }
+
+  if (round.decisionMode === "voting" && contestedAtMs == null)
+    contestedAtMs = now;
   const startedAtMs = firstArm ? now : round.votingStartedAtMs;
 
   if (
     firstArm ||
+    enteringVoting ||
     deadline !== round.closesAtMs ||
-    startedAtMs !== round.votingStartedAtMs
+    startedAtMs !== round.votingStartedAtMs ||
+    contestedAtMs !== (round.contestedAtMs ?? null)
   ) {
     db.exec(
-      `UPDATE promptRounds SET votingStartedAtMs = ?, closesAtMs = ? WHERE id = ? AND status = 'open'`,
+      `UPDATE promptRounds SET votingStartedAtMs = ?, contestedAtMs = ?, closesAtMs = ? WHERE id = ? AND status = 'open'`,
       startedAtMs,
+      contestedAtMs,
       deadline,
       roundId,
     );
     dbMeasure.measureSync(
       {
         start: () =>
-          firstArm ? "Arm next-episode timer" : "Accelerate next-episode timer",
+          firstArm
+            ? round.decisionMode === "voting"
+              ? "Arm voting timer"
+              : "Arm solo decision timer"
+            : enteringVoting
+              ? "Open contested voting"
+              : "Accelerate voting timer",
         end: (value) => value,
       },
       () => ({
         roundId,
         episode: round.targetEpisode + 1,
+        mode: round.decisionMode,
+        participants: round.participantCount ?? 0,
         ideas: round.proposals.length,
         voters: round.proposals.reduce(
           (sum, proposal) => sum + proposal.voterCount,
@@ -610,7 +676,7 @@ function armAutoTriggerForRound(
     );
   }
 
-  return { deadline, delayMs };
+  return { deadline, mode: round.decisionMode };
 }
 
 function clearAutoTriggerIfBoardEmpty(roundId: number) {
@@ -624,7 +690,7 @@ function clearAutoTriggerIfBoardEmpty(roundId: number) {
   );
   if (count === 0) {
     db.exec(
-      `UPDATE promptRounds SET votingStartedAtMs = NULL, closesAtMs = 0 WHERE id = ?`,
+      `UPDATE promptRounds SET votingStartedAtMs = NULL, contestedAtMs = NULL, closesAtMs = 0 WHERE id = ?`,
       roundId,
     );
   }
@@ -753,8 +819,10 @@ export async function upsertWebProposal(input: {
   ownerKey: string;
   walletAddress?: string | null;
   ownerWeight?: number;
+  participantKey: string;
 }) {
   const round = await roundForNewSuggestion();
+  assertRoundAcceptingActivity(round);
   const text = input.text.replace(/\s+/g, " ").trim().slice(0, 500);
   if (!text) throw new Error("Idea cannot be empty");
   const normalized = normalizeProposalText(text);
@@ -776,6 +844,20 @@ export async function upsertWebProposal(input: {
           input.walletAddress ?? null,
           input.ownerKey,
         )[0] || null;
+      const cohort =
+        db.raw<any>(
+          `SELECT * FROM proposals
+           WHERE roundId = ? AND source = 'web' AND status = 'open'
+             AND participantKey = ? AND id != ?
+           ORDER BY id ASC LIMIT 1`,
+          round.id,
+          input.participantKey,
+          own?.id ?? -1,
+        )[0] || null;
+      if (cohort)
+        throw new Error(
+          "This participant already has an active idea. Edit it from the original session, connect a wallet, or vote instead.",
+        );
       const duplicate =
         db.raw<any>(
           `SELECT id FROM proposals WHERE roundId = ? AND normalizedText = ? AND status = 'open' AND id != ? LIMIT 1`,
@@ -788,13 +870,18 @@ export async function upsertWebProposal(input: {
       let proposal = own;
       if (proposal) {
         const changed = proposal.normalizedText !== normalized;
+        if (changed && round.decisionMode === "voting")
+          throw new Error(
+            "Voting is open; submitted ideas are locked until this decision resolves.",
+          );
         db.exec(
-          `UPDATE proposals SET text = ?, normalizedText = ?, sourceId = ?, authorAddress = ?, ownerWeight = ? WHERE id = ?`,
+          `UPDATE proposals SET text = ?, normalizedText = ?, sourceId = ?, authorAddress = ?, ownerWeight = ?, participantKey = ? WHERE id = ?`,
           text,
           normalized,
           input.ownerKey,
           input.walletAddress ?? null,
           ownerWeight,
+          input.participantKey,
           proposal.id,
         );
         // Editing changes the proposition people voted for, so outside votes are
@@ -829,6 +916,7 @@ export async function upsertWebProposal(input: {
           author: null,
           authorAddress: input.walletAddress ?? null,
           sourceRoom: "web",
+          participantKey: input.participantKey,
           operatorVoteOverride: null,
           ownerWeight,
         });
@@ -854,6 +942,11 @@ export async function upsertWebProposal(input: {
 export async function cancelWebProposal(ownerKey: string) {
   const round = await getOpenPromptRound();
   if (!round) return false;
+  assertRoundAcceptingActivity(round);
+  if (round.decisionMode === "voting")
+    throw new Error(
+      "Voting is open; submitted ideas are locked until this decision resolves.",
+    );
   return dbMeasure.measureSync("Cancel persistent web proposal", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
@@ -885,6 +978,7 @@ export async function attachWebWallet(input: {
   ownerKey: string;
   walletAddress: string;
   weight: number;
+  participantKey: string;
 }) {
   const round = await getOpenPromptRound();
   if (!round) return null;
@@ -926,20 +1020,22 @@ export async function attachWebWallet(input: {
           db.exec(`DELETE FROM proposals WHERE id = ?`, anonymousProposal.id);
         } else if (anonymousProposal) {
           db.exec(
-            `UPDATE proposals SET sourceId = ?, authorAddress = ?, ownerWeight = ? WHERE id = ?`,
+            `UPDATE proposals SET sourceId = ?, authorAddress = ?, ownerWeight = ?, participantKey = ? WHERE id = ?`,
             walletKey,
             input.walletAddress,
             weight,
+            input.participantKey,
             anonymousProposal.id,
           );
         }
 
         db.exec(
-          `UPDATE proposals SET sourceId = ?, authorAddress = ?, ownerWeight = ?
+          `UPDATE proposals SET sourceId = ?, authorAddress = ?, ownerWeight = ?, participantKey = ?
            WHERE roundId = ? AND source = 'web' AND (sourceId = ? OR authorAddress = ?) AND status = 'open'`,
           walletKey,
           input.walletAddress,
           weight,
+          input.participantKey,
           round.id,
           walletKey,
           input.walletAddress,
@@ -952,11 +1048,12 @@ export async function attachWebWallet(input: {
           walletKey,
         );
         db.exec(
-          `UPDATE proposalVotes SET voterKey = ?, sourceId = ?, weight = ?
+          `UPDATE proposalVotes SET voterKey = ?, sourceId = ?, weight = ?, participantKey = ?
            WHERE roundId = ? AND voterKey = ?`,
           walletKey,
           input.walletAddress,
           weight,
+          input.participantKey,
           round.id,
           input.ownerKey,
         );
@@ -978,22 +1075,40 @@ export async function castWebVote(input: {
   voterKey: string;
   weight: number;
   walletAddress?: string | null;
+  participantKey: string;
 }) {
   const round = await getOpenPromptRound();
   if (!round) return null;
+  assertRoundAcceptingActivity(round);
   const target = round.proposals.find((item) => item.id === input.proposalId);
   if (!target) throw new Error("Idea is no longer active");
-  if (target.source === "web" && target.sourceId === input.voterKey)
-    throw new Error("Your own idea already carries your score");
+  const ownedProposal =
+    db.raw<any>(
+      `SELECT id FROM proposals
+       WHERE roundId = ? AND status = 'open'
+         AND (participantKey = ? OR (source = 'web' AND sourceId = ?))
+       ORDER BY id ASC LIMIT 1`,
+      round.id,
+      input.participantKey,
+      input.voterKey,
+    )[0] || null;
+  if (ownedProposal)
+    throw new Error(
+      "Your submitted idea already carries your score; you cannot cast a second vote in the same decision.",
+    );
+  if (round.decisionMode !== "voting")
+    throw new Error("Voting opens when a second independent idea is submitted");
   const weight = clampWeight(input.weight);
 
   return dbMeasure.measureSync("Cast persistent web vote", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       db.exec(
-        `DELETE FROM proposalVotes WHERE roundId = ? AND voterKey = ?`,
+        `DELETE FROM proposalVotes
+         WHERE roundId = ? AND (voterKey = ? OR participantKey = ?)`,
         round.id,
         input.voterKey,
+        input.participantKey,
       );
       db.proposalVotes.insert({
         roundId: round.id,
@@ -1002,6 +1117,7 @@ export async function castWebVote(input: {
         voterHandle: null,
         source: "web",
         sourceId: input.walletAddress ?? input.voterKey,
+        participantKey: input.participantKey,
         weight,
       });
       armAutoTriggerForRound(round.id, "vote");
@@ -1027,6 +1143,7 @@ export async function submitPumpfunProposal(input: {
   source?: DirectiveSource;
 }) {
   const round = await roundForNewSuggestion();
+  assertRoundAcceptingActivity(round);
   return dbMeasure.measureSync("Submit proposal", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
@@ -1060,6 +1177,9 @@ export async function submitPumpfunProposal(input: {
           author: input.author,
           authorAddress: input.authorAddress,
           sourceRoom: input.sourceRoom,
+          participantKey: input.authorAddress
+            ? `wallet:${input.authorAddress}`
+            : `pumpfun:${input.voterKey}`,
           operatorVoteOverride: null,
           ownerWeight: input.source === "web" ? 1 : 0,
         });
@@ -1077,8 +1197,12 @@ export async function submitPumpfunProposal(input: {
         voterHandle: input.voterHandle ?? null,
         source: input.source ?? "pumpfun",
         sourceId: input.sourceId,
+        participantKey: input.authorAddress
+          ? `wallet:${input.authorAddress}`
+          : `pumpfun:${input.voterKey}`,
         weight: 1,
       });
+      armAutoTriggerForRound(round.id, "proposal");
       db.exec("COMMIT");
       const loaded = loadRoundById(round.id);
       if (!loaded) throw new Error("Could not reload proposal round");
@@ -1104,6 +1228,7 @@ export async function castPumpfunVote(input: {
 }) {
   const round = await getOpenPromptRound();
   if (!round) return null;
+  assertRoundAcceptingActivity(round);
   if (!round.proposals.some((p) => p.id === input.proposalId)) return null;
   return dbMeasure.measureSync("Cast proposal vote", () => {
     db.exec("BEGIN IMMEDIATE");
@@ -1120,8 +1245,10 @@ export async function castPumpfunVote(input: {
         voterHandle: input.voterHandle ?? null,
         source: input.source ?? "pumpfun",
         sourceId: input.sourceId,
+        participantKey: `pumpfun:${input.voterKey}`,
         weight: 1,
       });
+      armAutoTriggerForRound(round.id, "vote");
       db.exec("COMMIT");
       return loadRoundById(round.id);
     } catch (error) {
@@ -1208,6 +1335,7 @@ function carryProposalBoardForward(input: {
     status: "open",
     openedAtMs: input.now,
     votingStartedAtMs: null,
+    contestedAtMs: null,
     closesAtMs: 0,
     closedAtMs: null,
     winnerProposalId: null,
@@ -1612,6 +1740,7 @@ export async function operatorInjectProposal(text: string) {
           author: "operator",
           authorAddress: null,
           sourceRoom: "cli",
+          participantKey: sourceId,
           operatorVoteOverride: null,
           ownerWeight: 0,
         });
@@ -1630,6 +1759,7 @@ export async function operatorInjectProposal(text: string) {
         voterHandle: "operator",
         source: "pumpfun",
         sourceId,
+        participantKey: sourceId,
         weight: 1,
       });
       armAutoTriggerForRound(round.id, "proposal");

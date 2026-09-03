@@ -52,6 +52,10 @@ function artifact(row: any) {
     storedPlan && "_references" in storedPlan
       ? (storedPlan._references ?? null)
       : null;
+  const sanitizedH3Plan =
+    storedPlan && "_sanitizedH3Plan" in storedPlan
+      ? (storedPlan._sanitizedH3Plan ?? null)
+      : null;
   const factOverlay =
     storedPlan && "_factOverlay" in storedPlan
       ? (storedPlan._factOverlay ?? null)
@@ -65,6 +69,7 @@ function artifact(row: any) {
         Object.entries(storedPlan).filter(
           ([key]) =>
             key !== "_references" &&
+            key !== "_sanitizedH3Plan" &&
             key !== "_factOverlay" &&
             key !== "_factKeyframe",
         ),
@@ -85,6 +90,7 @@ function artifact(row: any) {
       outputTokens: row.showrunnerOutputTokens ?? null,
       ms: row.showrunnerMs ?? null,
       plan: showrunnerPlan,
+      sanitizedH3Plan,
     },
     h3: {
       prompt: row.h3Prompt ?? null,

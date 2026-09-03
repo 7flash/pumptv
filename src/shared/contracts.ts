@@ -9,6 +9,7 @@ export type PumpChatState =
   "disabled" | "standby" | "connecting" | "live" | "error";
 export type ProposalStatus = "open" | "selected" | "lost";
 export type PromptRoundStatus = "open" | "closed";
+export type PromptDecisionMode = "waiting" | "solo" | "voting";
 export type ReconciliationStatus =
   "verified" | "corrected" | "fallback" | "skipped";
 export type GenerationPauseKind =
@@ -86,6 +87,9 @@ export type PromptRound = {
   status: PromptRoundStatus;
   openedAtMs: number;
   votingStartedAtMs: number | null;
+  contestedAtMs?: number | null;
+  decisionMode?: PromptDecisionMode;
+  participantCount?: number;
   closesAtMs: number;
   closedAtMs: number | null;
   winnerProposalId: number | null;
@@ -208,6 +212,7 @@ export type LiveProgramPhase =
   | "offline"
   | "paused"
   | "idle"
+  | "deciding"
   | "voting"
   | "locked"
   | "planning"

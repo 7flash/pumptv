@@ -23,6 +23,15 @@ timeline_window = 96
 idle_poll_ms = 500
 error_backoff_ms = 2000
 
+# Next-episode decision policy. The first independent IP gets a 20s solo lock-in.
+# A second independent IP opens voting with at least 10s to participate.
+solo_decision_ms = 20000
+voting_base_ms = 15000
+voting_guarantee_ms = 10000
+auto_trigger_min_ms = 8000
+auto_trigger_idea_step_ms = 2000
+auto_trigger_vote_step_ms = 1000
+
 # Browser state transport uses long polling. Only meaningful changes trigger a
 # full measured state query; idle requests return after the timeout.
 long_poll_check_ms = 400
@@ -31,6 +40,14 @@ viewer_ttl_ms = 45000
 
 # Token mint used for Phantom holding-weight. This is independent of chat.
 token_mint = ""
+
+# Web participation identity/moderation. Enable trusted proxy headers only when
+# the app is actually behind a proxy you control (e.g. Cloudflare/nginx).
+moderation_db_path = ".data/pumptv-moderation.sqlite"
+moderation_secret = ""
+trust_proxy_headers = 0
+proposal_ip_cooldown_ms = 8000
+vote_ip_cooldown_ms = 2500
 
 # Optional Pump.fun live-chat ingestion. Leave blank when the web proposal board
 # is the only input source; disabled chat is not treated as an error.

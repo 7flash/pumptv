@@ -109,6 +109,9 @@ export function POST(request: Request) {
             ownerKey: anonymousOwnerKey,
             walletAddress: address,
             weight: score.power,
+            participantKey: originIpHash
+              ? `ip:${originIpHash}`
+              : walletOwnerKey,
           }),
       );
       recordSubjectOrigin(anonymousOwnerKey, originIpHash);

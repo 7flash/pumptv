@@ -23,12 +23,15 @@ long_poll_check_ms = 400
 long_poll_timeout_ms = 25000
 viewer_ttl_ms = 45000
 
-# Automatic next-episode decision. The first idea starts a 30s window. More
-# distinct ideas/votes can only shorten it, never extend it.
-auto_trigger_base_ms = 30000
+# Automatic next-episode decision. One independent idea gets a clean 20s solo
+# lock-in. A second independent participant opens voting and is guaranteed at
+# least 10s to vote; after that, additional activity can only shorten the timer.
+solo_decision_ms = 20000
+voting_base_ms = 15000
+voting_guarantee_ms = 10000
 auto_trigger_min_ms = 8000
-auto_trigger_idea_step_ms = 7000
-auto_trigger_vote_step_ms = 1500
+auto_trigger_idea_step_ms = 2000
+auto_trigger_vote_step_ms = 1000
 
 # Phantom/token-weighted proposal score. This MUST be configured in the web .config.toml
 # because /api/wallet/score runs in the web process.

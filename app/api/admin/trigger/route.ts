@@ -30,9 +30,19 @@ function authorize(request: Request): Response | null {
 
 function boardPayload(round: Awaited<ReturnType<typeof getOpenPromptRound>>) {
   if (!round)
-    return { targetEpisode: null, topProposalId: null, proposals: [] };
+    return {
+      targetEpisode: null,
+      decisionMode: "waiting",
+      participantCount: 0,
+      closesAtMs: null,
+      topProposalId: null,
+      proposals: [],
+    };
   return {
     targetEpisode: round.targetEpisode + 1,
+    decisionMode: round.decisionMode || "waiting",
+    participantCount: round.participantCount || 0,
+    closesAtMs: round.closesAtMs || null,
     topProposalId: round.proposals[0]?.id ?? null,
     proposals: round.proposals.map((proposal, index) => ({
       rank: index + 1,

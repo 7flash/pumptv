@@ -20,6 +20,95 @@ export type ShotPlan = {
   endingBeat: string;
 };
 
+function regexEscape(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function redactExactFact(value: string, factText: string | null | undefined) {
+  let result = value;
+  const fact = sanitizeLine(factText || "", 120);
+  if (!fact) return result;
+  const variants = new Set<string>([fact]);
+  const numeric = fact.match(/[0-9][0-9,]*(?:\.[0-9]+)?/g) || [];
+  for (const number of numeric) {
+    variants.add(number);
+    variants.add(number.replace(/,/g, ""));
+    variants.add(`$${number}`);
+    variants.add(`$${number.replace(/,/g, "")}`);
+  }
+  for (const variant of [...variants].sort((a, b) => b.length - a.length)) {
+    if (!variant) continue;
+    result = result.replace(
+      new RegExp(regexEscape(variant), "gi"),
+      "the exact factual readout",
+    );
+  }
+  return result;
+}
+
+function explicitTypographyRequest(directive: string) {
+  return /\b(?:print|write|spell|caption|subtitle|label|sign\s+(?:says|reads)|display\s+(?:the\s+)?(?:word|name|text)|screen\s+(?:says|reads))\b/i.test(
+    directive,
+  );
+}
+
+function suppressIncidentalTypography(value: string) {
+  return value
+    .replace(
+      /\b(?:display|screen|readout)\s+(?:shows?|displays?)\s+the exact factual readout\b/gi,
+      "display remains abstract and unreadable",
+    )
+    .replace(
+      /\b(?:display|screen|readout)\s+(?:of|with)\s+the exact factual readout\b/gi,
+      "display with abstract unreadable segments",
+    )
+    .replace(
+      /\b(?:reads?|reading|says?|showing|prints?|printing|spells?|spelling)\s+(?:["'][^"']{1,80}["']|[A-Z][A-Za-z0-9_-]{2,}|the exact factual readout)\b/g,
+      "showing unreadable marks",
+    );
+}
+
+export function sanitizeShotPlanForH3(input: {
+  plan: ShotPlan;
+  directive: string;
+  factOverlayText?: string | null;
+  factKeyframeProvided?: boolean;
+}): ShotPlan {
+  const preserveRequestedTypography = explicitTypographyRequest(
+    input.directive,
+  );
+  const cleanMotionField = (value: string) => {
+    let next = redactExactFact(value, input.factOverlayText);
+    if (!preserveRequestedTypography) next = suppressIncidentalTypography(next);
+    return sanitizeLine(next, 900);
+  };
+
+  const sanitized: ShotPlan = {
+    ...input.plan,
+    action: cleanMotionField(input.plan.action),
+    visualDetails: cleanMotionField(input.plan.visualDetails),
+    dialogue: redactExactFact(input.plan.dialogue, input.factOverlayText),
+    endingBeat: cleanMotionField(input.plan.endingBeat),
+  };
+
+  if (input.factOverlayText && input.factKeyframeProvided) {
+    sanitized.action = sanitizeLine(
+      `${sanitized.action} Keep any factual display unreadable until the camera reaches the supplied final frame.`,
+      900,
+    );
+    sanitized.visualDetails = sanitizeLine(
+      `${sanitized.visualDetails} During motion, use only abstract or obscured display segments; no stable readable digits or labels.`,
+      700,
+    );
+    sanitized.endingBeat = sanitizeLine(
+      `Settle into the supplied final keyframe, where the exact factual readout becomes readable. ${sanitized.endingBeat}`,
+      600,
+    );
+  }
+
+  return sanitized;
+}
+
 export function renderH3Prompt(input: {
   plan: ShotPlan;
   episode: number;

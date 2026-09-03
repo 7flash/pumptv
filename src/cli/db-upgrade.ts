@@ -46,6 +46,10 @@ const indexes = [
   `CREATE UNIQUE INDEX IF NOT EXISTS proposals_round_web_owner_unique
    ON proposals(roundId, sourceId)
    WHERE source = 'web' AND sourceId IS NOT NULL AND status = 'open'`,
+  `CREATE INDEX IF NOT EXISTS proposals_round_participant_idx
+   ON proposals(roundId, participantKey)`,
+  `CREATE INDEX IF NOT EXISTS proposal_votes_round_participant_idx
+   ON proposalVotes(roundId, participantKey)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS world_state_snapshots_episode_unique
    ON worldStateSnapshots(episode)`,
 ];

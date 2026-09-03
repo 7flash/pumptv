@@ -414,6 +414,7 @@ function ideaCanSubmit() {
   const text = normalizedIdea(ideaDraft);
   if (!text) return false;
   const own = ownProposal();
+  if (own && currentBoardRound()?.decisionMode === "voting") return false;
   return !own || normalizedIdea(own.text) !== text;
 }
 
@@ -1812,10 +1813,13 @@ function tooltipStatus() {
     return `Generating episode ${program.targetEpisode + 1}`;
   if (program.phase === "ready")
     return `Episode ${program.targetEpisode + 1} ready`;
-  const proposals = program.votingRound?.proposals.length || 0;
+  const round = program.votingRound;
+  const proposals = round?.proposals.length || 0;
   return proposals
     ? program.countdownEndsAtMs
-      ? `${proposals} active idea${proposals === 1 ? "" : "s"}; next selection is automatic`
+      ? round?.decisionMode === "voting"
+        ? `${proposals} active ideas; voting is open`
+        : "1 active idea; it locks in automatically unless another IP challenges"
       : `${proposals} active idea${proposals === 1 ? "" : "s"}`
     : "Waiting for suggestions";
 }
@@ -1933,6 +1937,7 @@ function stageGlyph(phase: LiveProgramState["phase"]) {
   if (phase === "finalizing") return "◆";
   if (phase === "ready") return "●";
   if (phase === "locked") return "◆";
+  if (phase === "deciding") return "◷";
   if (phase === "voting") return "◉";
   if (phase === "paused" || phase === "setup" || phase === "offline")
     return "!";
@@ -1994,12 +1999,14 @@ function OutsideProgram() {
   const phase = program.phase;
   const generating =
     phase === "planning" || phase === "rendering" || phase === "finalizing";
+  const deciding = phase === "deciding";
   const voting = phase === "voting";
+  const decidingOrVoting = deciding || voting;
   const ready = phase === "ready";
   const locked = phase === "locked";
   const decisionRound = program.decisionRound;
   const votingRound = program.votingRound;
-  const primaryRound = voting ? votingRound : decisionRound;
+  const primaryRound = decidingOrVoting ? votingRound : decisionRound;
   const futureRound =
     !voting &&
     votingRound &&
@@ -2018,7 +2025,7 @@ function OutsideProgram() {
           {stageGlyph(phase)}
         </span>
         <b>{program.targetEpisode + 1}</b>
-        {voting && program.countdownEndsAtMs ? (
+        {decidingOrVoting && program.countdownEndsAtMs ? (
           <strong data-vote-countdown>
             {formatClock(program.countdownEndsAtMs - liveNowMs())}
           </strong>
@@ -2037,7 +2044,7 @@ function OutsideProgram() {
         </div>
       ) : null}
 
-      {voting ? <CandidateRows round={primaryRound} /> : null}
+      {decidingOrVoting ? <CandidateRows round={primaryRound} /> : null}
 
       {futureRound?.proposals.length ? (
         <div className="outsideFuture">
@@ -2605,6 +2612,7 @@ function PersistentIdeas() {
   const round = currentBoardRound();
   const own = ownProposal();
   const proposals = sortedCandidates(round);
+  const ownLocked = Boolean(own && round?.decisionMode === "voting");
   const countdown = program?.countdownEndsAtMs
     ? `${Math.max(0, Math.ceil((program.countdownEndsAtMs - liveNowMs()) / 1000))}s`
     : null;
@@ -2616,7 +2624,8 @@ function PersistentIdeas() {
         </b>
         {countdown ? (
           <span>
-            NEXT IN <strong data-drawer-countdown>{countdown}</strong>
+            {round?.decisionMode === "voting" ? "VOTE ENDS" : "LOCKS IN"}{" "}
+            <strong data-drawer-countdown>{countdown}</strong>
           </span>
         ) : null}
       </div>
@@ -2630,9 +2639,15 @@ function PersistentIdeas() {
           maxLength={500}
           autoComplete="off"
           spellCheck="true"
-          placeholder={own ? "edit your idea" : "what happens next?"}
+          placeholder={
+            ownLocked
+              ? "your idea is locked while voting is open"
+              : own
+                ? "edit your idea"
+                : "what happens next?"
+          }
           aria-label="Your idea"
-          disabled={ideaSubmitting}
+          disabled={ideaSubmitting || ownLocked}
         />
         <button
           type="submit"
@@ -2647,7 +2662,10 @@ function PersistentIdeas() {
             type="button"
             className="withdrawIdea"
             data-action="cancel-own"
-            aria-label="Withdraw idea"
+            aria-label={
+              ownLocked ? "Idea locked while voting is open" : "Withdraw idea"
+            }
+            disabled={ownLocked}
           >
             <BoardIcon name="cancel" />
           </button>
@@ -2932,6 +2950,8 @@ function YourTurnOverlay() {
 
   const round = program.votingRound;
   const ideas = round?.proposals.length || 0;
+  const decisionMode =
+    round?.decisionMode || (ideas > 1 ? "voting" : ideas ? "solo" : "waiting");
   const countdown = program.countdownEndsAtMs
     ? `${Math.max(0, Math.ceil((program.countdownEndsAtMs - liveNowMs()) / 1000))}s`
     : null;
@@ -2956,16 +2976,19 @@ function YourTurnOverlay() {
             ? program.phase === "locked"
               ? "Starting…"
               : "Creating what happens next…"
-            : ideas
-              ? `${ideas} idea${ideas === 1 ? "" : "s"}`
-              : "What happens next?"}
+            : decisionMode === "voting"
+              ? `${ideas} ideas · voting open`
+              : ideas
+                ? "1 idea · unless challenged"
+                : "What happens next?"}
         </strong>
         <div className="yourTurnMeta">
           {unavailable ? (
             <>{program.reason || "Generation is temporarily unavailable"}</>
           ) : !busy && countdown ? (
             <>
-              Next in <b data-your-turn-countdown>{countdown}</b>
+              {decisionMode === "voting" ? "Voting ends in" : "Locks in in"}{" "}
+              <b data-your-turn-countdown>{countdown}</b>
             </>
           ) : busy && ideas ? (
             <>
@@ -2976,7 +2999,13 @@ function YourTurnOverlay() {
           ) : null}
         </div>
         <button type="button" data-action="tray-ideas">
-          {busy ? "ADD NEXT IDEA" : ideas ? "ADD IDEA OR VOTE" : "ADD AN IDEA"}
+          {busy
+            ? "ADD NEXT IDEA"
+            : decisionMode === "voting"
+              ? "VOTE OR ADD IDEA"
+              : ideas
+                ? "CHALLENGE OR VIEW IDEA"
+                : "ADD AN IDEA"}
         </button>
       </div>
     </div>
@@ -3069,13 +3098,17 @@ function ProgramShelfSlot() {
   const directiveText = program.directive?.text?.trim() || "";
   const title =
     program.reason ||
-    (phase === "voting"
-      ? `Voting for episode ${episode}`
-      : phase === "planning" || phase === "rendering" || phase === "finalizing"
-        ? `Generating episode ${episode}`
-        : phase === "locked"
-          ? `Episode ${episode} locked`
-          : `Waiting for episode ${episode}`);
+    (phase === "deciding"
+      ? `Idea locks for episode ${episode}`
+      : phase === "voting"
+        ? `Voting for episode ${episode}`
+        : phase === "planning" ||
+            phase === "rendering" ||
+            phase === "finalizing"
+          ? `Generating episode ${episode}`
+          : phase === "locked"
+            ? `Episode ${episode} locked`
+            : `Waiting for episode ${episode}`);
   const copy =
     directiveText ||
     (candidateCount
