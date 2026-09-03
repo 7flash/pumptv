@@ -5,6 +5,7 @@ import { acquireRoomLease, releaseRoomLease, renewRoomLease } from "./lease.ts";
 import { workerMeasure } from "./observability.ts";
 import { dbPath } from "./db.ts";
 import {
+  autoTriggerNextProposalIfDue,
   clearGenerationPause,
   ensureOpenPromptRound,
   getLatestClip,
@@ -96,7 +97,12 @@ async function generationTick() {
     // Viewers can start suggesting EP 2 while the opening is still rendering.
     await ensureOpenPromptRound(1);
   } else {
-    if (!(await hasQueuedDirective())) {
+    let queued = await hasQueuedDirective();
+    if (!queued) {
+      const automatic = await autoTriggerNextProposalIfDue(now);
+      queued = Boolean(automatic) || (await hasQueuedDirective());
+    }
+    if (!queued) {
       await ensureOpenPromptRound(await nextEpisode());
       await setWorkerState("idle", null, "full");
       return { generated: false, sleepMs: IDLE_POLL_MS };
@@ -136,7 +142,12 @@ async function generationTick() {
     const lockedOpening = !lockedLatest;
     if (!lockedRoom.running) return { generated: false, sleepMs: IDLE_POLL_MS };
     if (!lockedOpening) {
-      if (!(await hasQueuedDirective())) {
+      let queued = await hasQueuedDirective();
+      if (!queued) {
+        const automatic = await autoTriggerNextProposalIfDue();
+        queued = Boolean(automatic) || (await hasQueuedDirective());
+      }
+      if (!queued) {
         await setWorkerState("idle", null, "full");
         return { generated: false, sleepMs: IDLE_POLL_MS };
       }

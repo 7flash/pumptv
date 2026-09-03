@@ -23,6 +23,13 @@ long_poll_check_ms = 400
 long_poll_timeout_ms = 25000
 viewer_ttl_ms = 45000
 
+# Automatic next-episode decision. The first idea starts a 30s window. More
+# distinct ideas/votes can only shorten it, never extend it.
+auto_trigger_base_ms = 30000
+auto_trigger_min_ms = 8000
+auto_trigger_idea_step_ms = 7000
+auto_trigger_vote_step_ms = 1500
+
 # Phantom/token-weighted proposal score. This MUST be configured in the web .config.toml
 # because /api/wallet/score runs in the web process.
 token_mint = ""
@@ -39,6 +46,10 @@ web_heartbeat_ttl_ms = 6000
 moderation_db_path = ".data/pumptv-moderation.sqlite"
 moderation_secret = ""
 trust_proxy_headers = 0
+# First participation is immediate. Subsequent rapid writes from the same
+# network are throttled; normal edits/votes remain usable after a few seconds.
+proposal_ip_cooldown_ms = 8000
+vote_ip_cooldown_ms = 2500
 
 [measure]
 silent = 0

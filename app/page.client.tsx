@@ -558,12 +558,17 @@ function toggleTray() {
 }
 
 function openTray(view: TrayView) {
-  if (trayOpen && trayView === view) trayOpen = false;
+  const opening = !(trayOpen && trayView === view);
+  if (!opening) trayOpen = false;
   else {
     trayOpen = true;
     trayView = view;
   }
   redraw();
+  if (opening && view === "ideas")
+    queueMicrotask(() =>
+      document.querySelector<HTMLInputElement>("[data-idea-input]")?.focus(),
+    );
 }
 
 let richTooltipNode: HTMLDivElement | null = null;
@@ -724,6 +729,10 @@ function syncLocalUiState() {
   html.dataset.pumptvPlayback = playbackPaused ? "paused" : "playing";
   html.dataset.pumptvMode = replayClipId == null ? "live" : "replay";
   html.dataset.pumptvSlot = replayClipId == null ? liveSlotState : "replay";
+  mediaDeck?.classList.toggle(
+    "intermission",
+    replayClipId == null && liveSlotState === "intermission",
+  );
 
   document
     .querySelectorAll<HTMLElement>("[data-control]")
@@ -784,11 +793,15 @@ function syncCurrentPromptDom() {
   const author = document.querySelector<HTMLElement>(
     "[data-current-prompt-author]",
   );
+  const fact = document.querySelector<HTMLElement>(
+    "[data-current-prompt-fact]",
+  );
   if (!prompt) return;
   if (clip) prompt.removeAttribute("data-empty");
   else prompt.setAttribute("data-empty", "");
   if (text) text.textContent = clip?.directive || "";
   if (author) author.textContent = clip ? clipAuthor(clip) : "";
+  if (fact) fact.textContent = clipFactOverlay(clip);
   if (clip) {
     prompt.dataset.richTooltip = "1";
     prompt.dataset.tooltipKicker = `EP ${clip.episode + 1}`;
@@ -1503,6 +1516,7 @@ function handleDeckEnded(slot: number, clipId: number) {
     active.pause();
     active.muted = true;
   }
+  redraw();
 }
 
 function togglePlayback() {
@@ -1578,6 +1592,14 @@ function updateLiveMeters() {
     futureVote.textContent = formatClock(
       program.votingRound.closesAtMs - liveNowMs(),
     );
+  if (program?.countdownEndsAtMs)
+    document
+      .querySelectorAll<HTMLElement>(
+        "[data-your-turn-countdown], [data-drawer-countdown]",
+      )
+      .forEach((node) => {
+        node.textContent = `${Math.max(0, Math.ceil((program!.countdownEndsAtMs! - liveNowMs()) / 1000))}s`;
+      });
   const gen = document.querySelector(
     "[data-generation-elapsed]",
   ) as HTMLElement | null;
@@ -1742,6 +1764,20 @@ function clipAuthor(clip: Clip) {
   return authorLabel(clip.directiveAuthor, clip.directiveAuthorAddress);
 }
 
+function clipFactOverlay(clip: Clip | null | undefined) {
+  if (!clip?.showrunnerPlanJson) return "";
+  try {
+    const parsed = JSON.parse(clip.showrunnerPlanJson) as {
+      _factOverlay?: unknown;
+    };
+    return typeof parsed._factOverlay === "string"
+      ? parsed._factOverlay.trim().slice(0, 96)
+      : "";
+  } catch {
+    return "";
+  }
+}
+
 function directiveAuthor(directive: Directive | null) {
   return directive
     ? authorLabel(directive.author, directive.authorAddress)
@@ -1778,7 +1814,9 @@ function tooltipStatus() {
     return `Episode ${program.targetEpisode + 1} ready`;
   const proposals = program.votingRound?.proposals.length || 0;
   return proposals
-    ? `${proposals} active suggestion${proposals === 1 ? "" : "s"}; waiting for trigger`
+    ? program.countdownEndsAtMs
+      ? `${proposals} active idea${proposals === 1 ? "" : "s"}; next selection is automatic`
+      : `${proposals} active idea${proposals === 1 ? "" : "s"}`
     : "Waiting for suggestions";
 }
 
@@ -2386,6 +2424,7 @@ function ParticipationTray() {
 }
 
 function CurrentPrompt({ clip }: { clip: Clip | null }) {
+  const fact = clipFactOverlay(clip);
   return (
     <div
       className="currentPrompt"
@@ -2393,6 +2432,26 @@ function CurrentPrompt({ clip }: { clip: Clip | null }) {
       data-empty={clip ? undefined : ""}
     >
       <span data-current-prompt-text>{clip?.directive || ""}</span>
+      {fact ? (
+        <b
+          data-current-prompt-fact
+          aria-label={`Exact resolved fact: ${fact}`}
+          style={{
+            marginLeft: "12px",
+            paddingLeft: "12px",
+            borderLeft: "1px solid rgba(231,188,83,.32)",
+            color: "#e7bc53",
+            fontSize: ".82em",
+            fontWeight: 800,
+            whiteSpace: "nowrap",
+            letterSpacing: ".02em",
+          }}
+        >
+          {fact}
+        </b>
+      ) : (
+        <b data-current-prompt-fact style={{ display: "none" }} />
+      )}
       <i data-current-prompt-author>{clip ? clipAuthor(clip) : ""}</i>
     </div>
   );
@@ -2546,8 +2605,21 @@ function PersistentIdeas() {
   const round = currentBoardRound();
   const own = ownProposal();
   const proposals = sortedCandidates(round);
+  const countdown = program?.countdownEndsAtMs
+    ? `${Math.max(0, Math.ceil((program.countdownEndsAtMs - liveNowMs()) / 1000))}s`
+    : null;
   return (
     <section className="persistentIdeas" aria-label="Suggestions">
+      <div className="persistentIdeasHead">
+        <b>
+          {proposals.length} IDEA{proposals.length === 1 ? "" : "S"}
+        </b>
+        {countdown ? (
+          <span>
+            NEXT IN <strong data-drawer-countdown>{countdown}</strong>
+          </span>
+        ) : null}
+      </div>
       <form
         className={`persistentIdeaForm ${own ? "editing" : ""}`}
         data-idea-form
@@ -2854,6 +2926,63 @@ function ParticipationBoard() {
   );
 }
 
+function YourTurnOverlay() {
+  if (replayClipId != null || liveSlotState !== "intermission" || !program)
+    return null;
+
+  const round = program.votingRound;
+  const ideas = round?.proposals.length || 0;
+  const countdown = program.countdownEndsAtMs
+    ? `${Math.max(0, Math.ceil((program.countdownEndsAtMs - liveNowMs()) / 1000))}s`
+    : null;
+  const busy =
+    program.phase === "locked" ||
+    program.phase === "planning" ||
+    program.phase === "rendering" ||
+    program.phase === "finalizing";
+  const unavailable =
+    program.phase === "offline" ||
+    program.phase === "setup" ||
+    program.phase === "paused";
+
+  return (
+    <div className={`yourTurnOverlay ${busy ? "busy" : "choose"}`}>
+      <div className="yourTurnCard">
+        <span className="yourTurnKicker">
+          {busy ? "NEXT EPISODE" : "YOUR TURN"}
+        </span>
+        <strong>
+          {busy
+            ? program.phase === "locked"
+              ? "Starting…"
+              : "Creating what happens next…"
+            : ideas
+              ? `${ideas} idea${ideas === 1 ? "" : "s"}`
+              : "What happens next?"}
+        </strong>
+        <div className="yourTurnMeta">
+          {unavailable ? (
+            <>{program.reason || "Generation is temporarily unavailable"}</>
+          ) : !busy && countdown ? (
+            <>
+              Next in <b data-your-turn-countdown>{countdown}</b>
+            </>
+          ) : busy && ideas ? (
+            <>
+              {ideas} idea{ideas === 1 ? "" : "s"} queued after this
+            </>
+          ) : !busy ? (
+            <>Be the first to decide</>
+          ) : null}
+        </div>
+        <button type="button" data-action="tray-ideas">
+          {busy ? "ADD NEXT IDEA" : ideas ? "ADD IDEA OR VOTE" : "ADD AN IDEA"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function TactileTV({ clip }: { clip: Clip | null }) {
   const state = engineState();
   const isReplay = replayClipId != null;
@@ -2874,7 +3003,10 @@ function TactileTV({ clip }: { clip: Clip | null }) {
             </div>
           ) : null}
           <div className="glassGlow" />
-          <CurrentPrompt clip={clip} />
+          {liveSlotState !== "intermission" || isReplay ? (
+            <CurrentPrompt clip={clip} />
+          ) : null}
+          <YourTurnOverlay />
           {isReplay ? (
             <button
               className="liveReturn"
@@ -5885,8 +6017,191 @@ function OutsideInterfaceStyles() {
       }
       .proposalVote:hover svg { color: var(--pump-gold-hi) !important; }
 
+      .persistentIdeasHead {
+        min-height: 24px;
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 0 2px 6px;
+        color: rgba(226,226,220,.42);
+        font: 750 8px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        letter-spacing: .1em;
+      }
+      .persistentIdeasHead > b { color: rgba(226,226,220,.58); font: inherit; }
+      .persistentIdeasHead > span { white-space: nowrap; }
+      .persistentIdeasHead strong { color: var(--pump-gold-hi); font: inherit; font-variant-numeric: tabular-nums; }
+
+      /* v43: the final frame is an intentional participation state. */
+      .mediaDeck .tvVideoLayer,
+      .mediaDeck .tvPosterFallback {
+        transition: filter 360ms ease, opacity 260ms ease !important;
+      }
+      .mediaDeck.intermission .tvVideoLayer.active,
+      .mediaDeck.intermission .tvPosterFallback {
+        filter: brightness(.42) saturate(.72) contrast(.94) !important;
+      }
+      .yourTurnOverlay {
+        position: absolute;
+        inset: 0;
+        z-index: 18;
+        display: grid;
+        place-items: center;
+        padding: clamp(16px, 4vw, 42px);
+        pointer-events: none;
+      }
+      .yourTurnCard {
+        width: min(430px, 82%);
+        display: grid;
+        justify-items: center;
+        gap: 9px;
+        padding: 20px 22px 18px;
+        border: 1px solid rgba(226,185,83,.2);
+        border-radius: 16px;
+        background: rgba(8,9,10,.76);
+        box-shadow: inset 0 1px rgba(255,255,255,.05), 0 20px 55px rgba(0,0,0,.38);
+        backdrop-filter: blur(13px) saturate(.9);
+        text-align: center;
+        pointer-events: auto;
+      }
+      .yourTurnKicker {
+        color: var(--pump-gold-hi);
+        font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        letter-spacing: .18em;
+      }
+      .yourTurnCard > strong {
+        max-width: 30ch;
+        color: rgba(248,248,243,.96);
+        font-size: clamp(18px, 2vw, 25px);
+        line-height: 1.08;
+      }
+      .yourTurnMeta {
+        min-height: 14px;
+        color: rgba(226,226,220,.58);
+        font: 650 10px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      }
+      .yourTurnMeta b { color: var(--pump-gold-hi); font-variant-numeric: tabular-nums; }
+      .yourTurnCard > button {
+        min-height: 38px;
+        margin-top: 2px;
+        padding: 0 17px;
+        border: 1px solid rgba(226,185,83,.34);
+        border-radius: 10px;
+        background: linear-gradient(180deg, rgba(215,164,59,.16), rgba(215,164,59,.07));
+        color: var(--pump-gold-hi);
+        box-shadow: inset 0 1px rgba(255,255,255,.06), 0 8px 22px rgba(0,0,0,.22);
+        font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        letter-spacing: .08em;
+        cursor: pointer;
+      }
+      .yourTurnCard > button:active { transform: translateY(1px); }
+      .yourTurnOverlay.busy .yourTurnCard { border-color: rgba(255,255,255,.11); }
+      .yourTurnOverlay.busy .yourTurnKicker { color: var(--pump-silver); }
+
       @media (max-width: 820px) {
-        .minimalTop .wordmark { width: 58px !important; height: 58px !important; }
+        html, body, #pumptv-page {
+          min-height: 100dvh !important;
+          max-width: 100vw !important;
+          overflow-x: hidden !important;
+        }
+        .viewerApp {
+          width: 100% !important;
+          min-height: 100dvh !important;
+          display: flex !important;
+          flex-direction: column !important;
+          align-items: stretch !important;
+          overflow-x: hidden !important;
+          padding-bottom: max(8px, env(safe-area-inset-bottom)) !important;
+        }
+        .watchDeck {
+          width: 100% !important;
+          min-width: 0 !important;
+          min-height: 0 !important;
+          padding-inline: 6px !important;
+          box-sizing: border-box !important;
+        }
+        .tvCenter {
+          width: 100% !important;
+          min-width: 0 !important;
+          margin-inline: auto !important;
+          padding: 0 !important;
+        }
+        .tvShell {
+          width: 100% !important;
+          max-width: 100% !important;
+          min-width: 0 !important;
+          height: auto !important;
+          min-height: 0 !important;
+          aspect-ratio: 1.78 / 1 !important;
+          margin: 0 auto !important;
+          transform: none !important;
+        }
+        .minimalTop .wordmark { width: 48px !important; height: 48px !important; }
+        .yourTurnOverlay { padding: 10px !important; }
+        .yourTurnCard {
+          width: min(82vw, 360px) !important;
+          padding: 16px 14px 14px !important;
+          gap: 7px !important;
+          border-radius: 14px !important;
+        }
+        .yourTurnCard > strong { font-size: clamp(17px, 5vw, 22px) !important; }
+        .yourTurnCard > button { min-height: 42px !important; width: 100% !important; }
+        .episodeShelf {
+          position: relative !important;
+          inset: auto !important;
+          width: 100% !important;
+          height: auto !important;
+          max-height: none !important;
+          min-height: 0 !important;
+          flex-direction: row !important;
+          align-items: center !important;
+          gap: 6px !important;
+          padding: 6px !important;
+          order: 2 !important;
+          overflow: hidden !important;
+          box-sizing: border-box !important;
+        }
+        .episodeShelf > .liveCap {
+          flex: 0 0 42px !important;
+          width: 42px !important;
+          height: 54px !important;
+        }
+        .episodeShelf > .episodeList {
+          flex: 1 1 auto !important;
+          width: auto !important;
+          height: auto !important;
+          min-height: 0 !important;
+          display: flex !important;
+          flex-direction: row !important;
+          gap: 6px !important;
+          overflow-x: auto !important;
+          overflow-y: hidden !important;
+          padding: 0 4px 2px !important;
+          scroll-snap-type: x proximity;
+        }
+        .episodeList > .episodeCard,
+        .episodeList > .programShelfSlot {
+          flex: 0 0 104px !important;
+          width: 104px !important;
+          min-width: 104px !important;
+          scroll-snap-align: center;
+        }
+        .participationBoard {
+          width: calc(100vw - 12px) !important;
+          margin: 7px auto 0 !important;
+        }
+        .participationSheet {
+          position: fixed !important;
+          left: 6px !important;
+          right: 6px !important;
+          bottom: max(6px, env(safe-area-inset-bottom)) !important;
+          width: auto !important;
+          height: min(78dvh, 680px) !important;
+          max-height: min(78dvh, 680px) !important;
+          min-height: 0 !important;
+          z-index: 120 !important;
+          border-radius: 18px !important;
+        }
         .knobControl { width: 42px !important; height: 32px !important; min-width: 42px !important; min-height: 32px !important; }
         .participationBoard {
           width: calc(100vw - 24px);

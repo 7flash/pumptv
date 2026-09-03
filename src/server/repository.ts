@@ -33,6 +33,26 @@ const MAX_PROPOSALS_PER_ROUND = Math.max(
   2,
   Number(process.env.PUMPTV_MAX_PROPOSALS_PER_ROUND || 40),
 );
+const AUTO_TRIGGER_ENABLED = process.env.PUMPTV_AUTO_TRIGGER !== "0";
+const AUTO_TRIGGER_BASE_MS = Math.max(
+  8_000,
+  Number(process.env.PUMPTV_AUTO_TRIGGER_BASE_MS || 30_000),
+);
+const AUTO_TRIGGER_MIN_MS = Math.max(
+  5_000,
+  Math.min(
+    AUTO_TRIGGER_BASE_MS,
+    Number(process.env.PUMPTV_AUTO_TRIGGER_MIN_MS || 8_000),
+  ),
+);
+const AUTO_TRIGGER_IDEA_STEP_MS = Math.max(
+  0,
+  Number(process.env.PUMPTV_AUTO_TRIGGER_IDEA_STEP_MS || 7_000),
+);
+const AUTO_TRIGGER_VOTE_STEP_MS = Math.max(
+  0,
+  Number(process.env.PUMPTV_AUTO_TRIGGER_VOTE_STEP_MS || 1_500),
+);
 
 function toClip(row: any): Clip {
   return {
@@ -514,6 +534,102 @@ function loadRoundById(id: number): PromptRound | null {
   };
 }
 
+function autoTriggerDelayMs(round: PromptRound) {
+  const ideas = Math.max(1, round.proposals.length);
+  const outsideVoters = round.proposals.reduce(
+    (sum, proposal) => sum + Math.max(0, Number(proposal.voterCount || 0)),
+    0,
+  );
+  const accelerated =
+    AUTO_TRIGGER_BASE_MS -
+    Math.max(0, ideas - 1) * AUTO_TRIGGER_IDEA_STEP_MS -
+    Math.min(12, outsideVoters) * AUTO_TRIGGER_VOTE_STEP_MS;
+  return Math.max(
+    AUTO_TRIGGER_MIN_MS,
+    Math.min(AUTO_TRIGGER_BASE_MS, accelerated),
+  );
+}
+
+function armAutoTriggerForRound(
+  roundId: number,
+  reason: "proposal" | "vote" | "carry" | "legacy",
+  now = Date.now(),
+) {
+  if (!AUTO_TRIGGER_ENABLED) return null;
+  const round = loadRoundById(roundId);
+  if (!round || round.status !== "open") return null;
+
+  if (!round.proposals.length) {
+    if (round.votingStartedAtMs != null || round.closesAtMs !== 0) {
+      db.exec(
+        `UPDATE promptRounds SET votingStartedAtMs = NULL, closesAtMs = 0 WHERE id = ?`,
+        roundId,
+      );
+    }
+    return null;
+  }
+
+  const delayMs = autoTriggerDelayMs(round);
+  const firstArm = round.votingStartedAtMs == null || round.closesAtMs <= 0;
+  const desiredDeadline = now + delayMs;
+  // Activity can accelerate a decision but can never keep extending it. This
+  // prevents a spammer from keeping the show permanently in intermission.
+  const deadline = firstArm
+    ? desiredDeadline
+    : Math.min(round.closesAtMs, desiredDeadline);
+  const startedAtMs = firstArm ? now : round.votingStartedAtMs;
+
+  if (
+    firstArm ||
+    deadline !== round.closesAtMs ||
+    startedAtMs !== round.votingStartedAtMs
+  ) {
+    db.exec(
+      `UPDATE promptRounds SET votingStartedAtMs = ?, closesAtMs = ? WHERE id = ? AND status = 'open'`,
+      startedAtMs,
+      deadline,
+      roundId,
+    );
+    dbMeasure.measureSync(
+      {
+        start: () =>
+          firstArm ? "Arm next-episode timer" : "Accelerate next-episode timer",
+        end: (value) => value,
+      },
+      () => ({
+        roundId,
+        episode: round.targetEpisode + 1,
+        ideas: round.proposals.length,
+        voters: round.proposals.reduce(
+          (sum, proposal) => sum + proposal.voterCount,
+          0,
+        ),
+        remainingMs: Math.max(0, deadline - now),
+        reason,
+      }),
+    );
+  }
+
+  return { deadline, delayMs };
+}
+
+function clearAutoTriggerIfBoardEmpty(roundId: number) {
+  const count = Number(
+    (
+      db.raw<any>(
+        `SELECT COUNT(*) AS count FROM proposals WHERE roundId = ? AND status = 'open'`,
+        roundId,
+      )[0] || {}
+    ).count || 0,
+  );
+  if (count === 0) {
+    db.exec(
+      `UPDATE promptRounds SET votingStartedAtMs = NULL, closesAtMs = 0 WHERE id = ?`,
+      roundId,
+    );
+  }
+}
+
 export async function getOpenPromptRound(): Promise<PromptRound | null> {
   return dbMeasure.measureSync(
     {
@@ -718,6 +834,7 @@ export async function upsertWebProposal(input: {
         });
       }
       if (!proposal) throw new Error("Could not save idea");
+      armAutoTriggerForRound(round.id, "proposal");
 
       db.exec("COMMIT");
       const loaded = loadRoundById(round.id);
@@ -752,6 +869,7 @@ export async function cancelWebProposal(ownerKey: string) {
       }
       db.exec(`DELETE FROM proposalVotes WHERE proposalId = ?`, proposal.id);
       db.exec(`DELETE FROM proposals WHERE id = ?`, proposal.id);
+      clearAutoTriggerIfBoardEmpty(round.id);
       db.exec("COMMIT");
       return true;
     } catch (error) {
@@ -886,6 +1004,7 @@ export async function castWebVote(input: {
         sourceId: input.walletAddress ?? input.voterKey,
         weight,
       });
+      armAutoTriggerForRound(round.id, "vote");
       db.exec("COMMIT");
       return loadRoundById(round.id);
     } catch (error) {
@@ -1084,11 +1203,6 @@ function carryProposalBoardForward(input: {
   targetEpisode: number;
   now: number;
 }) {
-  const survivors = db.raw<any>(
-    `SELECT * FROM proposals WHERE roundId = ? AND id != ? ORDER BY id ASC`,
-    input.roundId,
-    input.winnerProposalId,
-  );
   const nextRound = db.promptRounds.insert({
     targetEpisode: input.targetEpisode,
     status: "open",
@@ -1101,40 +1215,27 @@ function carryProposalBoardForward(input: {
   if (!nextRound) throw new Error("Could not open persistent proposal board");
   const nextRoundId = Number((nextRound as any).id);
 
-  for (const proposal of survivors) {
-    const cloned = db.proposals.insert({
-      roundId: nextRoundId,
-      text: proposal.text,
-      normalizedText: proposal.normalizedText,
-      status: "open",
-      source: proposal.source,
-      sourceId: proposal.sourceId ?? null,
-      author: proposal.author ?? null,
-      authorAddress: proposal.authorAddress ?? null,
-      sourceRoom: proposal.sourceRoom ?? null,
-      operatorVoteOverride: proposal.operatorVoteOverride ?? null,
-      ownerWeight: Math.max(0, Number(proposal.ownerWeight ?? 1)),
-    });
-    if (!cloned) throw new Error("Could not carry proposal forward");
+  // Persistent means persistent: surviving ideas keep the same proposal id,
+  // ownership, score and vote rows. Only their board/round membership advances.
+  // The executed winner remains attached to the closed historical round.
+  db.exec(
+    `UPDATE proposals
+     SET roundId = ?, status = 'open'
+     WHERE roundId = ? AND id != ?`,
+    nextRoundId,
+    input.roundId,
+    input.winnerProposalId,
+  );
+  db.exec(
+    `UPDATE proposalVotes
+     SET roundId = ?
+     WHERE roundId = ? AND proposalId != ?`,
+    nextRoundId,
+    input.roundId,
+    input.winnerProposalId,
+  );
 
-    const votes = db.raw<any>(
-      `SELECT * FROM proposalVotes WHERE roundId = ? AND proposalId = ? ORDER BY id ASC`,
-      input.roundId,
-      proposal.id,
-    );
-    for (const vote of votes) {
-      db.proposalVotes.insert({
-        roundId: nextRoundId,
-        proposalId: Number((cloned as any).id),
-        voterKey: vote.voterKey,
-        voterHandle: vote.voterHandle ?? null,
-        source: vote.source,
-        sourceId: vote.sourceId ?? null,
-        weight: Math.max(1, Number(vote.weight ?? 1)),
-      });
-    }
-  }
-
+  armAutoTriggerForRound(nextRoundId, "carry", input.now);
   return nextRoundId;
 }
 
@@ -1434,10 +1535,42 @@ export async function forceProposalAsNext(
   });
 }
 
-export async function closePromptRoundIfDue(_now = Date.now()) {
-  // Persistent proposals never auto-lock. Generation begins only when an
-  // operator explicitly calls `control trigger` / force.
-  return null;
+export async function autoTriggerNextProposalIfDue(now = Date.now()) {
+  if (!AUTO_TRIGGER_ENABLED) return null;
+  const due =
+    db.raw<any>(
+      `SELECT r.id, r.targetEpisode, r.closesAtMs,
+              (SELECT COUNT(*) FROM proposals p WHERE p.roundId = r.id AND p.status = 'open') AS proposalCount
+       FROM promptRounds r
+       WHERE r.status = 'open'
+         AND r.closesAtMs > 0
+         AND r.closesAtMs <= ?
+       ORDER BY r.id DESC
+       LIMIT 1`,
+      now,
+    )[0] || null;
+  if (!due || Number(due.proposalCount || 0) <= 0) return null;
+
+  try {
+    return await triggerNextProposal({ actor: "auto" });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    // Manual/API trigger can win the race with this worker tick. That is a
+    // successful outcome, not a worker failure.
+    if (
+      /already (queued|generating)|already .*generation|no open proposal board|board changed/i.test(
+        message,
+      )
+    ) {
+      dbMeasure.measureSync("Auto-trigger race resolved", () => ({ message }));
+      return null;
+    }
+    throw error;
+  }
+}
+
+export async function closePromptRoundIfDue(now = Date.now()) {
+  return autoTriggerNextProposalIfDue(now);
 }
 
 export async function operatorInjectProposal(text: string) {
@@ -1499,6 +1632,7 @@ export async function operatorInjectProposal(text: string) {
         sourceId,
         weight: 1,
       });
+      armAutoTriggerForRound(round.id, "proposal");
 
       db.exec("COMMIT");
       const loaded = loadRoundById(round.id);

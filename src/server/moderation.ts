@@ -8,6 +8,14 @@ import { resolveProjectPath } from "./project-paths.ts";
 import { moderationMeasure } from "./observability.ts";
 
 export class ModerationBlockedError extends Error {}
+export class ParticipationCooldownError extends Error {
+  retryAfterMs: number;
+  constructor(retryAfterMs: number) {
+    const seconds = Math.max(1, Math.ceil(retryAfterMs / 1000));
+    super(`Try again in ${seconds}s.`);
+    this.retryAfterMs = Math.max(1, retryAfterMs);
+  }
+}
 
 const moderationDbPath = resolveProjectPath(
   process.env.PUMPTV_MODERATION_DB_PATH || ".data/pumptv-moderation.sqlite",
@@ -33,6 +41,12 @@ const moderationDb = moderationMeasure.measureSync(
           valueHash: z.string(),
           reason: z.string().nullable().default(null),
           active: z.boolean().default(true),
+        }),
+        participationEvents: z.object({
+          ipHash: z.string(),
+          subjectKey: z.string(),
+          kind: z.enum(["proposal", "vote"]),
+          atMs: z.number(),
         }),
       },
       { timestamps: true },
@@ -110,6 +124,84 @@ export function assertRequestAllowed(request: Request) {
       "This network is blocked from participating.",
     );
   return { originIpHash };
+}
+
+const PROPOSAL_COOLDOWN_MS = Math.max(
+  0,
+  Number(process.env.PUMPTV_PROPOSAL_IP_COOLDOWN_MS || 8_000),
+);
+const VOTE_COOLDOWN_MS = Math.max(
+  0,
+  Number(process.env.PUMPTV_VOTE_IP_COOLDOWN_MS || 2_500),
+);
+
+function cooldownFor(kind: "proposal" | "vote") {
+  return kind === "proposal" ? PROPOSAL_COOLDOWN_MS : VOTE_COOLDOWN_MS;
+}
+
+export function claimParticipationSlot(input: {
+  originIpHash: string | null;
+  subjectKey: string;
+  kind: "proposal" | "vote";
+}) {
+  if (!input.originIpHash) return null;
+  const cooldownMs = cooldownFor(input.kind);
+  if (cooldownMs <= 0) return null;
+  const now = Date.now();
+
+  const result = moderationMeasure.measureSync(
+    {
+      start: () => `Participation gate · ${input.kind}`,
+      end: (value) =>
+        value.retryAfterMs > 0
+          ? { allowed: false, retryAfterMs: value.retryAfterMs }
+          : { allowed: true, eventId: value.eventId },
+    },
+    () => {
+      moderationDb.exec("BEGIN IMMEDIATE");
+      try {
+        const last =
+          moderationDb.raw<any>(
+            `SELECT id, atMs FROM participationEvents
+             WHERE ipHash = ? AND kind = ?
+             ORDER BY atMs DESC, id DESC LIMIT 1`,
+            input.originIpHash,
+            input.kind,
+          )[0] || null;
+        if (last) {
+          const retryAfterMs = Number(last.atMs || 0) + cooldownMs - now;
+          if (retryAfterMs > 0) {
+            moderationDb.exec("COMMIT");
+            return { eventId: null as number | null, retryAfterMs };
+          }
+        }
+        const event = moderationDb.participationEvents.insert({
+          ipHash: input.originIpHash,
+          subjectKey: String(input.subjectKey || "").slice(0, 240),
+          kind: input.kind,
+          atMs: now,
+        });
+        if (!event) throw new Error("Could not reserve participation slot");
+        moderationDb.exec("COMMIT");
+        return { eventId: Number((event as any).id), retryAfterMs: 0 };
+      } catch (error) {
+        try {
+          moderationDb.exec("ROLLBACK");
+        } catch {}
+        throw error;
+      }
+    },
+  );
+
+  if (!result) return null;
+  if (result.retryAfterMs > 0)
+    throw new ParticipationCooldownError(result.retryAfterMs);
+  return result.eventId;
+}
+
+export function releaseParticipationSlot(eventId: number | null) {
+  if (!eventId) return;
+  moderationDb.exec(`DELETE FROM participationEvents WHERE id = ?`, eventId);
 }
 
 export function recordSubjectOrigin(

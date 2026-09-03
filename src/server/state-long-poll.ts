@@ -47,6 +47,29 @@ function tableStamp(table: string) {
   ];
 }
 
+function roundStamp() {
+  const row =
+    db.raw<any>(
+      `SELECT COALESCE(MAX(id), 0) AS maxId,
+              COALESCE(MAX(updatedAt), '') AS updatedAt,
+              COUNT(*) AS count,
+              COALESCE(MAX(closesAtMs), 0) AS closesAtMs,
+              COALESCE(MAX(votingStartedAtMs), 0) AS votingStartedAtMs,
+              COALESCE(MAX(closedAtMs), 0) AS closedAtMs,
+              COALESCE(MAX(winnerProposalId), 0) AS winnerProposalId
+       FROM promptRounds`,
+    )[0] || {};
+  return [
+    Number(row.maxId || 0),
+    String(row.updatedAt || ""),
+    Number(row.count || 0),
+    Number(row.closesAtMs || 0),
+    Number(row.votingStartedAtMs || 0),
+    Number(row.closedAtMs || 0),
+    Number(row.winnerProposalId || 0),
+  ];
+}
+
 /**
  * Cheap, unmeasured change detector. The expensive measured StreamState query
  * only runs after a meaningful change. Exact heartbeat timestamps are excluded,
@@ -97,7 +120,7 @@ function lightKey() {
     published: [Number(published.count || 0), Number(published.maxId || 0)],
     clips: tableStamp("clips"),
     directives: tableStamp("directives"),
-    rounds: tableStamp("promptRounds"),
+    rounds: roundStamp(),
     proposals: tableStamp("proposals"),
     votes: tableStamp("proposalVotes"),
     world: tableStamp("worldStateSnapshots"),

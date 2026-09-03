@@ -26,6 +26,13 @@ worker_heartbeat_ms = 1000
 idle_poll_ms = 500
 error_backoff_ms = 2000
 
+# Must match the web defaults when overridden. The worker is the authority that
+# atomically fires the winning proposal when the persisted deadline expires.
+auto_trigger_base_ms = 30000
+auto_trigger_min_ms = 8000
+auto_trigger_idea_step_ms = 7000
+auto_trigger_vote_step_ms = 1500
+
 # External-reference resolution cache. Fresh facts stay short-lived.
 reference_fresh_cache_ms = 15000
 reference_cache_ms = 300000

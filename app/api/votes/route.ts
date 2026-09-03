@@ -6,8 +6,11 @@ import {
 import { sanitizeLine } from "../../../src/server/prompt.ts";
 import {
   assertRequestAllowed,
+  claimParticipationSlot,
   ModerationBlockedError,
+  ParticipationCooldownError,
   recordSubjectOrigin,
+  releaseParticipationSlot,
 } from "../../../src/server/moderation.ts";
 import { castWebVote } from "../../../src/server/repository.ts";
 import {
@@ -27,6 +30,7 @@ function voterKey(value: unknown, walletAddress: string | null) {
 
 export function POST(request: Request) {
   return measuredRoute(request, async () => {
+    let participationSlot: number | null = null;
     try {
       const { originIpHash } = assertRequestAllowed(request);
       const body = await httpMeasure.measure("Parse vote request", async () => {
@@ -40,6 +44,11 @@ export function POST(request: Request) {
         throw new Error("Invalid proposal id");
       const walletAddress = normalizeSolanaAddress(body.walletAddress);
       const subjectKey = voterKey(body.ownerId ?? body.viewerId, walletAddress);
+      participationSlot = claimParticipationSlot({
+        originIpHash,
+        subjectKey,
+        kind: "vote",
+      });
       const { power } = await httpMeasure.measure(
         {
           start: () => "Resolve vote score",
@@ -60,14 +69,30 @@ export function POST(request: Request) {
             walletAddress,
           }),
       );
-      if (!round)
+      if (!round) {
+        releaseParticipationSlot(participationSlot);
+        participationSlot = null;
         return Response.json({ error: "Could not vote." }, { status: 400 });
+      }
       recordSubjectOrigin(subjectKey, originIpHash);
       return Response.json(round);
     } catch (error) {
+      releaseParticipationSlot(participationSlot);
       return Response.json(
-        { error: errorText(error) },
-        { status: error instanceof ModerationBlockedError ? 403 : 400 },
+        {
+          error: errorText(error),
+          ...(error instanceof ParticipationCooldownError
+            ? { retryAfterMs: error.retryAfterMs }
+            : {}),
+        },
+        {
+          status:
+            error instanceof ModerationBlockedError
+              ? 403
+              : error instanceof ParticipationCooldownError
+                ? 429
+                : 400,
+        },
       );
     }
   });
