@@ -19,10 +19,15 @@ import type {
 import { evaluateBuffer } from "./adaptive-buffer.ts";
 import { db } from "./db.ts";
 import { ROOM_NAME } from "./lease.ts";
-import { dbMeasure } from "./observability.ts";
+import { arbitrationMeasure, dbMeasure } from "./observability.ts";
 import { EMPTY_WORLD_STATE, parseWorldStateJson } from "./world-state.ts";
 import { getViewerCount } from "./presence.ts";
 import { deriveLiveProgramState } from "./program-state.ts";
+import {
+  decisionPolicyFromEnv,
+  nextDecisionDeadline,
+  type DecisionActivity,
+} from "./decision-policy.ts";
 
 const PUMPFUN_MINT = (process.env.PUMPTV_PUMPFUN_MINT || "").trim();
 const PUMPFUN_PREFIX = process.env.PUMPTV_PUMPFUN_PREFIX ?? "!next";
@@ -35,33 +40,7 @@ const MAX_PROPOSALS_PER_ROUND = Math.max(
   Number(process.env.PUMPTV_MAX_PROPOSALS_PER_ROUND || 40),
 );
 const AUTO_TRIGGER_ENABLED = process.env.PUMPTV_AUTO_TRIGGER !== "0";
-const SOLO_DECISION_MS = Math.max(
-  5_000,
-  Number(process.env.PUMPTV_SOLO_DECISION_MS || 20_000),
-);
-const VOTING_BASE_MS = Math.max(
-  8_000,
-  Number(process.env.PUMPTV_VOTING_BASE_MS || 15_000),
-);
-const VOTING_MIN_MS = Math.max(
-  5_000,
-  Math.min(
-    VOTING_BASE_MS,
-    Number(process.env.PUMPTV_AUTO_TRIGGER_MIN_MS || 8_000),
-  ),
-);
-const VOTING_GUARANTEE_MS = Math.max(
-  VOTING_MIN_MS,
-  Number(process.env.PUMPTV_VOTING_GUARANTEE_MS || 10_000),
-);
-const AUTO_TRIGGER_IDEA_STEP_MS = Math.max(
-  0,
-  Number(process.env.PUMPTV_AUTO_TRIGGER_IDEA_STEP_MS || 2_000),
-);
-const AUTO_TRIGGER_VOTE_STEP_MS = Math.max(
-  0,
-  Number(process.env.PUMPTV_AUTO_TRIGGER_VOTE_STEP_MS || 1_000),
-);
+const DECISION_POLICY = decisionPolicyFromEnv();
 
 export class DecisionWindowClosedError extends Error {}
 
@@ -70,7 +49,7 @@ function assertRoundAcceptingActivity(round: PromptRound) {
     throw new DecisionWindowClosedError("This decision is already closed.");
   if (round.closesAtMs > 0 && Date.now() >= round.closesAtMs)
     throw new DecisionWindowClosedError(
-      "This decision is locking now. Wait for the next board before participating again.",
+      "Voting has ended. Wait for the next turn before participating again.",
     );
 }
 
@@ -712,22 +691,9 @@ function loadRoundById(id: number): PromptRound | null {
   };
 }
 
-function votingDelayMs(round: PromptRound) {
-  const ideas = Math.max(2, round.proposals.length);
-  const outsideVoters = round.proposals.reduce(
-    (sum, proposal) => sum + Math.max(0, Number(proposal.voterCount || 0)),
-    0,
-  );
-  const accelerated =
-    VOTING_BASE_MS -
-    Math.max(0, ideas - 2) * AUTO_TRIGGER_IDEA_STEP_MS -
-    Math.min(12, outsideVoters) * AUTO_TRIGGER_VOTE_STEP_MS;
-  return Math.max(VOTING_MIN_MS, Math.min(VOTING_BASE_MS, accelerated));
-}
-
 function armAutoTriggerForRound(
   roundId: number,
-  reason: "proposal" | "vote" | "carry" | "legacy",
+  reason: DecisionActivity,
   now = Date.now(),
 ) {
   if (!AUTO_TRIGGER_ENABLED) return null;
@@ -751,25 +717,19 @@ function armAutoTriggerForRound(
   const firstArm = round.votingStartedAtMs == null || round.closesAtMs <= 0;
   const enteringVoting =
     round.decisionMode === "voting" && round.contestedAtMs == null;
-  let deadline = round.closesAtMs;
-  let contestedAtMs = round.contestedAtMs ?? null;
-
-  if (firstArm) {
-    deadline =
-      round.decisionMode === "voting"
-        ? now + VOTING_BASE_MS
-        : now + SOLO_DECISION_MS;
-  } else if (enteringVoting) {
-    // A challenger arriving late gets a real ballot, not a 1-second fake vote.
-    // This is the only activity allowed to extend a deadline.
-    deadline = Math.max(round.closesAtMs, now + VOTING_GUARANTEE_MS);
-  } else if (round.decisionMode === "voting") {
-    // Once voting is open, activity can only accelerate the existing deadline.
-    deadline = Math.min(round.closesAtMs, now + votingDelayMs(round));
-  }
-
-  if (round.decisionMode === "voting" && contestedAtMs == null)
-    contestedAtMs = now;
+  const deadline = nextDecisionDeadline({
+    now,
+    previousDeadline: round.closesAtMs,
+    mode: round.decisionMode || "waiting",
+    firstArm,
+    enteringVoting,
+    activity: reason,
+    policy: DECISION_POLICY,
+  });
+  const contestedAtMs =
+    round.decisionMode === "voting"
+      ? (round.contestedAtMs ?? now)
+      : (round.contestedAtMs ?? null);
   const startedAtMs = firstArm ? now : round.votingStartedAtMs;
 
   if (
@@ -786,7 +746,7 @@ function armAutoTriggerForRound(
       deadline,
       roundId,
     );
-    dbMeasure.measureSync(
+    arbitrationMeasure.measureSync(
       {
         start: () =>
           firstArm
@@ -794,8 +754,10 @@ function armAutoTriggerForRound(
               ? "Arm voting timer"
               : "Arm solo decision timer"
             : enteringVoting
-              ? "Open contested voting"
-              : "Accelerate voting timer",
+              ? "Open voting · full window"
+              : reason === "proposal" && deadline > round.closesAtMs
+                ? "Extend voting for new candidate"
+                : "Keep voting deadline",
         end: (value) => value,
       },
       () => ({
@@ -808,7 +770,9 @@ function armAutoTriggerForRound(
           (sum, proposal) => sum + proposal.voterCount,
           0,
         ),
+        previousRemainingMs: Math.max(0, round.closesAtMs - now),
         remainingMs: Math.max(0, deadline - now),
+        extendedMs: Math.max(0, deadline - round.closesAtMs),
         reason,
       }),
     );
@@ -832,6 +796,67 @@ function clearAutoTriggerIfBoardEmpty(roundId: number) {
       roundId,
     );
   }
+}
+
+export async function discardOpenPromptRound(reason = "operator") {
+  return dbMeasure.measureSync(
+    {
+      start: () => `Discard open proposal board · ${reason}`,
+      end: (result) => result,
+    },
+    () => {
+      const row =
+        db.raw<any>(
+          `SELECT id, targetEpisode FROM promptRounds WHERE status = 'open' ORDER BY id DESC LIMIT 1`,
+        )[0] || null;
+      if (!row)
+        return { roundId: null, proposals: 0, votes: 0, targetEpisode: null };
+
+      const roundId = Number(row.id);
+      const proposals = Number(
+        (
+          db.raw<any>(
+            `SELECT COUNT(*) AS count FROM proposals WHERE roundId = ?`,
+            roundId,
+          )[0] || {}
+        ).count || 0,
+      );
+      const votes = Number(
+        (
+          db.raw<any>(
+            `SELECT COUNT(*) AS count FROM proposalVotes WHERE roundId = ?`,
+            roundId,
+          )[0] || {}
+        ).count || 0,
+      );
+
+      db.exec("BEGIN IMMEDIATE");
+      try {
+        db.exec(`DELETE FROM proposalVotes WHERE roundId = ?`, roundId);
+        db.exec(`DELETE FROM proposals WHERE roundId = ?`, roundId);
+        db.exec(
+          `UPDATE promptRounds
+           SET status = 'closed', closesAtMs = 0, closedAtMs = ?, winnerProposalId = NULL
+           WHERE id = ? AND status = 'open'`,
+          Date.now(),
+          roundId,
+        );
+        db.exec("COMMIT");
+      } catch (error) {
+        try {
+          db.exec("ROLLBACK");
+        } catch {}
+        throw error;
+      }
+
+      return {
+        roundId,
+        proposals,
+        votes,
+        targetEpisode: Number(row.targetEpisode) + 1,
+      };
+    },
+  );
 }
 
 export async function getOpenPromptRound(): Promise<PromptRound | null> {
@@ -943,8 +968,17 @@ export async function ensureOpenPromptRound(
 }
 
 async function roundForNewSuggestion() {
-  // The board follows actual generated/locked work, never historical round ids.
-  // This prevents repeated resets/triggers from drifting EP 7 into EP 16/61.
+  // Keep one decision attached to one episode. While a winner is queued or
+  // rendering, new submissions do not silently create a future auto-running
+  // board. The next turn opens after the canonical clip is committed.
+  const pending = nextPendingDirectiveWithVotes();
+  if (
+    pending &&
+    (pending.status === "queued" || pending.status === "generating")
+  )
+    throw new DecisionWindowClosedError(
+      "The next episode is already being made. Wait for the next turn.",
+    );
   return ensureOpenPromptRound();
 }
 
@@ -1462,49 +1496,6 @@ export async function setProposalVoteOverride(
   });
 }
 
-function carryProposalBoardForward(input: {
-  roundId: number;
-  winnerProposalId: number;
-  targetEpisode: number;
-  now: number;
-}) {
-  const nextRound = db.promptRounds.insert({
-    targetEpisode: input.targetEpisode,
-    status: "open",
-    openedAtMs: input.now,
-    votingStartedAtMs: null,
-    contestedAtMs: null,
-    closesAtMs: 0,
-    closedAtMs: null,
-    winnerProposalId: null,
-  });
-  if (!nextRound) throw new Error("Could not open persistent proposal board");
-  const nextRoundId = Number((nextRound as any).id);
-
-  // Persistent means persistent: surviving ideas keep the same proposal id,
-  // ownership, score and vote rows. Only their board/round membership advances.
-  // The executed winner remains attached to the closed historical round.
-  db.exec(
-    `UPDATE proposals
-     SET roundId = ?, status = 'open'
-     WHERE roundId = ? AND id != ?`,
-    nextRoundId,
-    input.roundId,
-    input.winnerProposalId,
-  );
-  db.exec(
-    `UPDATE proposalVotes
-     SET roundId = ?
-     WHERE roundId = ? AND proposalId != ?`,
-    nextRoundId,
-    input.roundId,
-    input.winnerProposalId,
-  );
-
-  armAutoTriggerForRound(nextRoundId, "carry", input.now);
-  return nextRoundId;
-}
-
 type TriggerSelection = {
   proposalId?: number;
   text?: string;
@@ -1650,6 +1641,14 @@ export async function triggerNextProposal(
           selected.id,
           round.id,
         );
+        arbitrationMeasure.measureSync("Resolve one-episode decision", () => ({
+          roundId: round.id,
+          episode: generationEpisode + 1,
+          winnerProposalId: selected.id,
+          winnerScore: score,
+          discardedLosers: Math.max(0, round.proposals.length - 1),
+          actor,
+        }));
 
         const sourceId = triggerDirectiveSourceId(actor, round.id, selected.id);
         const directive = db.directives.insert({
@@ -1665,13 +1664,6 @@ export async function triggerNextProposal(
           triggered: true,
         });
         if (!directive) throw new Error("Could not create winning directive");
-
-        carryProposalBoardForward({
-          roundId: round.id,
-          winnerProposalId: selected.id,
-          targetEpisode: generationEpisode + 1,
-          now,
-        });
 
         db.exec("COMMIT");
 

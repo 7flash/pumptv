@@ -194,7 +194,7 @@ async function handleRemoteCommand() {
       body: JSON.stringify(body),
     });
     console.log(
-      `[control] remote locked #${payload?.proposal?.id ?? "?"}` +
+      `[control] remote selected #${payload?.proposal?.id ?? "?"}` +
         `${payload?.proposal?.rank ? ` · rank ${payload.proposal.rank}` : ""}` +
         `${payload?.proposal?.score != null ? ` · score ${payload.proposal.score}` : ""}` +
         ` → ${payload?.proposal?.text ?? payload?.directive?.text ?? "selected proposal"}`,
@@ -309,6 +309,7 @@ function usage() {
   bun run control -- inject <prompt...> --local
   bun run control -- inject-force <prompt...> --local
   bun run control -- clear-queue --local
+  bun run control -- clear-turn --local
 `,
   );
 }
@@ -646,7 +647,7 @@ if (command === "doctor") {
     actor: "cli",
   });
   console.log(
-    `[control] locked #${result.proposal.id} · rank ${result.rank} · score ${result.score} → ${result.proposal.text}`,
+    `[control] selected #${result.proposal.id} · rank ${result.rank} · score ${result.score} → ${result.proposal.text}`,
   );
 } else if (command === "force") {
   const id = Number((args[0] || "").replace(/^#/, ""));
@@ -657,6 +658,25 @@ if (command === "doctor") {
   const directive = await repo.forceProposalAsNext(id);
   if (!directive) throw new Error("No open round with proposals");
   console.log(`[control] forced #${id} → ${directive.text}`);
+} else if (command === "clear-turn") {
+  const room = await repo.getRoomRow();
+  const workerHeartbeatAtMs = Number(room.heartbeatAtMs || 0);
+  const workerIsLive =
+    workerHeartbeatAtMs > 0 && Date.now() - workerHeartbeatAtMs < 5_000;
+  if (workerIsLive) {
+    throw new Error(
+      "Generation worker is still online. Stop PumpTV first, wait ~6 seconds, then run clear-turn.",
+    );
+  }
+  if (await repo.hasQueuedDirective())
+    throw new Error(
+      "A generation is still queued. Run clear-queue --local first, then clear-turn --local.",
+    );
+  const cleared = await repo.discardOpenPromptRound("control");
+  const fresh = await repo.ensureOpenPromptRound(await repo.nextEpisode());
+  console.log(
+    `[control] cleared round ${cleared.roundId ?? "none"}: ${cleared.proposals} idea${cleared.proposals === 1 ? "" : "s"}, ${cleared.votes} vote${cleared.votes === 1 ? "" : "s"}; fresh turn #${fresh.id} → EP ${fresh.targetEpisode + 1}`,
+  );
 } else if (command === "clear-queue") {
   const room = await repo.getRoomRow();
   const workerHeartbeatAtMs = Number(room.heartbeatAtMs || 0);

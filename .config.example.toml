@@ -23,14 +23,12 @@ timeline_window = 96
 idle_poll_ms = 500
 error_backoff_ms = 2000
 
-# Next-episode decision policy. The first independent IP gets a 20s solo lock-in.
-# A second independent IP opens voting with at least 10s to participate.
+# Next-episode decision policy. The first independent participant gets 20s.
+# The first challenger starts a fresh 20s ballot. Votes never change the clock;
+# a genuinely new late candidate only gets enough grace to be votable.
 solo_decision_ms = 20000
-voting_base_ms = 15000
-voting_guarantee_ms = 10000
-auto_trigger_min_ms = 8000
-auto_trigger_idea_step_ms = 2000
-auto_trigger_vote_step_ms = 1000
+voting_window_ms = 20000
+voting_new_idea_grace_ms = 10000
 
 # Latency hiding. A speculative render never closes voting or mutates canon; it
 # is promoted only if the exact proposal/text actually wins. Solo rounds can

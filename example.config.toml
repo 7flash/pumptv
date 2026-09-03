@@ -23,15 +23,12 @@ long_poll_check_ms = 400
 long_poll_timeout_ms = 25000
 viewer_ttl_ms = 45000
 
-# Automatic next-episode decision. One independent idea gets a clean 20s solo
-# lock-in. A second independent participant opens voting and is guaranteed at
-# least 10s to vote; after that, additional activity can only shorten the timer.
+# Automatic next-episode decision. One independent idea gets 20s. The first
+# challenger starts a fresh 20s ballot. Votes never alter the deadline; a new
+# late candidate gets a bounded grace period instead of making the clock jump.
 solo_decision_ms = 20000
-voting_base_ms = 15000
-voting_guarantee_ms = 10000
-auto_trigger_min_ms = 8000
-auto_trigger_idea_step_ms = 2000
-auto_trigger_vote_step_ms = 1000
+voting_window_ms = 20000
+voting_new_idea_grace_ms = 10000
 
 # Latency hiding. A speculative render never closes voting or mutates canon; it
 # is promoted only if the exact proposal/text actually wins. Solo rounds can

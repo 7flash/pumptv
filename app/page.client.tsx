@@ -411,6 +411,13 @@ function syncIdeaDraftFromBoard() {
 
 function ideaCanSubmit() {
   if (ideaSubmitting) return false;
+  if (
+    program?.phase === "locked" ||
+    program?.phase === "planning" ||
+    program?.phase === "rendering" ||
+    program?.phase === "finalizing"
+  )
+    return false;
   const text = normalizedIdea(ideaDraft);
   if (!text) return false;
   const own = ownProposal();
@@ -1779,12 +1786,6 @@ function clipFactOverlay(clip: Clip | null | undefined) {
   }
 }
 
-function directiveAuthor(directive: Directive | null) {
-  return directive
-    ? authorLabel(directive.author, directive.authorAddress)
-    : "@?";
-}
-
 function engineState() {
   if (!program) return "boot";
   if (program.phase === "starting") return "boot";
@@ -1804,7 +1805,7 @@ function tooltipStatus() {
   if (program.reason) return program.reason;
   if (program.phase === "starting") return "Generation worker is starting";
   if (program.phase === "locked")
-    return "Next episode is triggered and waiting for the worker";
+    return `Preparing episode ${program.targetEpisode + 1}`;
   if (
     program.phase === "planning" ||
     program.phase === "rendering" ||
@@ -1997,70 +1998,29 @@ function OutsideProgram() {
   if (!program || !liveOverlayEnabled) return null;
 
   const phase = program.phase;
-  const generating =
-    phase === "planning" || phase === "rendering" || phase === "finalizing";
   const deciding = phase === "deciding";
   const voting = phase === "voting";
-  const decidingOrVoting = deciding || voting;
-  const ready = phase === "ready";
-  const locked = phase === "locked";
-  const decisionRound = program.decisionRound;
-  const votingRound = program.votingRound;
-  const primaryRound = decidingOrVoting ? votingRound : decisionRound;
-  const futureRound =
-    !voting &&
-    votingRound &&
-    votingRound.targetEpisode !== program.targetEpisode
-      ? votingRound
-      : null;
+  if (!deciding && !voting) return null;
 
+  const primaryRound = program.votingRound || program.decisionRound;
   return (
     <section
-      className={`outsideProgram phase-${phase} ${generating ? "generating" : ""} ${ready ? "ready" : ""}`}
+      className={`outsideProgram phase-${phase}`}
       title={program.reason || tooltipStatus()}
-      aria-label="Next episode status"
+      aria-label="Next episode decision"
     >
       <div className="outsideProgramHead">
         <span className="outsideProgramGlyph" aria-hidden="true">
           {stageGlyph(phase)}
         </span>
         <b>{program.targetEpisode + 1}</b>
-        {decidingOrVoting && program.countdownEndsAtMs ? (
+        {program.countdownEndsAtMs ? (
           <strong data-vote-countdown>
             {formatClock(program.countdownEndsAtMs - liveNowMs())}
           </strong>
         ) : null}
-        {generating && program.generationStartedAtMs ? (
-          <strong data-generation-elapsed>
-            {formatClock(liveNowMs() - program.generationStartedAtMs)}
-          </strong>
-        ) : null}
       </div>
-
-      {program.directive && (generating || locked || ready) ? (
-        <div className="outsideWinner">
-          <span>{program.directive.text}</span>
-          <i>{directiveAuthor(program.directive)}</i>
-        </div>
-      ) : null}
-
-      {decidingOrVoting ? <CandidateRows round={primaryRound} /> : null}
-
-      {futureRound?.proposals.length ? (
-        <div className="outsideFuture">
-          <div className="outsideFutureHead">
-            <span>◉</span>
-            <b>{futureRound.targetEpisode + 1}</b>
-            {futureRound.votingStartedAtMs &&
-            futureRound.closesAtMs > liveNowMs() ? (
-              <strong data-future-vote-countdown>
-                {formatClock(futureRound.closesAtMs - liveNowMs())}
-              </strong>
-            ) : null}
-          </div>
-          <CandidateRows round={futureRound} limit={3} />
-        </div>
-      ) : null}
+      <CandidateRows round={primaryRound} />
     </section>
   );
 }
@@ -2228,8 +2188,11 @@ function trayRound() {
 function ParticipationIdeas() {
   const round = trayRound();
   const candidates = sortedCandidates(round);
-  const canVote = Boolean(round?.status === "open");
-  const generating =
+  const canVote = Boolean(
+    round?.status === "open" && round.decisionMode === "voting",
+  );
+  const generationBusy =
+    program?.phase === "locked" ||
     program?.phase === "planning" ||
     program?.phase === "rendering" ||
     program?.phase === "finalizing";
@@ -2245,28 +2208,18 @@ function ParticipationIdeas() {
           spellCheck="true"
           placeholder="what happens next?"
           aria-label="Next episode idea"
-          disabled={ideaSubmitting}
+          disabled={ideaSubmitting || generationBusy}
         />
         <button
           type="submit"
           data-action="submit-idea"
-          disabled={ideaSubmitting || !ideaDraft.trim()}
+          disabled={!ideaCanSubmit()}
           title="Submit"
           aria-label="Submit idea"
         >
           <TrayIcon name="send" />
         </button>
       </form>
-
-      {program?.directive &&
-      (generating ||
-        program.phase === "locked" ||
-        program.phase === "ready") ? (
-        <div className="trayLocked">
-          <span>{program.directive.text}</span>
-          <i>{directiveAuthor(program.directive)}</i>
-        </div>
-      ) : null}
 
       {round ? (
         <div className="trayBallot">
@@ -2624,7 +2577,7 @@ function PersistentIdeas() {
         </b>
         {countdown ? (
           <span>
-            {round?.decisionMode === "voting" ? "VOTE ENDS" : "LOCKS IN"}{" "}
+            {round?.decisionMode === "voting" ? "VOTE" : "STARTS"}{" "}
             <strong data-drawer-countdown>{countdown}</strong>
           </span>
         ) : null}
@@ -2948,6 +2901,18 @@ function YourTurnOverlay() {
   if (replayClipId != null || liveSlotState !== "intermission" || !program)
     return null;
 
+  // Once the decision closes, the center of the TV stops being an interaction
+  // surface. Generation is represented by a tiny passive pulse instead; this
+  // avoids covering the first frames of a newly published episode with stale UI.
+  if (
+    program.phase === "locked" ||
+    program.phase === "planning" ||
+    program.phase === "rendering" ||
+    program.phase === "finalizing" ||
+    program.phase === "ready"
+  )
+    return null;
+
   const round = program.votingRound;
   const ideas = round?.proposals.length || 0;
   const decisionMode =
@@ -2955,69 +2920,57 @@ function YourTurnOverlay() {
   const countdown = program.countdownEndsAtMs
     ? `${Math.max(0, Math.ceil((program.countdownEndsAtMs - liveNowMs()) / 1000))}s`
     : null;
-  const busy =
-    program.phase === "locked" ||
-    program.phase === "planning" ||
-    program.phase === "rendering" ||
-    program.phase === "finalizing";
   const unavailable =
     program.phase === "offline" ||
     program.phase === "setup" ||
     program.phase === "paused";
-  const prewarming = Boolean(
-    !busy &&
-    round &&
-    room?.prewarm?.roundId === round.id &&
-    room?.prewarm?.proposalId === round.proposals[0]?.id &&
-    room?.prewarm?.stage !== "idle",
-  );
 
   return (
-    <div className={`yourTurnOverlay ${busy ? "busy" : "choose"}`}>
+    <div className="yourTurnOverlay choose">
       <div className="yourTurnCard">
         <span className="yourTurnKicker">
-          {busy ? "NEXT EPISODE" : "YOUR TURN"}
+          {decisionMode === "voting" ? "VOTE" : "YOUR TURN"}
         </span>
-        <strong>
-          {busy
-            ? program.phase === "locked"
-              ? "Starting…"
-              : "Creating what happens next…"
-            : decisionMode === "voting"
-              ? `${ideas} ideas · voting open`
-              : ideas
-                ? "1 idea · unless challenged"
-                : "What happens next?"}
-        </strong>
-        <div className="yourTurnMeta">
-          {unavailable ? (
-            <>{program.reason || "Generation is temporarily unavailable"}</>
-          ) : !busy && countdown ? (
-            <>
-              {decisionMode === "voting" ? "Voting ends in" : "Locks in in"}{" "}
-              <b data-your-turn-countdown>{countdown}</b>
-              {prewarming ? (
-                <span className="yourTurnPrep"> · episode prep started</span>
-              ) : null}
-            </>
-          ) : busy && ideas ? (
-            <>
-              {ideas} idea{ideas === 1 ? "" : "s"} queued after this
-            </>
-          ) : !busy ? (
-            <>Be the first to decide</>
-          ) : null}
-        </div>
+        {countdown ? (
+          <strong className="yourTurnCountdown" data-your-turn-countdown>
+            {countdown}
+          </strong>
+        ) : null}
+        {ideas ? (
+          <div className="yourTurnMeta">
+            {ideas} IDEA{ideas === 1 ? "" : "S"}
+          </div>
+        ) : unavailable ? (
+          <div className="yourTurnMeta">{program.reason || "UNAVAILABLE"}</div>
+        ) : null}
         <button type="button" data-action="tray-ideas">
-          {busy
-            ? "ADD NEXT IDEA"
-            : decisionMode === "voting"
-              ? "VOTE OR ADD IDEA"
-              : ideas
-                ? "CHALLENGE OR VIEW IDEA"
-                : "ADD AN IDEA"}
+          {decisionMode === "voting" ? "OPEN VOTE" : "ADD IDEA"}
         </button>
       </div>
+    </div>
+  );
+}
+
+function GenerationPulse() {
+  if (replayClipId != null || liveSlotState !== "intermission" || !program)
+    return null;
+  if (
+    program.phase !== "locked" &&
+    program.phase !== "planning" &&
+    program.phase !== "rendering" &&
+    program.phase !== "finalizing" &&
+    program.phase !== "ready"
+  )
+    return null;
+  const label = program.phase === "ready" ? "LOADING" : "GENERATING";
+  return (
+    <div
+      className="generationPulse"
+      aria-label={`${label === "LOADING" ? "Loading" : "Generating"} episode ${program.targetEpisode + 1}`}
+      title={tooltipStatus()}
+    >
+      <i aria-hidden="true" />
+      <span>{label}</span>
     </div>
   );
 }
@@ -3046,6 +2999,7 @@ function TactileTV({ clip }: { clip: Clip | null }) {
             <CurrentPrompt clip={clip} />
           ) : null}
           <YourTurnOverlay />
+          <GenerationPulse />
           {isReplay ? (
             <button
               className="liveReturn"
@@ -3117,13 +3071,14 @@ function ProgramShelfSlot() {
             phase === "finalizing"
           ? `Generating episode ${episode}`
           : phase === "locked"
-            ? `Episode ${episode} locked`
+            ? `Preparing episode ${episode}`
             : `Waiting for episode ${episode}`);
   const copy =
-    directiveText ||
-    (candidateCount
-      ? `${candidateCount} idea${candidateCount === 1 ? "" : "s"}`
-      : "");
+    phase === "deciding" || phase === "voting"
+      ? candidateCount
+        ? `${candidateCount} idea${candidateCount === 1 ? "" : "s"}`
+        : ""
+      : "";
   return (
     <div
       className={`programShelfSlot phase-${phase}`}
@@ -6090,57 +6045,85 @@ function OutsideInterfaceStyles() {
         z-index: 18;
         display: grid;
         place-items: center;
-        padding: clamp(16px, 4vw, 42px);
+        padding: clamp(14px, 3vw, 30px);
         pointer-events: none;
       }
       .yourTurnCard {
-        width: min(430px, 82%);
+        width: min(270px, 72%);
         display: grid;
         justify-items: center;
-        gap: 9px;
-        padding: 20px 22px 18px;
-        border: 1px solid rgba(226,185,83,.2);
-        border-radius: 16px;
-        background: rgba(8,9,10,.76);
-        box-shadow: inset 0 1px rgba(255,255,255,.05), 0 20px 55px rgba(0,0,0,.38);
-        backdrop-filter: blur(13px) saturate(.9);
+        gap: 8px;
+        padding: 16px 18px 15px;
+        border: 1px solid rgba(226,185,83,.19);
+        border-radius: 14px;
+        background: rgba(8,9,10,.68);
+        box-shadow: inset 0 1px rgba(255,255,255,.04), 0 16px 42px rgba(0,0,0,.3);
+        backdrop-filter: blur(10px) saturate(.9);
         text-align: center;
         pointer-events: auto;
       }
       .yourTurnKicker {
         color: var(--pump-gold-hi);
-        font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-        letter-spacing: .18em;
+        font: 800 9px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        letter-spacing: .2em;
       }
-      .yourTurnCard > strong {
-        max-width: 30ch;
-        color: rgba(248,248,243,.96);
-        font-size: clamp(18px, 2vw, 25px);
-        line-height: 1.08;
+      .yourTurnCountdown {
+        color: rgba(248,248,243,.98);
+        font: 800 clamp(28px, 4vw, 40px)/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        font-variant-numeric: tabular-nums;
+        letter-spacing: -.05em;
       }
       .yourTurnMeta {
-        min-height: 14px;
-        color: rgba(226,226,220,.58);
-        font: 650 10px/1.25 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        min-height: 11px;
+        color: rgba(226,226,220,.52);
+        font: 750 9px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        letter-spacing: .1em;
       }
-      .yourTurnMeta b { color: var(--pump-gold-hi); font-variant-numeric: tabular-nums; }
-      .yourTurnPrep { color: rgba(255,255,255,.68); font-style: normal; white-space: nowrap; }
       .yourTurnCard > button {
-        min-height: 38px;
-        margin-top: 2px;
-        padding: 0 17px;
-        border: 1px solid rgba(226,185,83,.34);
-        border-radius: 10px;
-        background: linear-gradient(180deg, rgba(215,164,59,.16), rgba(215,164,59,.07));
+        min-height: 36px;
+        margin-top: 1px;
+        padding: 0 15px;
+        border: 1px solid rgba(226,185,83,.3);
+        border-radius: 9px;
+        background: rgba(215,164,59,.1);
         color: var(--pump-gold-hi);
-        box-shadow: inset 0 1px rgba(255,255,255,.06), 0 8px 22px rgba(0,0,0,.22);
-        font: 800 10px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        box-shadow: inset 0 1px rgba(255,255,255,.05);
+        font: 800 9px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
         letter-spacing: .08em;
         cursor: pointer;
       }
       .yourTurnCard > button:active { transform: translateY(1px); }
-      .yourTurnOverlay.busy .yourTurnCard { border-color: rgba(255,255,255,.11); }
-      .yourTurnOverlay.busy .yourTurnKicker { color: var(--pump-silver); }
+      .generationPulse {
+        position: absolute;
+        left: 50%;
+        bottom: clamp(18px, 4vw, 34px);
+        z-index: 18;
+        transform: translateX(-50%);
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        padding: 7px 10px;
+        border: 1px solid rgba(255,255,255,.09);
+        border-radius: 999px;
+        background: rgba(8,9,10,.5);
+        color: rgba(242,242,236,.7);
+        backdrop-filter: blur(8px);
+        pointer-events: none;
+        font: 750 8px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+        letter-spacing: .14em;
+      }
+      .generationPulse > i {
+        width: 6px;
+        height: 6px;
+        border-radius: 999px;
+        background: var(--pump-gold-hi);
+        box-shadow: 0 0 10px rgba(226,185,83,.55);
+        animation: generationPulse 1.15s ease-in-out infinite alternate;
+      }
+      @keyframes generationPulse {
+        from { opacity: .35; transform: scale(.82); }
+        to { opacity: 1; transform: scale(1.08); }
+      }
 
       @media (max-width: 820px) {
         html, body, #pumptv-page {
@@ -6188,7 +6171,7 @@ function OutsideInterfaceStyles() {
           gap: 7px !important;
           border-radius: 14px !important;
         }
-        .yourTurnCard > strong { font-size: clamp(17px, 5vw, 22px) !important; }
+        .yourTurnCountdown { font-size: clamp(28px, 10vw, 38px) !important; }
         .yourTurnCard > button { min-height: 42px !important; width: 100% !important; }
         .episodeShelf {
           position: relative !important;
