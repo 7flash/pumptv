@@ -17,9 +17,9 @@ import {
   DecisionWindowClosedError,
 } from "../../../src/server/repository.ts";
 import {
-  normalizeSolanaAddress,
+  normalizeEvmAddress,
   walletVotingPower,
-} from "../../../src/server/wallet-score.ts";
+} from "../../../src/server/evm-wallet.ts";
 import { participationCohortKey } from "../../../src/server/participant-identity.ts";
 
 function anonymousKey(value: unknown) {
@@ -46,7 +46,7 @@ export function POST(request: Request) {
       const proposalId = Number(body.proposalId);
       if (!Number.isSafeInteger(proposalId) || proposalId <= 0)
         throw new Error("Invalid proposal id");
-      const walletAddress = normalizeSolanaAddress(body.walletAddress);
+      const walletAddress = normalizeEvmAddress(body.walletAddress);
       const subjectKey = voterKey(body.ownerId ?? body.viewerId, walletAddress);
       participationSlot = claimParticipationSlot({
         originIpHash,

@@ -39,17 +39,29 @@ prewarm_solo_immediate = 1
 prewarm_voting_lead_ms = 12000
 prewarm_lease_ttl_ms = 30000
 
-# Phantom/token-weighted proposal score. This MUST be configured in the web .config.toml
-# because /api/wallet/score runs in the web process.
+# Optional Solana/Pump.fun compatibility. MetaMask web participants are one-wallet/one-vote;
+# these fields no longer control the browser wallet score.
 token_mint = ""
 solana_rpc_url = "https://api.mainnet-beta.solana.com"
 wallet_score_cache_ms = 20000
 
-# Winning web ideas with a connected Solana wallet receive an automatic SOL reward.
-# Solard owns the reward wallet/signing; fund this wallet before enabling payouts.
-winner_reward_sol = 0.01
-reward_wallet_name = "pumptv-winner-rewards"
+# Web participation uses MetaMask / EVM wallet identity. Robinhood Chain is an
+# EVM L2 whose native currency is ETH. Mainnet is chain 4663; use 46630 + the
+# testnet RPC while validating payouts before enabling real rewards.
+robinhood_chain_id = 4663
+robinhood_rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+robinhood_explorer_url = "https://robinhoodchain.blockscout.com"
+
+# Each winning idea with a connected MetaMask wallet receives approximately
+# this USD value, paid as native ETH on Robinhood Chain. The worker quotes
+# ETH/USD immediately before sending, persists the exact wei amount, then sends.
+winner_reward_usd = 1.00
+reward_eth_usd_url = "https://api.coinbase.com/v2/prices/ETH-USD/spot"
+reward_price_cache_ms = 60000
+reward_price_retry_ms = 30000
 reward_sending_stale_ms = 180000
+# The payout signing key does NOT belong in the web config. Put
+# PUMPTV_REWARD_PRIVATE_KEY in .worker.toml only; see .worker.example.toml.
 
 # Shared worker ownership/health settings used by the web process.
 web_heartbeat_ttl_ms = 6000

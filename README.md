@@ -224,3 +224,36 @@ bun run start
 ```
 
 Then Ctrl+C stops TradJS and the owned worker follows.
+
+## Invariants
+
+1. `YOUR TURN` is owned by the browser playback boundary. When the actually presented live clip ends and no newer live clip is pending, the next-turn overlay appears immediately. It no longer waits for a fresh server snapshot.
+2. A stale server phase for the clip that just played (`ready`, `finalizing`, etc.) cannot suppress the next turn. Busy state only suppresses the overlay when `program.targetEpisode` is strictly newer than the episode the browser just presented.
+3. The client performs a best-effort `/api/state` refresh at every live episode boundary to repair long-poll drift, but correctness does not depend on that request succeeding.
+4. `GENERATING` / `LOADING` remains visible until the incoming video is genuinely usable and a first frame has crossed the browser presentation gate.
+5. As soon as the incoming frame is presented, the media state transition schedules a UI redraw. This prevents a stale `LOADING` badge from remaining over an already-playing episode.
+6. All live media state transitions now go through `setLiveSlotState(...)` and are logged through the existing `media` measure-fn scope with reason + transition metadata.
+7. First-frame detection no longer treats a delayed `requestVideoFrameCallback()` as a reason to fail the whole activation after five seconds. The measured gate accepts rVFC, real `playing`, or verified time progression with current media data; only genuinely unusable playback hits the hard failure path.
+
+## Expected flow
+
+```
+EP N ends
+  -> media: playing -> intermission
+  -> YOUR TURN renders immediately
+  -> background state refresh (non-authoritative)
+
+idea timer closes
+  -> YOUR TURN disappears
+  -> GENERATING remains while server renders
+  -> LOADING remains while the browser fetches/decodes the finished clip
+
+first frame of EP N+1 is actually presented
+  -> media: intermission -> transitioning -> playing
+  -> LOADING is removed in the same presentation transition
+
+EP N+1 ends
+  -> media: playing -> intermission
+  -> YOUR TURN renders again without refresh
+```
+

@@ -108,7 +108,15 @@ const openedDb = dbMeasure.measureSync(
           roundId: z.number(),
           proposalId: z.number(),
           walletAddress: z.string(),
-          amountLamports: z.number(),
+          // Legacy SOL field remains for safe upgrades of v47-v50 databases.
+          // New Robinhood Chain rows always write 0 here and use amountWei.
+          amountLamports: z.number().default(0),
+          chainId: z.number().default(0),
+          asset: z.string().default("LEGACY"),
+          targetUsdCents: z.number().default(0),
+          amountWei: z.string().nullable().default(null),
+          quotedEthUsdMicros: z.number().nullable().default(null),
+          quoteSource: z.string().nullable().default(null),
           status: z
             .enum(["pending", "sending", "sent", "uncertain", "skipped"])
             .default("pending"),

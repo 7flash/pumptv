@@ -15,14 +15,15 @@
   },
   "dependencies": {
     "@fal-ai/client": "^1.6.2",
-    "@solard/sdk": "^0.2.9",
     "measure-fn": "^5.2.0",
     "sqlite-zod-orm": "^3.33.0",
     "tradjs": "^4.3.0",
     "ws": "^8.18.0",
     "jsx-ai": "latest",
     "bgrun": "^3.14.0",
-    "@openai/codex-sdk": "latest"
+    "@openai/codex-sdk": "latest",
+    "@metamask/connect-evm": "^2.1.1",
+    "viem": "^2.56.3"
   },
   "devDependencies": {
     "@types/bun": "latest",

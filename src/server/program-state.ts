@@ -52,9 +52,9 @@ export function deriveLiveProgramState(input: {
   };
   const lockedPrewarmMatches = Boolean(
     nextDirective &&
-      prewarm.proposalId != null &&
-      nextDirective.proposalId === prewarm.proposalId &&
-      prewarm.stage !== "idle",
+    prewarm.proposalId != null &&
+    nextDirective.proposalId === prewarm.proposalId &&
+    prewarm.stage !== "idle",
   );
 
   if (!room.workerOnline) {
@@ -68,8 +68,7 @@ export function deriveLiveProgramState(input: {
   } else if (countdownEndsAtMs) {
     // Speculative rendering is deliberately invisible to arbitration: the UI
     // stays in decision/voting mode until the server actually locks a winner.
-    phase =
-      votingRound?.decisionMode === "voting" ? "voting" : "deciding";
+    phase = votingRound?.decisionMode === "voting" ? "voting" : "deciding";
   } else if (room.workerState === "generating") {
     phase = room.generationStage === "idle" ? "planning" : room.generationStage;
   } else if (lockedPrewarmMatches) {

@@ -11,9 +11,11 @@ import {
 } from "../../../../src/server/moderation.ts";
 import { attachWebWallet } from "../../../../src/server/repository.ts";
 import {
-  normalizeSolanaAddress,
+  normalizeEvmAddress,
+  walletNetworkInfo,
+  walletOwnerKey,
   walletVotingPower,
-} from "../../../../src/server/wallet-score.ts";
+} from "../../../../src/server/evm-wallet.ts";
 
 function ownerKey(value: unknown) {
   const id = sanitizeLine(String(value || ""), 180);
@@ -21,32 +23,24 @@ function ownerKey(value: unknown) {
   return `web:${id}`;
 }
 
-function errorStatus(error: unknown) {
-  const message = errorText(error);
-  return /not configured|does not exist|not an SPL token mint/i.test(message)
-    ? 503
-    : 400;
-}
-
 export function GET(request: Request) {
   return measuredRoute(request, async () => {
     try {
       const url = new URL(request.url);
-      const address = normalizeSolanaAddress(
-        url.searchParams.get("walletAddress"),
-      );
-      if (!address) throw new Error("Invalid Solana wallet");
+      const rawAddress = url.searchParams.get("walletAddress");
+      if (!rawAddress) return Response.json({ network: walletNetworkInfo() });
+      const address = normalizeEvmAddress(rawAddress);
+      if (!address) throw new Error("Invalid EVM wallet");
       const fresh = /^(1|true|yes)$/i.test(
         url.searchParams.get("refresh") || "",
       );
       const score = await httpMeasure.measure(
         {
           start: () =>
-            `Inspect wallet score ${address.slice(0, 5)}…${address.slice(-4)}`,
+            `Inspect Robinhood wallet ${address.slice(0, 6)}…${address.slice(-4)}`,
           end: (value) => ({
-            mint: value.mint,
-            tokenProgram: value.tokenProgram,
-            matchingAccounts: value.matchingAccounts,
+            chainId: value.chainId,
+            ethBalance: value.ethBalance,
             power: value.power,
             fresh,
           }),
@@ -57,10 +51,7 @@ export function GET(request: Request) {
     } catch (error) {
       return Response.json(
         { error: errorText(error) },
-        {
-          status:
-            error instanceof ModerationBlockedError ? 403 : errorStatus(error),
-        },
+        { status: error instanceof ModerationBlockedError ? 403 : 400 },
       );
     }
   });
@@ -71,7 +62,7 @@ export function POST(request: Request) {
     try {
       const { originIpHash } = assertRequestAllowed(request);
       const body = await httpMeasure.measure(
-        "Parse wallet request",
+        "Parse MetaMask wallet request",
         async () => {
           const raw = await request.json();
           if (!raw || typeof raw !== "object" || Array.isArray(raw))
@@ -79,17 +70,16 @@ export function POST(request: Request) {
           return raw as Record<string, unknown>;
         },
       );
-      const address = normalizeSolanaAddress(body.walletAddress);
-      if (!address) throw new Error("Invalid Solana wallet");
+      const address = normalizeEvmAddress(body.walletAddress);
+      if (!address) throw new Error("Invalid EVM wallet");
       const anonymousOwnerKey = ownerKey(body.ownerId ?? body.viewerId);
-      const walletOwnerKey = `wallet:${address}`;
+      const walletKey = walletOwnerKey(address);
       const score = await httpMeasure.measure(
         {
-          start: () => "Read wallet token balance",
+          start: () => "Read Robinhood wallet state",
           end: (value) => ({
-            mint: value.mint,
-            tokenProgram: value.tokenProgram,
-            matchingAccounts: value.matchingAccounts,
+            chainId: value.chainId,
+            ethBalance: value.ethBalance,
             power: value.power,
           }),
         },
@@ -97,7 +87,7 @@ export function POST(request: Request) {
       );
       await httpMeasure.measure(
         {
-          start: () => "Apply wallet score",
+          start: () => "Attach MetaMask wallet identity",
           end: (round) => ({
             roundId: round?.id ?? null,
             proposals: round?.proposals.length ?? 0,
@@ -109,21 +99,16 @@ export function POST(request: Request) {
             ownerKey: anonymousOwnerKey,
             walletAddress: address,
             weight: score.power,
-            participantKey: originIpHash
-              ? `ip:${originIpHash}`
-              : walletOwnerKey,
+            participantKey: walletKey,
           }),
       );
       recordSubjectOrigin(anonymousOwnerKey, originIpHash);
-      recordSubjectOrigin(walletOwnerKey, originIpHash);
+      recordSubjectOrigin(walletKey, originIpHash);
       return Response.json({ walletAddress: address, ...score });
     } catch (error) {
       return Response.json(
         { error: errorText(error) },
-        {
-          status:
-            error instanceof ModerationBlockedError ? 403 : errorStatus(error),
-        },
+        { status: error instanceof ModerationBlockedError ? 403 : 400 },
       );
     }
   });

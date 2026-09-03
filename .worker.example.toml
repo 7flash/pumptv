@@ -1,0 +1,28 @@
+# PumpTV generation/reward worker secrets and worker-only overrides.
+# Copy to .worker.toml. This file is intentionally separate from .config.toml
+# so the web server never needs the payout private key.
+
+[fal]
+key = ""
+
+[jsx_ai]
+runtime = "codex"
+model = "gpt-5.6"
+
+[pumptv]
+# Keep these identical to the web config.
+db_path = ".data/pumptv.sqlite"
+room = "main"
+
+# Robinhood Chain payout network. Testnet: chain_id=46630 and testnet RPC.
+robinhood_chain_id = 4663
+robinhood_rpc_url = "https://rpc.mainnet.chain.robinhood.com"
+robinhood_explorer_url = "https://robinhoodchain.blockscout.com"
+
+# Dedicated hot-wallet key used only by the reward worker. Never commit a real
+# key and do not place it in .config.toml. Fund only the amount you are willing
+# to use for winner rewards + gas.
+reward_private_key = ""
+
+[measure]
+timestamps = 1

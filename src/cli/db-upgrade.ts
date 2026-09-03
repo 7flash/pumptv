@@ -6,11 +6,14 @@ await loadTomlEnvironment(PROJECT_ROOT, ".config.toml");
 
 // Importing db.ts is intentionally the only schema step here. sqlite-zod-orm owns
 // the declarative table/column shape from its Database schema. This command only
-// installs PumpTV's raw SQLite indexes and, when explicitly requested, performs
-// legacy semantic data repair from pre-explicit-trigger builds.
+// installs PumpTV's raw SQLite indexes, safely retires incompatible legacy
+// reward rows, and, when explicitly requested, performs broader legacy semantic
+// data repair from pre-explicit-trigger builds.
 const { db, dbPath } = await import("../server/db.ts");
 
 const legacyRepair = process.argv.includes("--legacy-repair");
+let legacyRewardPendingSkipped = 0;
+let legacyRewardSendingQuarantined = 0;
 const now = Date.now();
 const room =
   db.raw<any>(
@@ -47,6 +50,8 @@ const indexes = [
    ON ideaRewards(walletAddress, id DESC)`,
   `CREATE INDEX IF NOT EXISTS idea_rewards_status_idx
    ON ideaRewards(status, id)`,
+  `CREATE INDEX IF NOT EXISTS idea_rewards_chain_status_idx
+   ON ideaRewards(chainId, asset, status, id)`,
   `CREATE INDEX IF NOT EXISTS proposal_votes_round_handle_idx
    ON proposalVotes(roundId, voterHandle)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS proposals_round_web_owner_unique
@@ -66,6 +71,42 @@ const journal = db.raw<any>("PRAGMA journal_mode = WAL")[0] || null;
 db.exec("BEGIN IMMEDIATE");
 try {
   for (const sql of indexes) db.exec(sql);
+
+  // v47-v50 paid winners in SOL. The v51 schema keeps those rows as
+  // chainId=0 / asset=LEGACY so the Robinhood worker can never reinterpret a
+  // historical Solana payout as an EVM transfer. Pending legacy payouts are
+  // explicitly retired; in-flight legacy payouts are quarantined because
+  // replaying them could pay a winner twice.
+  legacyRewardPendingSkipped = Number(
+    (
+      db.raw<any>(
+        `SELECT COUNT(*) AS count FROM ideaRewards
+         WHERE chainId = 0 AND asset = 'LEGACY' AND status = 'pending'`,
+      )[0] || {}
+    ).count || 0,
+  );
+  legacyRewardSendingQuarantined = Number(
+    (
+      db.raw<any>(
+        `SELECT COUNT(*) AS count FROM ideaRewards
+         WHERE chainId = 0 AND asset = 'LEGACY' AND status = 'sending'`,
+      )[0] || {}
+    ).count || 0,
+  );
+  if (legacyRewardPendingSkipped > 0)
+    db.exec(
+      `UPDATE ideaRewards
+       SET status = 'skipped',
+           lastError = 'Legacy SOL reward retired during Robinhood Chain migration; it was never converted or replayed as ETH.'
+       WHERE chainId = 0 AND asset = 'LEGACY' AND status = 'pending'`,
+    );
+  if (legacyRewardSendingQuarantined > 0)
+    db.exec(
+      `UPDATE ideaRewards
+       SET status = 'uncertain',
+           lastError = 'Legacy SOL reward was in-flight during Robinhood Chain migration; not replayed automatically because payout state is ambiguous.'
+       WHERE chainId = 0 AND asset = 'LEGACY' AND status = 'sending'`,
+    );
 
   if (legacyRepair) {
     // One-time compatibility repair for databases that lived through the old
@@ -122,4 +163,7 @@ console.log(
 console.log(`[db-upgrade] ensured ${indexes.length} PumpTV indexes`);
 console.log(
   `[db-upgrade] legacy repair=${legacyRepair ? "applied" : "skipped"}`,
+);
+console.log(
+  `[db-upgrade] legacy SOL rewards: ${legacyRewardPendingSkipped} pending retired, ${legacyRewardSendingQuarantined} in-flight quarantined`,
 );

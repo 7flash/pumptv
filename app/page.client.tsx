@@ -1,5 +1,11 @@
 import { render } from "tradjs/client";
+import { createEVMClient } from "@metamask/connect-evm";
+import { getAddress, isAddress } from "viem";
 import { createMeasure } from "measure-fn";
+import {
+  createInvalidationQueue,
+  createReactiveState,
+} from "../src/client/signals.ts";
 import type {
   Clip,
   Directive,
@@ -12,6 +18,7 @@ import type {
 } from "../src/shared/contracts.ts";
 
 const mediaMeasure = createMeasure("media");
+const uiMeasure = createMeasure("ui");
 
 function clientErrorText(error: unknown) {
   return error instanceof Error
@@ -19,79 +26,153 @@ function clientErrorText(error: unknown) {
     : String(error ?? "Unknown error");
 }
 
-let timeline: Clip[] = [];
-let room: RoomState | null = null;
-let nextDirective: Directive | null = null;
-let program: LiveProgramState | null = null;
-let worldState: WorldState | null = null;
 let serverOffsetMs = 0;
-let replayClipId: number | null = null;
 let longPollAbort: AbortController | null = null;
 let streamRevision = 0;
 let viewerId = "";
 let proposalOwnerId = "";
 let initialCatchupPending = false;
 const NEW_VIEWER_HISTORY_OFFSET = 7;
-let transport: "connecting" | "live" | "reconnecting" = "connecting";
-let error: string | null = null;
 let timer: ReturnType<typeof setInterval> | null = null;
-
-let soundEnabled = false;
-let captionsEnabled = true;
-let liveOverlayEnabled = true;
-let infoOpen = false;
-let playbackPaused = false;
-let pausedClipId: number | null = null;
 
 type TrayView = "ideas" | "world";
 type WalletState = "idle" | "connecting" | "connected" | "missing" | "error";
 
-let trayOpen = false;
-let trayView: TrayView = "ideas";
-let walletState: WalletState = "idle";
-let walletAddress: string | null = null;
-let walletTokenBalance = 0;
-let walletPower = 1;
-let walletScoreLoading = false;
+type WalletNetwork = {
+  chainId: number;
+  chainHex: string;
+  name: string;
+  currency: "ETH";
+  rpcUrl: string;
+  explorerUrl: string;
+};
+
+let walletNetworkPromise: Promise<WalletNetwork> | null = null;
+
 let ideaDraft = "";
 let ideaDraftDirty = false;
 let syncedOwnProposalSignature = "";
-let ideaSubmitting = false;
-let votePendingId: number | null = null;
-let participationError: string | null = null;
-let worldDetailId: string | null = null;
-let worldDetailKind: "location" | "character" | "prop" | null = null;
+let rewardPollAtMs = 0;
 
 type WinnerReward = {
   proposalId: number;
-  amountSol: number;
+  chainId: number;
+  asset: "ETH";
+  targetUsd: number;
+  amountEth: number | null;
+  quotedEthUsd: number | null;
   status: "pending" | "sending" | "sent" | "uncertain" | "skipped";
-  signature: string | null;
+  transactionHash: string | null;
+  explorerUrl: string | null;
   lastError: string | null;
   claimedAtMs?: number | null;
   sentAtMs?: number | null;
 };
-let winnerReward: WinnerReward | null = null;
-let winnerNoticeProposalId: number | null = null;
-let winnerNoticeDismissed = false;
-let rewardPollAtMs = 0;
 
-type PhantomPublicKey = { toString(): string };
-type PhantomProvider = {
-  isPhantom?: boolean;
-  isConnected?: boolean;
-  publicKey?: PhantomPublicKey | null;
-  connect(options?: {
-    onlyIfTrusted?: boolean;
-  }): Promise<{ publicKey: PhantomPublicKey }>;
-  on?(
-    event: "connect" | "disconnect" | "accountChanged",
-    handler: (value?: PhantomPublicKey | null) => void,
-  ): void;
+type Eip1193Provider = {
+  request(input: { method: string; params?: unknown[] | object }): Promise<any>;
+  on?(event: string, handler: (...args: any[]) => void): void;
 };
 
 type LiveSlotState = "playing" | "intermission" | "transitioning";
-let liveSlotState: LiveSlotState = "playing";
+
+const viewSignals = createReactiveState({
+  timeline: [] as Clip[],
+  room: null as RoomState | null,
+  nextDirective: null as Directive | null,
+  program: null as LiveProgramState | null,
+  worldState: null as WorldState | null,
+  replayClipId: null as number | null,
+  transport: "connecting" as "connecting" | "live" | "reconnecting",
+  error: null as string | null,
+  soundEnabled: false,
+  captionsEnabled: true,
+  liveOverlayEnabled: true,
+  infoOpen: false,
+  playbackPaused: false,
+  pausedClipId: null as number | null,
+  trayOpen: false,
+  trayView: "ideas" as TrayView,
+  walletState: "idle" as WalletState,
+  walletAddress: null as string | null,
+  walletEthBalance: 0,
+  walletPower: 1,
+  walletScoreLoading: false,
+  ideaSubmitting: false,
+  votePendingId: null as number | null,
+  participationError: null as string | null,
+  worldDetailId: null as string | null,
+  worldDetailKind: null as "location" | "character" | "prop" | null,
+  winnerReward: null as WinnerReward | null,
+  winnerNoticeProposalId: null as number | null,
+  winnerNoticeDismissed: false,
+  liveSlotState: "playing" as LiveSlotState,
+  lastEndedLiveClipId: null as number | null,
+});
+const view = viewSignals.state;
+const renderQueue = createInvalidationQueue((reasons) => renderApp(reasons));
+const videoSyncQueue = createInvalidationQueue((reasons) => {
+  mediaMeasure.measureSync(
+    {
+      start: () => `Sync video deck · ${reasons.join(", ")}`,
+      end: (value) => value,
+    },
+    () => {
+      syncVideoDeck();
+      return {
+        reasons,
+        activeClipId: activeVideoClipId,
+        desiredClipId: desiredClip()?.id ?? null,
+        liveSlot: view.liveSlotState,
+      };
+    },
+  );
+});
+
+viewSignals.subscribe((change) => {
+  renderQueue.invalidate(`signal:${String(change.key)}`);
+});
+for (const key of [
+  "timeline",
+  "replayClipId",
+  "playbackPaused",
+  "pausedClipId",
+  "liveSlotState",
+  "soundEnabled",
+] as const) {
+  viewSignals.subscribeKey(key, () => {
+    videoSyncQueue.invalidate(`signal:${key}`);
+  });
+}
+
+function scheduleViewRender(reason: string) {
+  renderQueue.invalidate(reason);
+}
+
+function scheduleVideoSync(reason: string) {
+  videoSyncQueue.invalidate(reason);
+}
+function setLiveSlotState(
+  next: LiveSlotState,
+  reason: string,
+  detail: Record<string, unknown> = {},
+) {
+  if (view.liveSlotState === next) {
+    syncLocalUiState();
+    return false;
+  }
+  const previous = view.liveSlotState;
+  view.liveSlotState = next;
+  mediaMeasure.measureSync(
+    {
+      start: () => `Live media ${previous} → ${next}`,
+      end: (value) => value,
+    },
+    () => ({ reason, previous, next, ...detail }),
+  );
+  syncLocalUiState();
+  return true;
+}
 
 let mediaDeck: HTMLDivElement | null = null;
 let posterNode: HTMLImageElement | null = null;
@@ -122,7 +203,7 @@ function liveNowMs() {
 }
 
 function publishedTimeline(now = liveNowMs()) {
-  return timeline.filter((clip) => clip.startsAtMs <= now);
+  return view.timeline.filter((clip) => clip.startsAtMs <= now);
 }
 
 function latestPublishedClip() {
@@ -131,15 +212,15 @@ function latestPublishedClip() {
 }
 
 function replayClip() {
-  return replayClipId == null
+  return view.replayClipId == null
     ? null
-    : timeline.find((clip) => clip.id === replayClipId) || null;
+    : view.timeline.find((clip) => clip.id === view.replayClipId) || null;
 }
 
 function desiredClip() {
-  if (playbackPaused && pausedClipId != null)
+  if (view.playbackPaused && view.pausedClipId != null)
     return (
-      timeline.find((clip) => clip.id === pausedClipId) ||
+      view.timeline.find((clip) => clip.id === view.pausedClipId) ||
       replayClip() ||
       latestPublishedClip()
     );
@@ -150,37 +231,41 @@ function visibleClip() {
   return (
     (activeVideoClipId == null
       ? null
-      : timeline.find((clip) => clip.id === activeVideoClipId)) || desiredClip()
+      : view.timeline.find((clip) => clip.id === activeVideoClipId)) ||
+    desiredClip()
   );
 }
 
 function incomingLiveClipPending() {
-  if (replayClipId != null || liveSlotState !== "intermission") return false;
+  if (view.replayClipId != null || view.liveSlotState !== "intermission")
+    return false;
   const latest = latestPublishedClip();
   return Boolean(latest && latest.id !== activeVideoClipId);
 }
 
 function enterLiveIntermission(reason: string) {
-  if (replayClipId != null || liveSlotState === "intermission") return;
-  liveSlotState = "intermission";
-  mediaMeasure.measureSync("Enter live intermission", () => ({
-    reason,
+  if (view.replayClipId != null) return;
+  if (activeVideoClipId != null) view.lastEndedLiveClipId = activeVideoClipId;
+  setLiveSlotState("intermission", reason, {
     clipId: activeVideoClipId,
-  }));
-  syncLocalUiState();
+    endedClipId: view.lastEndedLiveClipId,
+  });
   const active = videoNodes()[activeVideoSlot];
   if (active) {
     active.pause();
     active.muted = true;
   }
-  redraw();
+  // The browser owns the truth at an episode boundary. Refreshing here repairs
+  // any long-poll snapshot that still describes the episode we just watched as
+  // `ready`/`finalizing`, but the overlay no longer depends on this request.
+  void refreshStreamState();
 }
 
 function reconcileLiveEdge() {
   if (
-    replayClipId != null ||
-    playbackPaused ||
-    liveSlotState === "intermission"
+    view.replayClipId != null ||
+    view.playbackPaused ||
+    view.liveSlotState === "intermission"
   )
     return;
   const latest = latestPublishedClip();
@@ -201,7 +286,8 @@ function reconcileLiveEdge() {
 
 function clipAfter(clip: Clip | null) {
   if (!clip) return null;
-  const ordered = replayClipId == null ? timeline : publishedTimeline();
+  const ordered =
+    view.replayClipId == null ? view.timeline : publishedTimeline();
   const index = ordered.findIndex((candidate) => candidate.id === clip.id);
   return index >= 0 ? ordered[index + 1] || null : null;
 }
@@ -297,22 +383,49 @@ function syncPoster() {
   posterNode.style.opacity = poster ? "1" : "0";
 }
 
-function redraw() {
+function renderApp(reasons: readonly string[]) {
   const root = document.getElementById("pumptv-root");
   if (!root) return;
 
-  // The media deck lives in a sibling host that TradJS never renders into.
-  // UI redraws therefore cannot detach, replace, or repaint the video elements.
-  render(<App />, root);
-  queueMicrotask(() => {
-    ensureMediaDeck();
-    observeMediaTarget();
-    syncVideoDeck();
-    syncLocalPresentation();
-    syncIdeaFormState();
-    updateLiveMeters();
-    centerSelectedEpisode();
-  });
+  uiMeasure.measureSync(
+    {
+      start: () => `Render UI · ${reasons.join(", ")}`,
+      end: (value) => value,
+    },
+    () => {
+      // TradJS owns only the application root. The persistent media deck stays
+      // in its sibling host, so a reactive UI render never replaces a decoder.
+      render(<App />, root);
+
+      // DOM effects run after the synchronous TradJS commit. Layout-dependent
+      // work is deferred to rAF; there is no generic "DOM is probably ready"
+      // microtask anymore.
+      ensureMediaDeck();
+      observeMediaTarget();
+      syncLocalPresentation();
+      syncIdeaFormState();
+      updateLiveMeters();
+
+      const selectionRelevant = reasons.some(
+        (reason) =>
+          reason === "boot" ||
+          reason === "media:presentation" ||
+          reason === "signal:timeline" ||
+          reason === "signal:replayClipId",
+      );
+      requestAnimationFrame(() => {
+        positionMediaDeck();
+        if (selectionRelevant) centerSelectedEpisode();
+      });
+
+      return {
+        reasons,
+        phase: view.program?.phase ?? null,
+        timeline: view.timeline.length,
+        liveSlot: view.liveSlotState,
+      };
+    },
+  );
 }
 
 async function json<T>(url: string, init?: RequestInit): Promise<T> {
@@ -325,22 +438,23 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
 
 function applyState(state: StreamState) {
   serverOffsetMs = state.serverNowMs - Date.now();
-  room = state.room;
-  timeline = state.timeline;
-  nextDirective = state.nextDirective;
-  program = state.program;
-  worldState = state.worldState;
+  view.room = state.room;
+  view.timeline = state.timeline;
+  view.nextDirective = state.nextDirective;
+  view.program = state.program;
+  view.worldState = state.worldState;
   if (
-    walletAddress &&
+    view.walletAddress &&
     state.program.directive?.proposalId &&
-    state.program.directive.authorAddress === walletAddress
+    state.program.directive.authorAddress?.toLowerCase() ===
+      view.walletAddress.toLowerCase()
   ) {
     const proposalId = state.program.directive.proposalId;
-    if (winnerNoticeProposalId !== proposalId) {
-      winnerNoticeProposalId = proposalId;
-      winnerNoticeDismissed =
+    if (view.winnerNoticeProposalId !== proposalId) {
+      view.winnerNoticeProposalId = proposalId;
+      view.winnerNoticeDismissed =
         sessionStorage.getItem(
-          `pumptv-reward-dismissed:${walletAddress}:${proposalId}`,
+          `pumptv-reward-dismissed:${view.walletAddress}:${proposalId}`,
         ) === "1";
     }
     void refreshWinnerReward();
@@ -358,7 +472,7 @@ function applyState(state: StreamState) {
       );
       const target = published[targetIndex] || published[0];
       const latest = published[published.length - 1];
-      replayClipId =
+      view.replayClipId =
         target && latest && target.id !== latest.id ? target.id : null;
       initialCatchupPending = false;
       localStorage.removeItem("pumptv-new-viewer-catchup");
@@ -366,99 +480,162 @@ function applyState(state: StreamState) {
   }
 
   if (
-    replayClipId != null &&
-    !timeline.some((clip) => clip.id === replayClipId)
+    view.replayClipId != null &&
+    !view.timeline.some((clip) => clip.id === view.replayClipId)
   )
-    replayClipId = null;
-  error = null;
-  redraw();
+    view.replayClipId = null;
+  view.error = null;
 }
 
-function phantomProvider(): PhantomProvider | null {
-  const provider = (window as any).phantom?.solana as
-    PhantomProvider | undefined;
-  return provider?.isPhantom ? provider : null;
+function normalizeClientEvmAddress(value: unknown) {
+  const text = String(value || "").trim();
+  if (!text || !isAddress(text)) return null;
+  return getAddress(text);
 }
 
-function walletFromPublicKey(value?: PhantomPublicKey | null) {
-  const address = value?.toString?.().trim() || "";
-  const next = address || null;
-  if (walletAddress !== next) {
-    winnerReward = null;
-    winnerNoticeProposalId = null;
-    winnerNoticeDismissed = false;
+function walletFromAddress(value: unknown) {
+  const next = normalizeClientEvmAddress(value);
+  if (view.walletAddress !== next) {
+    view.winnerReward = null;
+    view.winnerNoticeProposalId = null;
+    view.winnerNoticeDismissed = false;
   }
-  walletAddress = next;
-  walletState = walletAddress ? "connected" : "idle";
+  view.walletAddress = next;
+  view.walletState = next ? "connected" : "idle";
 }
 
-let phantomEventsInstalled = false;
-function installPhantomEvents() {
-  if (phantomEventsInstalled) return;
-  const provider = phantomProvider();
-  if (!provider?.on) return;
-  phantomEventsInstalled = true;
-  provider.on("connect", (publicKey) => {
-    walletFromPublicKey(publicKey || provider.publicKey || null);
-    participationError = null;
-    redraw();
-    void refreshWalletScore();
-    void refreshWinnerReward();
-  });
-  provider.on("disconnect", () => {
-    walletAddress = null;
-    walletState = "idle";
-    winnerReward = null;
-    winnerNoticeProposalId = null;
-    winnerNoticeDismissed = false;
-    redraw();
-  });
-  provider.on("accountChanged", (publicKey) => {
-    walletFromPublicKey(publicKey || provider.publicKey || null);
-    walletTokenBalance = 0;
-    walletPower = 1;
-    redraw();
-    if (walletAddress) {
+let metamaskClientPromise: ReturnType<typeof createEVMClient> | null = null;
+let metamaskEventsInstalled = false;
+
+function getWalletNetwork() {
+  if (!walletNetworkPromise) {
+    walletNetworkPromise = json<{ network: WalletNetwork }>(
+      "/api/wallet/score",
+      {
+        cache: "no-store",
+      },
+    ).then((payload) => payload.network);
+  }
+  return walletNetworkPromise;
+}
+
+function getMetaMaskClient() {
+  if (!metamaskClientPromise) {
+    metamaskClientPromise = getWalletNetwork().then((network) =>
+      createEVMClient({
+        dapp: {
+          name: "PumpTV",
+          url: window.location.origin,
+          iconUrl: new URL("/api/logo", window.location.href).href,
+        },
+        api: {
+          supportedNetworks: {
+            [network.chainHex]: network.rpcUrl,
+          },
+        },
+      }),
+    );
+  }
+  return metamaskClientPromise;
+}
+
+async function ensureRobinhoodChain(
+  provider: Eip1193Provider,
+  network: WalletNetwork,
+) {
+  const current = String(
+    (await provider.request({ method: "eth_chainId" })) || "",
+  ).toLowerCase();
+  if (current === network.chainHex.toLowerCase()) return;
+  try {
+    await provider.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: network.chainHex }],
+    });
+  } catch (cause: any) {
+    if (
+      Number(cause?.code) !== 4902 &&
+      !/unknown chain|unrecognized chain/i.test(String(cause?.message || ""))
+    )
+      throw cause;
+    await provider.request({
+      method: "wallet_addEthereumChain",
+      params: [
+        {
+          chainId: network.chainHex,
+          chainName: network.name,
+          nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+          rpcUrls: [network.rpcUrl],
+          blockExplorerUrls: [network.explorerUrl],
+        },
+      ],
+    });
+    await provider.request({
+      method: "wallet_switchEthereumChain",
+      params: [{ chainId: network.chainHex }],
+    });
+  }
+}
+
+function installMetaMaskEvents(provider: Eip1193Provider) {
+  if (metamaskEventsInstalled || !provider.on) return;
+  metamaskEventsInstalled = true;
+  provider.on("accountsChanged", (accounts: string[] = []) => {
+    walletFromAddress(accounts[0] || null);
+    view.walletEthBalance = 0;
+    view.walletPower = 1;
+    if (view.walletAddress) {
       void refreshWalletScore();
       void refreshWinnerReward();
     }
   });
+  provider.on("disconnect", () => {
+    walletFromAddress(null);
+    view.walletEthBalance = 0;
+    view.walletPower = 1;
+  });
+  provider.on("chainChanged", () => {
+    if (view.walletAddress) void refreshWalletScore();
+  });
 }
 
-async function connectPhantom(interactive: boolean) {
-  const provider = phantomProvider();
-  if (!provider) {
-    walletAddress = null;
-    walletState = "missing";
-    if (interactive)
-      window.open("https://phantom.app/", "_blank", "noopener,noreferrer");
-    redraw();
-    return false;
-  }
-
-  installPhantomEvents();
-  walletState = "connecting";
-  participationError = null;
-  redraw();
+async function connectMetaMask(interactive: boolean) {
+  view.walletState = interactive ? "connecting" : view.walletState;
+  if (interactive) view.participationError = null;
   try {
-    const result = await provider.connect(
-      interactive ? undefined : { onlyIfTrusted: true },
-    );
-    walletFromPublicKey(result?.publicKey || provider.publicKey || null);
-    redraw();
-    if (walletAddress) {
+    const network = await getWalletNetwork();
+    const client = await getMetaMaskClient();
+    const provider = client.getProvider() as Eip1193Provider;
+    installMetaMaskEvents(provider);
+
+    let accounts: string[] = [];
+    if (interactive) {
+      const result = await client.connect({ chainIds: [network.chainHex] });
+      accounts = Array.isArray(result?.accounts) ? result.accounts : [];
+      await ensureRobinhoodChain(provider, network);
+    } else {
+      const existing = await provider.request({
+        method: "eth_accounts",
+        params: [],
+      });
+      accounts = Array.isArray(existing) ? existing : [];
+    }
+
+    walletFromAddress(accounts[0] || null);
+    if (view.walletAddress) {
       await refreshWalletScore();
       await refreshWinnerReward();
     }
-    return Boolean(walletAddress);
+    return Boolean(view.walletAddress);
   } catch (cause: any) {
-    walletAddress = null;
     const rejected = Number(cause?.code) === 4001;
-    walletState = interactive && !rejected ? "error" : "idle";
-    if (interactive && !rejected)
-      participationError =
-        cause instanceof Error ? cause.message : "Wallet connection failed";
-    redraw();
+    if (interactive && !rejected) {
+      view.walletState = "error";
+      view.participationError =
+        cause instanceof Error ? cause.message : "MetaMask connection failed";
+    } else if (!view.walletAddress) {
+      view.walletState = "idle";
+    }
     return false;
   }
 }
@@ -470,11 +647,13 @@ async function refreshStreamState() {
 }
 
 function ownerKey() {
-  return walletAddress ? `wallet:${walletAddress}` : `web:${proposalOwnerId}`;
+  return view.walletAddress
+    ? `wallet:${view.walletAddress}`
+    : `web:${proposalOwnerId}`;
 }
 
 function currentBoardRound() {
-  return program?.votingRound || null;
+  return view.program?.votingRound || null;
 }
 
 function ownProposal() {
@@ -500,12 +679,12 @@ function syncIdeaDraftFromBoard() {
 }
 
 function ideaCanSubmit() {
-  if (ideaSubmitting) return false;
+  if (view.ideaSubmitting) return false;
   if (
-    program?.phase === "locked" ||
-    program?.phase === "planning" ||
-    program?.phase === "rendering" ||
-    program?.phase === "finalizing"
+    view.program?.phase === "locked" ||
+    view.program?.phase === "planning" ||
+    view.program?.phase === "rendering" ||
+    view.program?.phase === "finalizing"
   )
     return false;
   const text = normalizedIdea(ideaDraft);
@@ -526,74 +705,76 @@ function syncIdeaFormState() {
 }
 
 async function refreshWalletScore() {
-  if (!walletAddress || walletScoreLoading) return;
-  walletScoreLoading = true;
-  participationError = null;
-  redraw();
+  if (!view.walletAddress || view.walletScoreLoading) return;
+  view.walletScoreLoading = true;
+  view.participationError = null;
   try {
-    const result = await json<{ tokenBalance: number; power: number }>(
-      "/api/wallet/score",
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          viewerId,
-          ownerId: proposalOwnerId,
-          walletAddress,
-        }),
-      },
-    );
-    walletTokenBalance = Number(result.tokenBalance || 0);
-    walletPower = Math.max(1, Number(result.power || 1));
+    const result = await json<{
+      ethBalance: number;
+      power: number;
+      chainId: number;
+    }>("/api/wallet/score", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        viewerId,
+        ownerId: proposalOwnerId,
+        walletAddress: view.walletAddress,
+      }),
+    });
+    view.walletEthBalance = Number(result.ethBalance || 0);
+    view.walletPower = Math.max(1, Number(result.power || 1));
     await refreshStreamState();
   } catch (cause) {
-    walletTokenBalance = 0;
-    walletPower = 1;
-    participationError =
-      cause instanceof Error ? cause.message : "Could not read token balance";
+    view.walletEthBalance = 0;
+    view.walletPower = 1;
+    view.participationError =
+      cause instanceof Error
+        ? cause.message
+        : "Could not read Robinhood wallet";
   } finally {
-    walletScoreLoading = false;
-    redraw();
+    view.walletScoreLoading = false;
   }
 }
 
 async function refreshWinnerReward() {
-  if (!walletAddress) return;
-  const address = walletAddress;
+  if (!view.walletAddress) return;
+  const address = view.walletAddress;
   try {
     const payload = await json<{ reward: WinnerReward | null }>(
       `/api/rewards/mine?walletAddress=${encodeURIComponent(address)}`,
       { cache: "no-store" },
     );
-    if (walletAddress !== address) return;
-    winnerReward = payload.reward;
+    if (view.walletAddress !== address) return;
+    view.winnerReward = payload.reward;
     if (payload.reward) {
       const recentSent =
         payload.reward.status !== "sent" ||
         !payload.reward.sentAtMs ||
         Date.now() - payload.reward.sentAtMs < 10 * 60_000;
-      if (recentSent || winnerNoticeProposalId === payload.reward.proposalId) {
-        winnerNoticeProposalId = payload.reward.proposalId;
-        winnerNoticeDismissed =
+      if (
+        recentSent ||
+        view.winnerNoticeProposalId === payload.reward.proposalId
+      ) {
+        view.winnerNoticeProposalId = payload.reward.proposalId;
+        view.winnerNoticeDismissed =
           sessionStorage.getItem(
             `pumptv-reward-dismissed:${address}:${payload.reward.proposalId}`,
           ) === "1";
       }
     }
-    redraw();
   } catch {
     // Reward status is non-critical viewer metadata. The worker owns payment.
   }
 }
 
 async function submitIdea() {
-  if (ideaSubmitting) return;
+  if (view.ideaSubmitting) return;
   const text = normalizedIdea(ideaDraft);
   if (!text) return;
 
-  ideaSubmitting = true;
-  participationError = null;
-  redraw();
+  view.ideaSubmitting = true;
+  view.participationError = null;
   try {
     await json("/api/proposals", {
       method: "POST",
@@ -602,26 +783,24 @@ async function submitIdea() {
         text,
         viewerId,
         ownerId: proposalOwnerId,
-        walletAddress,
+        walletAddress: view.walletAddress,
       }),
     });
     ideaDraftDirty = false;
     syncedOwnProposalSignature = "";
     await refreshStreamState();
   } catch (cause) {
-    participationError =
+    view.participationError =
       cause instanceof Error ? cause.message : "Could not save idea";
   } finally {
-    ideaSubmitting = false;
-    redraw();
+    view.ideaSubmitting = false;
   }
 }
 
 async function cancelOwnIdea() {
-  if (ideaSubmitting || !ownProposal()) return;
-  ideaSubmitting = true;
-  participationError = null;
-  redraw();
+  if (view.ideaSubmitting || !ownProposal()) return;
+  view.ideaSubmitting = true;
+  view.participationError = null;
   try {
     await json("/api/proposals", {
       method: "DELETE",
@@ -629,7 +808,7 @@ async function cancelOwnIdea() {
       body: JSON.stringify({
         viewerId,
         ownerId: proposalOwnerId,
-        walletAddress,
+        walletAddress: view.walletAddress,
       }),
     });
     ideaDraft = "";
@@ -637,21 +816,23 @@ async function cancelOwnIdea() {
     syncedOwnProposalSignature = "";
     await refreshStreamState();
   } catch (cause) {
-    participationError =
+    view.participationError =
       cause instanceof Error ? cause.message : "Could not cancel idea";
   } finally {
-    ideaSubmitting = false;
-    redraw();
+    view.ideaSubmitting = false;
   }
 }
 
 async function voteForProposal(proposalId: number) {
-  if (!Number.isSafeInteger(proposalId) || proposalId <= 0 || votePendingId)
+  if (
+    !Number.isSafeInteger(proposalId) ||
+    proposalId <= 0 ||
+    view.votePendingId
+  )
     return;
 
-  votePendingId = proposalId;
-  participationError = null;
-  redraw();
+  view.votePendingId = proposalId;
+  view.participationError = null;
   try {
     await json("/api/votes", {
       method: "POST",
@@ -660,42 +841,46 @@ async function voteForProposal(proposalId: number) {
         proposalId,
         viewerId,
         ownerId: proposalOwnerId,
-        walletAddress,
+        walletAddress: view.walletAddress,
       }),
     });
     await refreshStreamState();
   } catch (cause) {
-    participationError =
+    view.participationError =
       cause instanceof Error ? cause.message : "Could not vote";
   } finally {
-    votePendingId = null;
-    redraw();
+    view.votePendingId = null;
   }
+}
+
+function shouldAutofocusIdea() {
+  if (typeof window === "undefined" || typeof window.matchMedia !== "function")
+    return false;
+  return window.matchMedia("(min-width: 821px) and (pointer: fine)").matches;
+}
+
+function focusIdeaInputIfAppropriate() {
+  if (!shouldAutofocusIdea()) return;
+  queueMicrotask(() =>
+    document.querySelector<HTMLInputElement>("[data-idea-input]")?.focus(),
+  );
 }
 
 function toggleTray() {
-  const opening = !trayOpen;
-  trayOpen = opening;
-  if (opening) trayView = "ideas";
-  redraw();
-  if (opening)
-    queueMicrotask(() =>
-      document.querySelector<HTMLInputElement>("[data-idea-input]")?.focus(),
-    );
+  const opening = !view.trayOpen;
+  view.trayOpen = opening;
+  if (opening) view.trayView = "ideas";
+  if (opening) focusIdeaInputIfAppropriate();
 }
 
-function openTray(view: TrayView) {
-  const opening = !(trayOpen && trayView === view);
-  if (!opening) trayOpen = false;
+function openTray(targetView: TrayView) {
+  const opening = !(view.trayOpen && view.trayView === targetView);
+  if (!opening) view.trayOpen = false;
   else {
-    trayOpen = true;
-    trayView = view;
+    view.trayOpen = true;
+    view.trayView = targetView;
   }
-  redraw();
-  if (opening && view === "ideas")
-    queueMicrotask(() =>
-      document.querySelector<HTMLInputElement>("[data-idea-input]")?.focus(),
-    );
+  if (opening && targetView === "ideas") focusIdeaInputIfAppropriate();
 }
 
 let richTooltipNode: HTMLDivElement | null = null;
@@ -849,16 +1034,17 @@ function writePref(key: string, value: boolean) {
 
 function syncLocalUiState() {
   const html = document.documentElement;
-  html.dataset.pumptvSound = soundEnabled ? "on" : "off";
-  html.dataset.pumptvCaptions = captionsEnabled ? "on" : "off";
-  html.dataset.pumptvOverlay = liveOverlayEnabled ? "on" : "off";
-  html.dataset.pumptvInfo = infoOpen ? "open" : "closed";
-  html.dataset.pumptvPlayback = playbackPaused ? "paused" : "playing";
-  html.dataset.pumptvMode = replayClipId == null ? "live" : "replay";
-  html.dataset.pumptvSlot = replayClipId == null ? liveSlotState : "replay";
+  html.dataset.pumptvSound = view.soundEnabled ? "on" : "off";
+  html.dataset.pumptvCaptions = view.captionsEnabled ? "on" : "off";
+  html.dataset.pumptvOverlay = view.liveOverlayEnabled ? "on" : "off";
+  html.dataset.pumptvInfo = view.infoOpen ? "open" : "closed";
+  html.dataset.pumptvPlayback = view.playbackPaused ? "paused" : "playing";
+  html.dataset.pumptvMode = view.replayClipId == null ? "live" : "replay";
+  html.dataset.pumptvSlot =
+    view.replayClipId == null ? view.liveSlotState : "replay";
   mediaDeck?.classList.toggle(
     "intermission",
-    replayClipId == null && liveSlotState === "intermission",
+    view.replayClipId == null && view.liveSlotState === "intermission",
   );
 
   document
@@ -867,15 +1053,15 @@ function syncLocalUiState() {
       const name = control.dataset.control;
       const active =
         name === "playback"
-          ? !playbackPaused
+          ? !view.playbackPaused
           : name === "sound"
-            ? soundEnabled
+            ? view.soundEnabled
             : name === "captions"
-              ? captionsEnabled
+              ? view.captionsEnabled
               : name === "overlay"
-                ? liveOverlayEnabled
+                ? view.liveOverlayEnabled
                 : name === "info"
-                  ? infoOpen
+                  ? view.infoOpen
                   : false;
       control.classList.toggle("on", active);
       if (name !== "fullscreen")
@@ -888,7 +1074,7 @@ function syncLocalUiState() {
     ) as HTMLVideoElement[];
     for (const video of nodes) {
       if (video.dataset.clipId === String(activeVideoClipId))
-        video.muted = !soundEnabled;
+        video.muted = !view.soundEnabled;
       else video.muted = true;
     }
   }
@@ -904,11 +1090,11 @@ function syncEpisodeSelection() {
       card.classList.toggle("active", Number.isFinite(id) && id === desiredId);
       card.classList.toggle(
         "live",
-        Number.isFinite(id) && id === liveId && replayClipId == null,
+        Number.isFinite(id) && id === liveId && view.replayClipId == null,
       );
     });
   const liveCap = document.querySelector<HTMLElement>(".liveCap");
-  if (liveCap) liveCap.classList.toggle("active", replayClipId == null);
+  if (liveCap) liveCap.classList.toggle("active", view.replayClipId == null);
 }
 
 function syncCurrentPromptDom() {
@@ -968,9 +1154,9 @@ function ensureViewerIdAndPrefs() {
     sessionStorage.setItem("pumptv-proposal-owner-id", proposalOwnerId);
   }
 
-  soundEnabled = readPref("pumptv-v25-sound", false);
-  captionsEnabled = readPref("pumptv-v25-captions", true);
-  liveOverlayEnabled = readPref("pumptv-v25-live-overlay", true);
+  view.soundEnabled = readPref("pumptv-v25-sound", false);
+  view.captionsEnabled = readPref("pumptv-v25-captions", true);
+  view.liveOverlayEnabled = readPref("pumptv-v25-live-overlay", true);
 }
 
 async function runStateLongPoll() {
@@ -994,17 +1180,16 @@ async function runStateLongPoll() {
       if (Number.isSafeInteger(payload.revision))
         streamRevision = Number(payload.revision);
       if (payload.state) applyState(payload.state);
-      else error = null;
+      else view.error = null;
       retryMs = 850;
-      if (transport !== "live") {
-        transport = "live";
-        redraw();
+      if (view.transport !== "live") {
+        view.transport = "live";
       }
     } catch (cause) {
       if (controller.signal.aborted) break;
-      transport = "reconnecting";
-      error = cause instanceof Error ? cause.message : "state reconnecting";
-      redraw();
+      view.transport = "reconnecting";
+      view.error =
+        cause instanceof Error ? cause.message : "state reconnecting";
       const jitter = Math.floor(Math.random() * Math.min(500, retryMs / 3));
       await new Promise((resolve) => setTimeout(resolve, retryMs + jitter));
       retryMs = Math.min(8_000, Math.round(retryMs * 1.7));
@@ -1016,16 +1201,14 @@ async function boot() {
   ensureViewerIdAndPrefs();
   installInteractionLayer();
   installRichTooltips();
-  installPhantomEvents();
   syncLocalUiState();
-  redraw();
-  void connectPhantom(false);
+  scheduleViewRender("boot");
+  void connectMetaMask(false);
   try {
     applyState(await json<StreamState>("/api/state"));
-    transport = "live";
+    view.transport = "live";
   } catch (cause) {
-    error = cause instanceof Error ? cause.message : "offline";
-    redraw();
+    view.error = cause instanceof Error ? cause.message : "offline";
   }
 
   void runStateLongPoll();
@@ -1034,7 +1217,7 @@ async function boot() {
     syncVideoDeck();
     reconcileLiveEdge();
     updateLiveMeters();
-    if (walletAddress && Date.now() - rewardPollAtMs >= 3_000) {
+    if (view.walletAddress && Date.now() - rewardPollAtMs >= 3_000) {
       rewardPollAtMs = Date.now();
       void refreshWinnerReward();
     }
@@ -1150,7 +1333,7 @@ async function primeColdLiveClip(
   await waitForColdRunway(warm, clip.id);
   if (
     desiredClip()?.id !== clip.id ||
-    replayClipId != null ||
+    view.replayClipId != null ||
     activeVideoClipId != null
   )
     return;
@@ -1168,7 +1351,7 @@ async function primeColdLiveClip(
 
   if (
     desiredClip()?.id !== clip.id ||
-    replayClipId != null ||
+    view.replayClipId != null ||
     activeVideoClipId != null
   )
     return;
@@ -1180,7 +1363,7 @@ async function primeColdLiveClip(
   await waitForColdRunway(playback, clip.id, 2_500);
   if (
     desiredClip()?.id !== clip.id ||
-    replayClipId != null ||
+    view.replayClipId != null ||
     activeVideoClipId != null
   )
     return;
@@ -1221,59 +1404,92 @@ function targetTimeFor(_clip: Clip) {
 }
 
 async function waitForPaint(video: HTMLVideoElement) {
-  const hardTimeoutMs = 5_000;
-  const callback = (video as any).requestVideoFrameCallback;
+  await mediaMeasure.measure(
+    {
+      start: () => "Wait for first presented video frame",
+      end: (result) => result,
+    },
+    () =>
+      new Promise<{ via: string; readyState: number; currentTime: number }>(
+        (resolve, reject) => {
+          let settled = false;
+          const startedAtTime = Number(video.currentTime || 0);
+          const callback = (video as any).requestVideoFrameCallback;
+          let fallbackTimer: ReturnType<typeof setTimeout> | null = null;
+          let hardTimer: ReturnType<typeof setTimeout> | null = null;
 
-  if (typeof callback === "function") {
-    await new Promise<void>((resolve, reject) => {
-      let settled = false;
-      const finish = (error?: Error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timeout);
-        if (error) reject(error);
-        else resolve();
-      };
-      const timeout = setTimeout(
-        () =>
-          finish(new Error("timed out waiting for a presented video frame")),
-        hardTimeoutMs,
-      );
-      callback.call(video, () => finish());
-    });
-    return;
-  }
+          const cleanup = () => {
+            if (fallbackTimer) clearTimeout(fallbackTimer);
+            if (hardTimer) clearTimeout(hardTimer);
+            video.removeEventListener("playing", onPlaying);
+            video.removeEventListener("timeupdate", onTimeUpdate);
+            video.removeEventListener("error", onError);
+          };
+          const finish = (via: string) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            resolve({
+              via,
+              readyState: video.readyState,
+              currentTime: Number(video.currentTime || 0),
+            });
+          };
+          const fail = (message: string) => {
+            if (settled) return;
+            settled = true;
+            cleanup();
+            reject(new Error(message));
+          };
+          const afterPaintTurn = (via: string) => {
+            requestAnimationFrame(() =>
+              requestAnimationFrame(() => finish(via)),
+            );
+          };
+          const usable = () =>
+            !video.paused &&
+            !video.ended &&
+            video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA;
+          const onPlaying = () => {
+            if (usable()) afterPaintTurn("playing");
+          };
+          const onTimeUpdate = () => {
+            if (
+              usable() &&
+              Number(video.currentTime || 0) > startedAtTime + 0.01
+            )
+              afterPaintTurn("timeupdate");
+          };
+          const onError = () =>
+            fail("video failed before its first frame was available");
 
-  if (video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA) {
-    await new Promise<void>((resolve, reject) => {
-      const cleanup = () => {
-        clearTimeout(timeout);
-        video.removeEventListener("loadeddata", onLoaded);
-        video.removeEventListener("error", onError);
-      };
-      const onLoaded = () => {
-        cleanup();
-        resolve();
-      };
-      const onError = () => {
-        cleanup();
-        reject(new Error("video failed before its first frame was available"));
-      };
-      const timeout = setTimeout(() => {
-        cleanup();
-        reject(new Error("timed out waiting for video data"));
-      }, hardTimeoutMs);
-      video.addEventListener("loadeddata", onLoaded, { once: true });
-      video.addEventListener("error", onError, { once: true });
-    });
-  }
+          video.addEventListener("playing", onPlaying);
+          video.addEventListener("timeupdate", onTimeUpdate);
+          video.addEventListener("error", onError, { once: true });
 
-  // Browsers without requestVideoFrameCallback cannot prove compositor
-  // presentation. Two animation frames after HAVE_CURRENT_DATA is the safest
-  // fallback; importantly, an arbitrary short timeout is never treated as a
-  // successful paint anymore.
-  await new Promise<void>((resolve) =>
-    requestAnimationFrame(() => requestAnimationFrame(() => resolve())),
+          if (typeof callback === "function") {
+            try {
+              callback.call(video, () => finish("video-frame-callback"));
+            } catch {}
+          }
+
+          // `play()` has already resolved before this function is called. Some
+          // WebKit/Chromium builds nevertheless delay rVFC on hidden/entering
+          // layers. If the media is demonstrably playing with current data,
+          // two compositor turns are a stronger signal than waiting five
+          // seconds and retrying the entire activation.
+          fallbackTimer = setTimeout(() => {
+            if (usable()) afterPaintTurn("playing-ready-fallback");
+          }, 180);
+
+          hardTimer = setTimeout(
+            () => fail("timed out waiting for usable video playback"),
+            8_000,
+          );
+
+          if (usable()) afterPaintTurn("already-playing");
+        },
+      ),
   );
 }
 
@@ -1311,8 +1527,8 @@ async function activateVideoSlot(
     // parked beneath the intermission surface. Do not restart it just because
     // the 100ms media synchronizer runs again.
     const parkedAtLiveEdge =
-      replayClipId == null && liveSlotState === "intermission";
-    if (playbackPaused) {
+      view.replayClipId == null && view.liveSlotState === "intermission";
+    if (view.playbackPaused) {
       if (!video.paused) video.pause();
       return;
     }
@@ -1331,13 +1547,13 @@ async function activateVideoSlot(
         .play()
         .then(() => {
           video.dataset.resumePending = "0";
-          if (activeVideoClipId === clip.id) video.muted = !soundEnabled;
+          if (activeVideoClipId === clip.id) video.muted = !view.soundEnabled;
         })
         .catch(() => {
           video.dataset.resumePending = "0";
         });
     } else if (!video.paused) {
-      video.muted = !soundEnabled;
+      video.muted = !view.soundEnabled;
     }
     return;
   }
@@ -1356,10 +1572,9 @@ async function activateVideoSlot(
   video.muted = true;
 
   try {
-    if (activeVideoClipId == null && replayClipId == null) {
-      liveSlotState = "transitioning";
-      syncLocalUiState();
-    }
+    // Keep an intermission/loading surface mounted until the browser has
+    // actually presented a frame. Cold-start activation used to switch the UI
+    // to `transitioning` before `play()`/paint, creating a dead-looking gap.
     // Cold refreshes arrive here only after configureVideo has fully prefetched
     // the first clip. Do not play a hidden video and rewind it: that path left
     // Chromium's decoder in a visibly stuttery state on first reveal.
@@ -1390,10 +1605,13 @@ async function activateVideoSlot(
   }
 
   const revealingFromIntermission =
-    replayClipId == null && liveSlotState === "intermission";
-  if (replayClipId == null) {
-    liveSlotState = revealingFromIntermission ? "transitioning" : "playing";
-    syncLocalUiState();
+    view.replayClipId == null && view.liveSlotState === "intermission";
+  if (view.replayClipId == null) {
+    setLiveSlotState(
+      revealingFromIntermission ? "transitioning" : "playing",
+      revealingFromIntermission ? "incoming-first-frame" : "video-first-frame",
+      { clipId: clip.id },
+    );
   }
 
   const changed = activeVideoClipId !== clip.id;
@@ -1411,7 +1629,7 @@ async function activateVideoSlot(
   video.classList.remove("retiring", "reveal");
   video.classList.add("active", "entering");
   video.setAttribute("aria-hidden", "false");
-  video.muted = !soundEnabled;
+  video.muted = !view.soundEnabled;
 
   if (previous && previous !== video) {
     previous.classList.add("retiring");
@@ -1420,8 +1638,13 @@ async function activateVideoSlot(
 
   activeVideoSlot = slot;
   activeVideoClipId = clip.id;
+  if (view.replayClipId == null) view.lastEndedLiveClipId = null;
   syncPoster();
   if (changed) syncLocalPresentation();
+  scheduleViewRender("media:presentation");
+  // `program.phase` can change before or after media readiness. Re-render at
+  // the exact presentation boundary so LOADING cannot survive over a video
+  // whose first frame is already on screen.
 
   if (previous && previous !== video) {
     // Force the entering deck's opacity:0 state to become a committed style,
@@ -1444,16 +1667,19 @@ async function activateVideoSlot(
       previous.muted = true;
       crossfade = null;
 
-      if (replayClipId == null && liveSlotState === "transitioning") {
-        liveSlotState = "playing";
-        syncLocalUiState();
+      if (
+        view.replayClipId == null &&
+        view.liveSlotState === "transitioning" &&
+        !video.ended
+      ) {
+        setLiveSlotState("playing", "crossfade-complete", { clipId: clip.id });
       }
     }
   } else {
     video.classList.remove("entering", "reveal");
   }
 
-  queueMicrotask(syncVideoDeck);
+  scheduleVideoSync("crossfade-settled");
 }
 
 function syncVideoDeck() {
@@ -1464,8 +1690,8 @@ function syncVideoDeck() {
   if (
     wanted &&
     activeVideoClipId == null &&
-    replayClipId == null &&
-    !playbackPaused
+    view.replayClipId == null &&
+    !view.playbackPaused
   ) {
     if (coldStartPrime?.clipId === wanted.id) return;
     if (coldStartAttemptedClipId !== wanted.id) {
@@ -1485,9 +1711,8 @@ function syncVideoDeck() {
     activeVideoClipId = null;
     crossfade = null;
     pendingActivation = null;
-    if (replayClipId == null) {
-      liveSlotState = "intermission";
-      syncLocalUiState();
+    if (view.replayClipId == null) {
+      setLiveSlotState("intermission", "no-live-clip");
     }
     syncPoster();
     return;
@@ -1563,7 +1788,8 @@ function syncVideoDeck() {
   }
 
   const active = nodes[activeVideoSlot];
-  if (active && activeVideoClipId === wanted.id) active.muted = !soundEnabled;
+  if (active && activeVideoClipId === wanted.id)
+    active.muted = !view.soundEnabled;
 }
 
 function primeDesiredPlaybackFromGesture() {
@@ -1591,7 +1817,7 @@ function primeDesiredPlaybackFromGesture() {
   // so it is the only place where we intentionally try an audible play under
   // the browser's user-activation token. If that is rejected, immediately
   // retry muted; activation/crossfade will restore the preferred mute state.
-  video.muted = !soundEnabled;
+  video.muted = !view.soundEnabled;
   void video
     .play()
     .then(() => {
@@ -1609,19 +1835,20 @@ function primeDesiredPlaybackFromGesture() {
 function handleDeckEnded(slot: number, clipId: number) {
   if (slot !== activeVideoSlot || clipId !== activeVideoClipId) return;
 
-  if (replayClipId != null) {
+  if (view.replayClipId != null) {
     // An outgoing deck can finish while a different replay episode is loading.
     // Never let that stale `ended` event advance/replace the newly requested
     // replay target. Only the replay episode that is *currently selected* owns
     // replay auto-advance semantics.
-    if (replayClipId !== clipId) return;
+    if (view.replayClipId !== clipId) return;
 
     const published = publishedTimeline();
     const index = published.findIndex((clip) => clip.id === clipId);
     const following = index >= 0 ? published[index + 1] : null;
     const live = latestPublishedClip();
-    if (following && following.id !== live?.id) replayClipId = following.id;
-    else replayClipId = null;
+    if (following && following.id !== live?.id)
+      view.replayClipId = following.id;
+    else view.replayClipId = null;
     switchSerial += 1;
     pendingActivation = null;
     syncLocalUiState();
@@ -1630,7 +1857,7 @@ function handleDeckEnded(slot: number, clipId: number) {
     return;
   }
 
-  const current = timeline.find((clip) => clip.id === clipId) || null;
+  const current = view.timeline.find((clip) => clip.id === clipId) || null;
   const following = clipAfter(current);
   if (following && following.startsAtMs <= liveNowMs() + 250) {
     syncVideoDeck();
@@ -1643,47 +1870,46 @@ function handleDeckEnded(slot: number, clipId: number) {
 }
 
 function togglePlayback() {
-  if (!playbackPaused) {
-    playbackPaused = true;
-    pausedClipId = visibleClip()?.id ?? desiredClip()?.id ?? null;
+  if (!view.playbackPaused) {
+    view.playbackPaused = true;
+    view.pausedClipId = visibleClip()?.id ?? desiredClip()?.id ?? null;
     const active = videoNodes()[activeVideoSlot];
     if (active && !active.paused) active.pause();
     syncLocalUiState();
-    redraw();
     return;
   }
 
-  playbackPaused = false;
-  pausedClipId = null;
-  if (replayClipId == null) liveSlotState = "playing";
+  view.playbackPaused = false;
+  view.pausedClipId = null;
+  if (view.replayClipId == null)
+    setLiveSlotState("playing", "manual-playback-resume");
   switchSerial += 1;
   pendingActivation = null;
   syncLocalUiState();
   primeDesiredPlaybackFromGesture();
   syncVideoDeck();
-  redraw();
 }
 
 function toggleSound() {
-  soundEnabled = !soundEnabled;
-  writePref("pumptv-v25-sound", soundEnabled);
+  view.soundEnabled = !view.soundEnabled;
+  writePref("pumptv-v25-sound", view.soundEnabled);
   syncLocalUiState();
 }
 
 function toggleCaptions() {
-  captionsEnabled = !captionsEnabled;
-  writePref("pumptv-v25-captions", captionsEnabled);
+  view.captionsEnabled = !view.captionsEnabled;
+  writePref("pumptv-v25-captions", view.captionsEnabled);
   syncLocalUiState();
 }
 
 function toggleLiveOverlay() {
-  liveOverlayEnabled = !liveOverlayEnabled;
-  writePref("pumptv-v25-live-overlay", liveOverlayEnabled);
+  view.liveOverlayEnabled = !view.liveOverlayEnabled;
+  writePref("pumptv-v25-live-overlay", view.liveOverlayEnabled);
   syncLocalUiState();
 }
 
 function toggleInfo() {
-  infoOpen = !infoOpen;
+  view.infoOpen = !view.infoOpen;
   syncLocalUiState();
 }
 
@@ -1706,37 +1932,42 @@ function updateLiveMeters() {
   const vote = document.querySelector(
     "[data-vote-countdown]",
   ) as HTMLElement | null;
-  if (vote && program?.countdownEndsAtMs)
-    vote.textContent = formatClock(program.countdownEndsAtMs - liveNowMs());
+  if (vote && view.program?.countdownEndsAtMs)
+    vote.textContent = formatClock(
+      view.program.countdownEndsAtMs - liveNowMs(),
+    );
   const futureVote = document.querySelector(
     "[data-future-vote-countdown]",
   ) as HTMLElement | null;
-  if (futureVote && program?.votingRound?.closesAtMs)
+  if (futureVote && view.program?.votingRound?.closesAtMs)
     futureVote.textContent = formatClock(
-      program.votingRound.closesAtMs - liveNowMs(),
+      view.program.votingRound.closesAtMs - liveNowMs(),
     );
-  if (program?.countdownEndsAtMs)
+  if (view.program?.countdownEndsAtMs)
     document
       .querySelectorAll<HTMLElement>(
         "[data-your-turn-countdown], [data-drawer-countdown]",
       )
       .forEach((node) => {
-        node.textContent = `${Math.max(0, Math.ceil((program!.countdownEndsAtMs! - liveNowMs()) / 1000))}s`;
+        node.textContent = `${Math.max(0, Math.ceil((view.program!.countdownEndsAtMs! - liveNowMs()) / 1000))}s`;
       });
   const gen = document.querySelector(
     "[data-generation-elapsed]",
   ) as HTMLElement | null;
-  if (gen && program?.generationStartedAtMs)
-    gen.textContent = formatClock(liveNowMs() - program.generationStartedAtMs);
+  if (gen && view.program?.generationStartedAtMs)
+    gen.textContent = formatClock(
+      liveNowMs() - view.program.generationStartedAtMs,
+    );
 }
 
 function jumpToEpisode(id: number) {
-  if (!timeline.some((clip) => clip.id === id)) return;
-  playbackPaused = false;
-  pausedClipId = null;
+  if (!view.timeline.some((clip) => clip.id === id)) return;
+  view.playbackPaused = false;
+  view.pausedClipId = null;
   const live = latestPublishedClip();
-  replayClipId = live?.id === id ? null : id;
-  if (replayClipId == null) liveSlotState = "playing";
+  view.replayClipId = live?.id === id ? null : id;
+  if (view.replayClipId == null)
+    setLiveSlotState("playing", "episode-selection");
   switchSerial += 1;
   pendingActivation = null;
   syncLocalUiState();
@@ -1747,12 +1978,12 @@ function jumpToEpisode(id: number) {
 }
 
 function returnLive() {
-  playbackPaused = false;
-  pausedClipId = null;
-  replayClipId = null;
+  view.playbackPaused = false;
+  view.pausedClipId = null;
+  view.replayClipId = null;
   // Returning to live starts the latest archive episode cleanly. The ended
   // edge will switch back to intermission when that episode actually finishes.
-  liveSlotState = "playing";
+  setLiveSlotState("playing", "return-live");
   switchSerial += 1;
   pendingActivation = null;
   syncLocalUiState();
@@ -1767,6 +1998,24 @@ let interactionLayerInstalled = false;
 function installInteractionLayer() {
   if (interactionLayerInstalled) return;
   interactionLayerInstalled = true;
+
+  document.addEventListener(
+    "pointerdown",
+    (event) => {
+      if (!view.trayOpen || view.worldDetailKind) return;
+      const target = event.target instanceof Element ? event.target : null;
+      if (!target) return;
+      if (
+        target.closest(".participationSheet") ||
+        target.closest(".participationDock") ||
+        target.closest(".winnerRewardNotice")
+      )
+        return;
+
+      view.trayOpen = false;
+    },
+    true,
+  );
 
   document.addEventListener(
     "click",
@@ -1785,39 +2034,35 @@ function installInteractionLayer() {
       else if (action === "overlay") toggleLiveOverlay();
       else if (action === "info") toggleInfo();
       else if (action === "close-info") {
-        if (infoOpen) {
-          infoOpen = false;
+        if (view.infoOpen) {
+          view.infoOpen = false;
           syncLocalUiState();
         }
       } else if (action === "tray-toggle") toggleTray();
       else if (action === "close-tray") {
-        if (trayOpen) {
-          trayOpen = false;
-          redraw();
+        if (view.trayOpen) {
+          view.trayOpen = false;
         }
       } else if (action === "close-reward") {
-        winnerNoticeDismissed = true;
-        if (walletAddress && winnerNoticeProposalId)
+        view.winnerNoticeDismissed = true;
+        if (view.walletAddress && view.winnerNoticeProposalId)
           sessionStorage.setItem(
-            `pumptv-reward-dismissed:${walletAddress}:${winnerNoticeProposalId}`,
+            `pumptv-reward-dismissed:${view.walletAddress}:${view.winnerNoticeProposalId}`,
             "1",
           );
-        redraw();
       } else if (action === "tray-ideas") openTray("ideas");
       else if (action === "tray-world") openTray("world");
-      else if (action === "wallet") void connectPhantom(true);
+      else if (action === "wallet") void connectMetaMask(true);
       else if (action === "submit-idea") void submitIdea();
       else if (action === "cancel-own") void cancelOwnIdea();
       else if (action === "world-detail") {
         const kind = control.dataset.worldKind as
           "location" | "character" | "prop" | undefined;
-        worldDetailKind = kind || null;
-        worldDetailId = control.dataset.worldId || null;
-        redraw();
+        view.worldDetailKind = kind || null;
+        view.worldDetailId = control.dataset.worldId || null;
       } else if (action === "close-world-detail") {
-        worldDetailKind = null;
-        worldDetailId = null;
-        redraw();
+        view.worldDetailKind = null;
+        view.worldDetailId = null;
       } else if (action === "vote") {
         const id = Number(control.dataset.proposalId);
         if (Number.isSafeInteger(id)) void voteForProposal(id);
@@ -1858,19 +2103,17 @@ function installInteractionLayer() {
 
   document.addEventListener("keydown", (event) => {
     if (event.key !== "Escape") return;
-    if (worldDetailKind) {
-      worldDetailKind = null;
-      worldDetailId = null;
-      redraw();
+    if (view.worldDetailKind) {
+      view.worldDetailKind = null;
+      view.worldDetailId = null;
       return;
     }
-    if (trayOpen) {
-      trayOpen = false;
-      redraw();
+    if (view.trayOpen) {
+      view.trayOpen = false;
       return;
     }
-    if (infoOpen) {
-      infoOpen = false;
+    if (view.infoOpen) {
+      view.infoOpen = false;
       syncLocalUiState();
     }
   });
@@ -1915,37 +2158,38 @@ function clipFactOverlay(clip: Clip | null | undefined) {
 }
 
 function engineState() {
-  if (!program) return "boot";
-  if (program.phase === "starting") return "boot";
-  if (program.phase === "offline") return "off";
-  if (program.phase === "setup" || program.phase === "paused") return "pause";
+  if (!view.program) return "boot";
+  if (view.program.phase === "starting") return "boot";
+  if (view.program.phase === "offline") return "off";
+  if (view.program.phase === "setup" || view.program.phase === "paused")
+    return "pause";
   if (
-    program.phase === "planning" ||
-    program.phase === "rendering" ||
-    program.phase === "finalizing"
+    view.program.phase === "planning" ||
+    view.program.phase === "rendering" ||
+    view.program.phase === "finalizing"
   )
     return "work";
   return "ready";
 }
 
 function tooltipStatus() {
-  if (!program || !room) return "PumpTV is starting";
-  if (program.reason) return program.reason;
-  if (program.phase === "starting") return "Generation worker is starting";
-  if (program.phase === "locked")
-    return `Preparing episode ${program.targetEpisode + 1}`;
+  if (!view.program || !view.room) return "PumpTV is starting";
+  if (view.program.reason) return view.program.reason;
+  if (view.program.phase === "starting") return "Generation worker is starting";
+  if (view.program.phase === "locked")
+    return `Preparing episode ${view.program.targetEpisode + 1}`;
   if (
-    program.phase === "planning" ||
-    program.phase === "rendering" ||
-    program.phase === "finalizing"
+    view.program.phase === "planning" ||
+    view.program.phase === "rendering" ||
+    view.program.phase === "finalizing"
   )
-    return `Generating episode ${program.targetEpisode + 1}`;
-  if (program.phase === "ready")
-    return `Episode ${program.targetEpisode + 1} ready`;
-  const round = program.votingRound;
+    return `Generating episode ${view.program.targetEpisode + 1}`;
+  if (view.program.phase === "ready")
+    return `Episode ${view.program.targetEpisode + 1} ready`;
+  const round = view.program.votingRound;
   const proposals = round?.proposals.length || 0;
   return proposals
-    ? program.countdownEndsAtMs
+    ? view.program.countdownEndsAtMs
       ? round?.decisionMode === "voting"
         ? `${proposals} active ideas; voting is open`
         : "1 active idea; it locks in automatically unless another IP challenges"
@@ -1962,7 +2206,7 @@ function ControlIcon({ name }: { name: ControlIconName }) {
   if (name === "playback")
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
-        {playbackPaused ? (
+        {view.playbackPaused ? (
           <path d="M8 5v14l11-7-11-7Z" />
         ) : (
           <>
@@ -1976,7 +2220,7 @@ function ControlIcon({ name }: { name: ControlIconName }) {
     return (
       <svg viewBox="0 0 24 24" aria-hidden="true">
         <path d="M4 9v6h4l5 4V5L8 9H4Z" />
-        {soundEnabled ? (
+        {view.soundEnabled ? (
           <path
             className="stroke"
             d="M16 9.2c1.1 1.1 1.1 4.5 0 5.6M18.5 7c2.6 2.5 2.6 7.5 0 10"
@@ -2093,7 +2337,7 @@ function CandidateRows({
           winnerId === candidate.id || candidate.status === "selected";
         return (
           <div
-            className={`rankRow ${selected ? "winner" : ""} ${interactive ? "interactive" : ""} ${votePendingId === candidate.id ? "pending" : ""}`}
+            className={`rankRow ${selected ? "winner" : ""} ${interactive ? "interactive" : ""} ${view.votePendingId === candidate.id ? "pending" : ""}`}
             key={candidate.id}
             data-action={interactive ? "vote" : undefined}
             data-proposal-id={interactive ? candidate.id : undefined}
@@ -2132,28 +2376,28 @@ function CandidateRows({
 }
 
 function OutsideProgram() {
-  if (!program || !liveOverlayEnabled) return null;
+  if (!view.program || !view.liveOverlayEnabled) return null;
 
-  const phase = program.phase;
+  const phase = view.program.phase;
   const deciding = phase === "deciding";
   const voting = phase === "voting";
   if (!deciding && !voting) return null;
 
-  const primaryRound = program.votingRound || program.decisionRound;
+  const primaryRound = view.program.votingRound || view.program.decisionRound;
   return (
     <section
       className={`outsideProgram phase-${phase}`}
-      title={program.reason || tooltipStatus()}
+      title={view.program.reason || tooltipStatus()}
       aria-label="Next episode decision"
     >
       <div className="outsideProgramHead">
         <span className="outsideProgramGlyph" aria-hidden="true">
           {stageGlyph(phase)}
         </span>
-        <b>{program.targetEpisode + 1}</b>
-        {program.countdownEndsAtMs ? (
+        <b>{view.program.targetEpisode + 1}</b>
+        {view.program.countdownEndsAtMs ? (
           <strong data-vote-countdown>
-            {formatClock(program.countdownEndsAtMs - liveNowMs())}
+            {formatClock(view.program.countdownEndsAtMs - liveNowMs())}
           </strong>
         ) : null}
       </div>
@@ -2183,7 +2427,7 @@ function OutsideTool(props: {
 }
 
 function WorldStatePanel() {
-  if (!infoOpen) return null;
+  if (!view.infoOpen) return null;
   return (
     <aside className="outsideWorld" aria-label="World state">
       <button
@@ -2196,21 +2440,21 @@ function WorldStatePanel() {
         ×
       </button>
 
-      {worldState ? (
+      {view.worldState ? (
         <div className="outsideWorldBody">
           <div className="outsideWorldLocation">
-            <b>{worldState.location || "—"}</b>
-            {worldState.locationDetails ? (
-              <p>{worldState.locationDetails}</p>
+            <b>{view.worldState.location || "—"}</b>
+            {view.worldState.locationDetails ? (
+              <p>{view.worldState.locationDetails}</p>
             ) : null}
-            {worldState.lastEndingBeat ? (
-              <em>{worldState.lastEndingBeat}</em>
+            {view.worldState.lastEndingBeat ? (
+              <em>{view.worldState.lastEndingBeat}</em>
             ) : null}
           </div>
 
-          {worldState.characters.length ? (
+          {view.worldState.characters.length ? (
             <div className="outsideWorldGroup">
-              {worldState.characters.map((item) => (
+              {view.worldState.characters.map((item) => (
                 <article key={item.id}>
                   <b>{item.name}</b>
                   <span>{item.status}</span>
@@ -2220,9 +2464,9 @@ function WorldStatePanel() {
             </div>
           ) : null}
 
-          {worldState.props.length ? (
+          {view.worldState.props.length ? (
             <div className="outsideWorldGroup compact">
-              {worldState.props.map((item) => (
+              {view.worldState.props.map((item) => (
                 <article key={item.id}>
                   <b>{item.name}</b>
                   <span>{item.status}</span>
@@ -2232,9 +2476,9 @@ function WorldStatePanel() {
             </div>
           ) : null}
 
-          {worldState.openThreads.length ? (
+          {view.worldState.openThreads.length ? (
             <div className="outsideThreads">
-              {worldState.openThreads.slice(0, 6).map((item) => (
+              {view.worldState.openThreads.slice(0, 6).map((item) => (
                 <span key={item}>{item}</span>
               ))}
             </div>
@@ -2250,13 +2494,15 @@ function OutsideConsole() {
     <div className="outsideConsole">
       <div className="outsideTools">
         <OutsideTool
-          active={liveOverlayEnabled}
+          active={view.liveOverlayEnabled}
           icon="overlay"
           action="overlay"
-          title={liveOverlayEnabled ? "Hide next episode" : "Show next episode"}
+          title={
+            view.liveOverlayEnabled ? "Hide next episode" : "Show next episode"
+          }
         />
         <OutsideTool
-          active={infoOpen}
+          active={view.infoOpen}
           icon="info"
           action="info"
           title="World state"
@@ -2319,7 +2565,7 @@ function TrayIcon({ name }: { name: TrayIconName }) {
 }
 
 function trayRound() {
-  return program?.votingRound || null;
+  return view.program?.votingRound || null;
 }
 
 function ParticipationIdeas() {
@@ -2329,10 +2575,10 @@ function ParticipationIdeas() {
     round?.status === "open" && round.decisionMode === "voting",
   );
   const generationBusy =
-    program?.phase === "locked" ||
-    program?.phase === "planning" ||
-    program?.phase === "rendering" ||
-    program?.phase === "finalizing";
+    view.program?.phase === "locked" ||
+    view.program?.phase === "planning" ||
+    view.program?.phase === "rendering" ||
+    view.program?.phase === "finalizing";
 
   return (
     <div className="trayIdeas">
@@ -2345,7 +2591,7 @@ function ParticipationIdeas() {
           spellCheck="true"
           placeholder="what happens next?"
           aria-label="Next episode idea"
-          disabled={ideaSubmitting || generationBusy}
+          disabled={view.ideaSubmitting || generationBusy}
         />
         <button
           type="submit"
@@ -2378,22 +2624,22 @@ function ParticipationIdeas() {
 }
 
 function ParticipationWorld() {
-  if (!worldState) return null;
+  if (!view.worldState) return null;
   return (
     <div className="trayWorld">
       <div className="trayWorldLocation">
-        <b>{worldState.location || "—"}</b>
-        {worldState.locationDetails ? (
-          <p>{worldState.locationDetails}</p>
+        <b>{view.worldState.location || "—"}</b>
+        {view.worldState.locationDetails ? (
+          <p>{view.worldState.locationDetails}</p>
         ) : null}
-        {worldState.lastEndingBeat ? (
-          <em>{worldState.lastEndingBeat}</em>
+        {view.worldState.lastEndingBeat ? (
+          <em>{view.worldState.lastEndingBeat}</em>
         ) : null}
       </div>
 
-      {worldState.characters.length ? (
+      {view.worldState.characters.length ? (
         <div className="trayWorldGrid">
-          {worldState.characters.map((item) => (
+          {view.worldState.characters.map((item) => (
             <article key={item.id}>
               <b>{item.name}</b>
               <span>{item.status}</span>
@@ -2403,9 +2649,9 @@ function ParticipationWorld() {
         </div>
       ) : null}
 
-      {worldState.props.length ? (
+      {view.worldState.props.length ? (
         <div className="trayWorldGrid compact">
-          {worldState.props.map((item) => (
+          {view.worldState.props.map((item) => (
             <article key={item.id}>
               <b>{item.name}</b>
               <span>{item.status}</span>
@@ -2415,9 +2661,9 @@ function ParticipationWorld() {
         </div>
       ) : null}
 
-      {worldState.openThreads.length ? (
+      {view.worldState.openThreads.length ? (
         <div className="trayThreads">
-          {worldState.openThreads.slice(0, 8).map((item) => (
+          {view.worldState.openThreads.slice(0, 8).map((item) => (
             <span key={item}>{item}</span>
           ))}
         </div>
@@ -2428,28 +2674,29 @@ function ParticipationWorld() {
 
 function ParticipationTray() {
   const round = trayRound();
-  const phase = program?.phase || "idle";
-  const targetEpisode = round?.targetEpisode ?? program?.targetEpisode ?? 0;
+  const phase = view.program?.phase || "idle";
+  const targetEpisode =
+    round?.targetEpisode ?? view.program?.targetEpisode ?? 0;
   const candidateCount = round?.proposals.length || 0;
   const walletTitle =
-    walletState === "missing"
-      ? "Install Phantom"
-      : walletAddress
-        ? walletAddress
-        : walletState === "connecting"
-          ? "Connecting Phantom"
-          : "Connect Phantom";
+    view.walletState === "missing"
+      ? "Connect MetaMask"
+      : view.walletAddress
+        ? view.walletAddress
+        : view.walletState === "connecting"
+          ? "Connecting MetaMask"
+          : "Connect MetaMask";
 
   return (
-    <section className={`participationTray ${trayOpen ? "open" : ""}`}>
+    <section className={`participationTray ${view.trayOpen ? "open" : ""}`}>
       <div className="trayBar">
         <button
           className="trayToggle"
           type="button"
           data-action="tray-toggle"
-          title={trayOpen ? "Collapse" : "Open"}
+          title={view.trayOpen ? "Collapse" : "Open"}
           aria-label={
-            trayOpen ? "Collapse participation" : "Open participation"
+            view.trayOpen ? "Collapse participation" : "Open participation"
           }
         >
           <TrayIcon name="chevron" />
@@ -2468,17 +2715,19 @@ function ParticipationTray() {
 
         <div className="trayActions">
           <button
-            className={`trayAction wallet ${walletAddress ? "on" : ""} ${walletState}`}
+            className={`trayAction wallet ${view.walletAddress ? "on" : ""} ${view.walletState}`}
             type="button"
             data-action="wallet"
             title={walletTitle}
             aria-label={walletTitle}
           >
             <TrayIcon name="wallet" />
-            {walletAddress ? <span>{shortAddress(walletAddress)}</span> : null}
+            {view.walletAddress ? (
+              <span>{shortAddress(view.walletAddress)}</span>
+            ) : null}
           </button>
           <button
-            className={`trayAction ${trayOpen && trayView === "ideas" ? "on" : ""}`}
+            className={`trayAction ${view.trayOpen && view.trayView === "ideas" ? "on" : ""}`}
             type="button"
             data-action="tray-ideas"
             title="Ideas"
@@ -2487,7 +2736,7 @@ function ParticipationTray() {
             <TrayIcon name="ideas" />
           </button>
           <button
-            className={`trayAction ${trayOpen && trayView === "world" ? "on" : ""}`}
+            className={`trayAction ${view.trayOpen && view.trayView === "world" ? "on" : ""}`}
             type="button"
             data-action="tray-world"
             title="World"
@@ -2498,18 +2747,18 @@ function ParticipationTray() {
         </div>
       </div>
 
-      {trayOpen ? (
+      {view.trayOpen ? (
         <div className="trayBody">
-          {participationError ? (
+          {view.participationError ? (
             <div
               className="trayError"
-              title={participationError}
-              aria-label={participationError}
+              title={view.participationError}
+              aria-label={view.participationError}
             >
               !
             </div>
           ) : null}
-          {trayView === "world" ? (
+          {view.trayView === "world" ? (
             <ParticipationWorld />
           ) : (
             <ParticipationIdeas />
@@ -2652,7 +2901,7 @@ function ProposalCard({
   rank: number;
   key?: unknown;
 }) {
-  const pending = votePendingId === proposal.id;
+  const pending = view.votePendingId === proposal.id;
   return (
     <div
       className={`persistentProposal ${rank === 1 ? "leader" : ""} ${own ? "own" : ""} ${pending ? "pending" : ""}`}
@@ -2690,11 +2939,11 @@ function ProposalCard({
           data-action="vote"
           data-proposal-id={proposal.id}
           disabled={pending}
-          aria-label={`Vote with score ${formatScore(walletPower)}. Current total ${formatScore(proposal.voteCount)}`}
+          aria-label={`Vote with score ${formatScore(view.walletPower)}. Current total ${formatScore(proposal.voteCount)}`}
           data-rich-tooltip="1"
           data-tooltip-kicker={`SCORE · #${proposal.id}`}
           data-tooltip-body={proposalScoreTooltip(proposal)}
-          data-tooltip-meta={`Your vote adds ${formatExactScore(walletPower)}`}
+          data-tooltip-meta={`Your vote adds ${formatExactScore(view.walletPower)}`}
         >
           <BoardIcon name="upvote" />
           <b>{formatScore(proposal.voteCount)}</b>
@@ -2709,8 +2958,8 @@ function PersistentIdeas() {
   const own = ownProposal();
   const proposals = sortedCandidates(round);
   const ownLocked = Boolean(own && round?.decisionMode === "voting");
-  const countdown = program?.countdownEndsAtMs
-    ? `${Math.max(0, Math.ceil((program.countdownEndsAtMs - liveNowMs()) / 1000))}s`
+  const countdown = view.program?.countdownEndsAtMs
+    ? `${Math.max(0, Math.ceil((view.program.countdownEndsAtMs - liveNowMs()) / 1000))}s`
     : null;
   return (
     <section className="persistentIdeas" aria-label="Suggestions">
@@ -2743,7 +2992,7 @@ function PersistentIdeas() {
                 : "what happens next?"
           }
           aria-label="Your idea"
-          disabled={ideaSubmitting || ownLocked}
+          disabled={view.ideaSubmitting || ownLocked}
         />
         <button
           type="submit"
@@ -2782,19 +3031,19 @@ function PersistentIdeas() {
 }
 
 function worldDetail() {
-  if (!worldState || !worldDetailKind) return null;
-  if (worldDetailKind === "location")
+  if (!view.worldState || !view.worldDetailKind) return null;
+  if (view.worldDetailKind === "location")
     return {
-      title: worldState.location,
+      title: view.worldState.location,
       lines: [
-        worldState.locationDetails,
-        worldState.lastEndingBeat,
-        ...worldState.openThreads,
+        view.worldState.locationDetails,
+        view.worldState.lastEndingBeat,
+        ...view.worldState.openThreads,
       ].filter(Boolean),
     };
-  if (worldDetailKind === "character") {
-    const item = worldState.characters.find(
-      (character) => character.id === worldDetailId,
+  if (view.worldDetailKind === "character") {
+    const item = view.worldState.characters.find(
+      (character) => character.id === view.worldDetailId,
     );
     return item
       ? {
@@ -2808,7 +3057,9 @@ function worldDetail() {
         }
       : null;
   }
-  const item = worldState.props.find((prop) => prop.id === worldDetailId);
+  const item = view.worldState.props.find(
+    (prop) => prop.id === view.worldDetailId,
+  );
   return item
     ? {
         title: item.name,
@@ -2845,7 +3096,7 @@ function WorldDetailModal() {
 }
 
 function PersistentWorld() {
-  if (!worldState) return <section className="persistentWorld" />;
+  if (!view.worldState) return <section className="persistentWorld" />;
   return (
     <section className="persistentWorld" aria-label="World state">
       <button
@@ -2855,20 +3106,22 @@ function PersistentWorld() {
         data-world-kind="location"
         data-world-id="location"
         data-rich-tooltip="1"
-        data-tooltip-kicker={worldState.location || "WORLD"}
+        data-tooltip-kicker={view.worldState.location || "WORLD"}
         data-tooltip-body={
-          worldState.locationDetails || worldState.lastEndingBeat || ""
+          view.worldState.locationDetails ||
+          view.worldState.lastEndingBeat ||
+          ""
         }
-        data-tooltip-meta={worldState.lastEndingBeat || ""}
+        data-tooltip-meta={view.worldState.lastEndingBeat || ""}
       >
-        <b>{worldState.location || "—"}</b>
-        {worldState.lastEndingBeat ? (
-          <span>{worldState.lastEndingBeat}</span>
+        <b>{view.worldState.location || "—"}</b>
+        {view.worldState.lastEndingBeat ? (
+          <span>{view.worldState.lastEndingBeat}</span>
         ) : null}
       </button>
-      {worldState.characters.length ? (
+      {view.worldState.characters.length ? (
         <div className="persistentWorldItems">
-          {worldState.characters.map((item) => (
+          {view.worldState.characters.map((item) => (
             <button
               key={item.id}
               type="button"
@@ -2890,9 +3143,9 @@ function PersistentWorld() {
           ))}
         </div>
       ) : null}
-      {worldState.props.length ? (
+      {view.worldState.props.length ? (
         <div className="persistentWorldItems props">
-          {worldState.props.map((item) => (
+          {view.worldState.props.map((item) => (
             <button
               key={item.id}
               type="button"
@@ -2912,13 +3165,13 @@ function PersistentWorld() {
           ))}
         </div>
       ) : null}
-      {worldState.openThreads.length ? (
+      {view.worldState.openThreads.length ? (
         <div
           className="persistentThreads"
           role="list"
           aria-label="Open story threads"
         >
-          {worldState.openThreads.map((thread, index) => (
+          {view.worldState.openThreads.map((thread, index) => (
             <div
               className="persistentThreadRow"
               role="listitem"
@@ -2938,22 +3191,22 @@ function ParticipationBoard() {
   const round = currentBoardRound();
   const candidates = sortedCandidates(round);
   const leader = candidates[0] || null;
-  const walletTitle = walletAddress
-    ? `${shortAddress(walletAddress)} · ${formatExactScore(walletTokenBalance)} $PumpTV · voting power ${formatExactScore(walletPower)}`
-    : "Connect Phantom";
+  const walletTitle = view.walletAddress
+    ? `${shortAddress(view.walletAddress)} · Robinhood Chain · ${view.walletEthBalance.toFixed(4)} ETH · 1 vote`
+    : "Connect MetaMask";
   const own = ownProposal();
 
   return (
-    <section className={`participationBoard ${trayOpen ? "open" : ""}`}>
+    <section className={`participationBoard ${view.trayOpen ? "open" : ""}`}>
       <div className="participationDock">
         <button
           className="boardToggle"
           type="button"
           data-action="tray-toggle"
           aria-label={
-            trayOpen ? "Close ideas" : own ? "Open my idea" : "Add an idea"
+            view.trayOpen ? "Close ideas" : own ? "Open my idea" : "Add an idea"
           }
-          aria-expanded={trayOpen}
+          aria-expanded={view.trayOpen}
         >
           <span>{own ? "MY IDEA" : "ADD IDEA"}</span>
           <TrayIcon name="chevron" />
@@ -2961,10 +3214,10 @@ function ParticipationBoard() {
 
         <span
           className="viewerMetric"
-          aria-label={`${room?.viewerCount ?? 0} viewers`}
+          aria-label={`${view.room?.viewerCount ?? 0} viewers`}
         >
           <BoardIcon name="viewer" />
-          <b>{room?.viewerCount ?? 0}</b>
+          <b>{view.room?.viewerCount ?? 0}</b>
         </span>
 
         <button
@@ -3003,39 +3256,43 @@ function ParticipationBoard() {
 
         <button
           type="button"
-          className={`walletMetric ${walletAddress ? "connected" : ""}`}
+          className={`walletMetric ${view.walletAddress ? "connected" : ""}`}
           data-action="wallet"
           aria-label={walletTitle}
-          data-rich-tooltip={walletAddress ? "1" : undefined}
-          data-tooltip-kicker={walletAddress ? "$PUMPTV TOKEN" : undefined}
+          data-rich-tooltip={view.walletAddress ? "1" : undefined}
+          data-tooltip-kicker={
+            view.walletAddress ? "ROBINHOOD CHAIN" : undefined
+          }
           data-tooltip-body={
-            walletAddress
-              ? `$PumpTV balance ${formatExactScore(walletTokenBalance)}\nVoting power ${formatExactScore(walletPower)}`
+            view.walletAddress
+              ? `Robinhood ETH ${view.walletEthBalance.toFixed(4)}\nVoting power ${formatExactScore(view.walletPower)}`
               : undefined
           }
           data-tooltip-meta={
-            walletAddress ? shortAddress(walletAddress) : undefined
+            view.walletAddress ? shortAddress(view.walletAddress) : undefined
           }
         >
           <BoardIcon name="wallet" />
-          {walletAddress ? (
-            <b>{walletScoreLoading ? "…" : formatScore(walletPower)}</b>
+          {view.walletAddress ? (
+            <b>
+              {view.walletScoreLoading ? "…" : formatScore(view.walletPower)}
+            </b>
           ) : null}
         </button>
 
-        {participationError ? (
+        {view.participationError ? (
           <i
             className="participationError"
             data-rich-tooltip="1"
             data-tooltip-kicker="ERROR"
-            data-tooltip-body={participationError}
+            data-tooltip-body={view.participationError}
           >
             !
           </i>
         ) : null}
       </div>
 
-      {trayOpen ? (
+      {view.trayOpen ? (
         <button
           type="button"
           className="participationShade"
@@ -3044,7 +3301,7 @@ function ParticipationBoard() {
         />
       ) : null}
 
-      <div className="participationSheet" aria-hidden={!trayOpen}>
+      <div className="participationSheet" aria-hidden={!view.trayOpen}>
         <div className="drawerGrab" aria-hidden="true">
           <i />
         </div>
@@ -3059,38 +3316,60 @@ function ParticipationBoard() {
   );
 }
 
+function liveEdgeEpisode() {
+  const active =
+    activeVideoClipId == null
+      ? null
+      : view.timeline.find((clip) => clip.id === activeVideoClipId) || null;
+  if (active) return active.episode;
+
+  const ended =
+    view.lastEndedLiveClipId == null
+      ? null
+      : view.timeline.find((clip) => clip.id === view.lastEndedLiveClipId) ||
+        null;
+  return ended?.episode ?? null;
+}
+
+function programBusyForFutureEpisode() {
+  if (!view.program) return false;
+  const busy =
+    view.program.phase === "locked" ||
+    view.program.phase === "planning" ||
+    view.program.phase === "rendering" ||
+    view.program.phase === "finalizing" ||
+    view.program.phase === "ready";
+  if (!busy) return false;
+
+  const presentedEpisode = liveEdgeEpisode();
+  // A long-poll snapshot can still say EP N is `ready` after the browser has
+  // already presented and ended EP N. Only suppress the next-turn surface when
+  // the server is actually working on an episode AFTER the one on screen.
+  return (
+    presentedEpisode == null || view.program.targetEpisode > presentedEpisode
+  );
+}
+
 function YourTurnOverlay() {
   if (
-    replayClipId != null ||
-    liveSlotState !== "intermission" ||
+    view.replayClipId != null ||
+    view.liveSlotState !== "intermission" ||
     incomingLiveClipPending() ||
-    !program
+    programBusyForFutureEpisode()
   )
     return null;
 
-  // Once the decision closes, the center of the TV stops being an interaction
-  // surface. Generation is represented by a tiny passive pulse instead; this
-  // avoids covering the first frames of a newly published episode with stale UI.
-  if (
-    program.phase === "locked" ||
-    program.phase === "planning" ||
-    program.phase === "rendering" ||
-    program.phase === "finalizing" ||
-    program.phase === "ready"
-  )
-    return null;
-
-  const round = program.votingRound;
+  const round = view.program?.votingRound || null;
   const ideas = round?.proposals.length || 0;
   const decisionMode =
     round?.decisionMode || (ideas > 1 ? "voting" : ideas ? "solo" : "waiting");
-  const countdown = program.countdownEndsAtMs
-    ? `${Math.max(0, Math.ceil((program.countdownEndsAtMs - liveNowMs()) / 1000))}s`
+  const countdown = view.program?.countdownEndsAtMs
+    ? `${Math.max(0, Math.ceil((view.program.countdownEndsAtMs - liveNowMs()) / 1000))}s`
     : null;
   const unavailable =
-    program.phase === "offline" ||
-    program.phase === "setup" ||
-    program.phase === "paused";
+    view.program?.phase === "offline" ||
+    view.program?.phase === "setup" ||
+    view.program?.phase === "paused";
 
   return (
     <div className="yourTurnOverlay choose">
@@ -3108,7 +3387,9 @@ function YourTurnOverlay() {
             {ideas} IDEA{ideas === 1 ? "" : "S"}
           </div>
         ) : unavailable ? (
-          <div className="yourTurnMeta">{program.reason || "UNAVAILABLE"}</div>
+          <div className="yourTurnMeta">
+            {view.program?.reason || "UNAVAILABLE"}
+          </div>
         ) : null}
         <button type="button" data-action="tray-ideas">
           {decisionMode === "voting" ? "OPEN VOTE" : "ADD IDEA"}
@@ -3119,22 +3400,20 @@ function YourTurnOverlay() {
 }
 
 function GenerationPulse() {
-  if (replayClipId != null || liveSlotState !== "intermission" || !program)
+  if (view.replayClipId != null || view.liveSlotState !== "intermission")
     return null;
   const mediaLoading = incomingLiveClipPending();
-  const serverBusy =
-    program.phase === "locked" ||
-    program.phase === "planning" ||
-    program.phase === "rendering" ||
-    program.phase === "finalizing" ||
-    program.phase === "ready";
+  const serverBusy = programBusyForFutureEpisode();
   if (!mediaLoading && !serverBusy) return null;
+
   const label =
-    mediaLoading || program.phase === "ready" ? "LOADING" : "GENERATING";
+    mediaLoading || view.program?.phase === "ready" ? "LOADING" : "GENERATING";
+  const targetEpisode =
+    view.program?.targetEpisode ?? (liveEdgeEpisode() ?? -1) + 1;
   return (
     <div
       className="generationPulse"
-      aria-label={`${label === "LOADING" ? "Loading" : "Generating"} episode ${program.targetEpisode + 1}`}
+      aria-label={`${label === "LOADING" ? "Loading" : "Generating"} episode ${targetEpisode + 1}`}
       title={tooltipStatus()}
     >
       <i aria-hidden="true" />
@@ -3144,11 +3423,18 @@ function GenerationPulse() {
 }
 
 function WinnerRewardNotice() {
-  if (!walletAddress || !winnerNoticeProposalId || winnerNoticeDismissed)
+  if (
+    !view.walletAddress ||
+    !view.winnerNoticeProposalId ||
+    view.winnerNoticeDismissed
+  )
     return null;
   const reward =
-    winnerReward?.proposalId === winnerNoticeProposalId ? winnerReward : null;
-  const amount = reward?.amountSol ?? 0.01;
+    view.winnerReward?.proposalId === view.winnerNoticeProposalId
+      ? view.winnerReward
+      : null;
+  const targetUsd = reward?.targetUsd ?? 1;
+  const amountEth = reward?.amountEth ?? null;
   const status =
     reward?.status === "sent"
       ? "SENT"
@@ -3169,15 +3455,23 @@ function WinnerRewardNotice() {
         ×
       </button>
       <b>YOUR IDEA WON</b>
-      <strong>{amount.toFixed(2)} SOL</strong>
+      <strong>
+        {`$${targetUsd.toFixed(2)}`} ·{" "}
+        {amountEth == null ? "ETH" : `${amountEth.toFixed(6)} ETH`}
+      </strong>
       <span>{status}</span>
+      {reward?.status === "sent" && reward.explorerUrl ? (
+        <a href={reward.explorerUrl} target="_blank" rel="noreferrer">
+          VIEW TX
+        </a>
+      ) : null}
     </aside>
   );
 }
 
 function TactileTV({ clip }: { clip: Clip | null }) {
   const state = engineState();
-  const isReplay = replayClipId != null;
+  const isReplay = view.replayClipId != null;
 
   return (
     <div className="tvShell">
@@ -3195,7 +3489,7 @@ function TactileTV({ clip }: { clip: Clip | null }) {
             </div>
           ) : null}
           <div className="glassGlow" />
-          {liveSlotState !== "intermission" || isReplay ? (
+          {view.liveSlotState !== "intermission" || isReplay ? (
             <CurrentPrompt clip={clip} />
           ) : null}
           <YourTurnOverlay />
@@ -3217,21 +3511,23 @@ function TactileTV({ clip }: { clip: Clip | null }) {
         <button className={`powerLamp ${state}`} aria-label={tooltipStatus()} />
         <div className="knobStack">
           <KnobControl
-            active={!playbackPaused}
-            title={playbackPaused ? "Play" : "Pause"}
+            active={!view.playbackPaused}
+            title={view.playbackPaused ? "Play" : "Pause"}
             icon="playback"
             action="playback"
           />
           <KnobControl
-            active={soundEnabled}
-            title={soundEnabled ? "Mute" : "Unmute"}
+            active={view.soundEnabled}
+            title={view.soundEnabled ? "Mute" : "Unmute"}
             icon="sound"
             action="sound"
           />
           <KnobControl
-            active={captionsEnabled}
+            active={view.captionsEnabled}
             title={
-              captionsEnabled ? "Hide prompt captions" : "Show prompt captions"
+              view.captionsEnabled
+                ? "Hide prompt captions"
+                : "Show prompt captions"
             }
             icon="captions"
             action="captions"
@@ -3253,15 +3549,15 @@ function TactileTV({ clip }: { clip: Clip | null }) {
 }
 
 function ProgramShelfSlot() {
-  if (!program) return null;
-  const phase = program.phase;
-  const candidateCount = program.votingRound?.proposals.length || 0;
+  if (!view.program) return null;
+  const phase = view.program.phase;
+  const candidateCount = view.program.votingRound?.proposals.length || 0;
   if (phase === "ready") return null; // the real future clip card is already in the rail
   if (phase === "idle" && candidateCount === 0) return null;
-  const episode = program.targetEpisode + 1;
-  const directiveText = program.directive?.text?.trim() || "";
+  const episode = view.program.targetEpisode + 1;
+  const directiveText = view.program.directive?.text?.trim() || "";
   const title =
-    program.reason ||
+    view.program.reason ||
     (phase === "deciding"
       ? `Idea locks for episode ${episode}`
       : phase === "voting"
@@ -3305,7 +3601,7 @@ function ProgramShelfSlot() {
 
 function EpisodeShelf() {
   const now = liveNowMs();
-  const episodes = [...timeline]
+  const episodes = [...view.timeline]
     .filter((clip) => Boolean(clip.videoUrl))
     .sort((a, b) => b.episode - a.episode || b.id - a.id);
   const shown = visibleClip();
@@ -3314,7 +3610,7 @@ function EpisodeShelf() {
   return (
     <aside className="episodeShelf" aria-label="Episodes">
       <button
-        className={`liveCap ${replayClipId == null ? "active" : ""}`}
+        className={`liveCap ${view.replayClipId == null ? "active" : ""}`}
         type="button"
         data-action="live"
         aria-label="Live"
@@ -3325,7 +3621,7 @@ function EpisodeShelf() {
         <ProgramShelfSlot />
         {episodes.map((clip) => {
           const active = shown?.id === clip.id;
-          const isLive = live?.id === clip.id && replayClipId == null;
+          const isLive = live?.id === clip.id && view.replayClipId == null;
           const future = clip.startsAtMs > now + 250;
           const thumb =
             clip.startFrameUrl || clip.endFrameUrl || clip.anchorFrameUrl;
@@ -6596,6 +6892,186 @@ function OutsideInterfaceStyles() {
         }
       }
 
+      /* v48: authoritative adaptive sheet layout.
+         Mobile gets one scroll owner, ideas first, and no sticky controls that
+         can float across world/story content. Keep this block last so historic
+         density experiments cannot reintroduce nested scrolling. */
+      @media (max-width: 900px) {
+        .participationSheet {
+          position: fixed !important;
+          left: 6px !important;
+          right: 6px !important;
+          bottom: max(6px, env(safe-area-inset-bottom)) !important;
+          width: auto !important;
+          height: min(86dvh, 760px) !important;
+          max-height: calc(
+            100dvh - max(14px, env(safe-area-inset-top)) -
+            max(12px, env(safe-area-inset-bottom))
+          ) !important;
+          min-height: 0 !important;
+          display: grid !important;
+          grid-template-rows: auto minmax(0, 1fr) !important;
+          overflow: hidden !important;
+          overscroll-behavior: none !important;
+          border-radius: 18px !important;
+          z-index: 220 !important;
+        }
+        .participationBoard.open .participationSheet {
+          z-index: 220 !important;
+        }
+        .participationShade {
+          position: fixed !important;
+          inset: 0 !important;
+          z-index: 219 !important;
+          display: block !important;
+          width: 100vw !important;
+          height: 100dvh !important;
+          pointer-events: auto !important;
+          touch-action: none !important;
+          background: rgba(0,0,0,.56) !important;
+          backdrop-filter: blur(2px);
+        }
+        .drawerGrab {
+          position: relative !important;
+          flex: none !important;
+          height: 26px !important;
+        }
+        .participationColumns {
+          display: flex !important;
+          flex-direction: column !important;
+          grid-template-columns: none !important;
+          height: 100% !important;
+          max-height: none !important;
+          min-height: 0 !important;
+          overflow-y: auto !important;
+          overflow-x: hidden !important;
+          overscroll-behavior-y: contain !important;
+          -webkit-overflow-scrolling: touch !important;
+          touch-action: pan-y !important;
+          scrollbar-gutter: stable !important;
+          padding: 0 0 max(20px, env(safe-area-inset-bottom)) !important;
+        }
+
+        /* Participation is the primary task on a phone. */
+        .persistentIdeas {
+          order: 1 !important;
+          flex: 0 0 auto !important;
+          width: 100% !important;
+          min-height: 0 !important;
+          max-height: none !important;
+          overflow: visible !important;
+          padding: 10px 10px 14px !important;
+          border-bottom: 1px solid rgba(255,255,255,.07) !important;
+        }
+        .persistentIdeasHead,
+        .persistentIdeaForm {
+          position: static !important;
+          inset: auto !important;
+          top: auto !important;
+          z-index: auto !important;
+        }
+        .persistentIdeaForm {
+          margin: 0 0 8px !important;
+          padding: 0 !important;
+        }
+        .persistentProposalList {
+          max-height: none !important;
+          overflow: visible !important;
+        }
+        .persistentProposal {
+          align-items: start !important;
+          grid-template-columns: 22px minmax(0,1fr) auto !important;
+          min-height: 0 !important;
+          padding-block: 9px !important;
+        }
+        .persistentProposalText {
+          min-width: 0 !important;
+        }
+        .persistentProposalText > span {
+          display: block !important;
+          white-space: normal !important;
+          overflow: visible !important;
+          text-overflow: clip !important;
+          overflow-wrap: anywhere !important;
+          word-break: break-word !important;
+          font-size: 12px !important;
+          line-height: 1.38 !important;
+        }
+
+        /* World state is secondary reference material and follows ideas. */
+        .persistentWorld {
+          order: 2 !important;
+          flex: 0 0 auto !important;
+          width: 100% !important;
+          min-height: 0 !important;
+          max-height: none !important;
+          overflow: visible !important;
+          padding: 10px !important;
+          border-right: 0 !important;
+          border-bottom: 0 !important;
+        }
+        .persistentWorldItems {
+          overflow: visible !important;
+        }
+        .persistentWorldItems > button {
+          min-height: 0 !important;
+          grid-template-columns: minmax(96px,.38fr) minmax(0,.62fr) !important;
+          align-items: start !important;
+          gap: 10px !important;
+          padding-block: 8px !important;
+        }
+        .persistentWorldItems > button > b,
+        .persistentWorldItems > button > span {
+          min-width: 0 !important;
+          white-space: normal !important;
+          overflow: visible !important;
+          text-overflow: clip !important;
+          overflow-wrap: anywhere !important;
+          word-break: break-word !important;
+          text-align: left !important;
+          line-height: 1.34 !important;
+        }
+        .persistentThreads {
+          display: grid !important;
+          max-height: none !important;
+          min-height: 0 !important;
+          overflow: visible !important;
+          overscroll-behavior: auto !important;
+          padding-right: 0 !important;
+          scrollbar-width: auto !important;
+        }
+        .persistentThreadRow {
+          min-height: 0 !important;
+          padding-block: 9px !important;
+        }
+        .persistentThreadRow > span {
+          white-space: normal !important;
+          overflow: visible !important;
+          text-overflow: clip !important;
+          overflow-wrap: anywhere !important;
+          word-break: break-word !important;
+          font-size: 10px !important;
+          line-height: 1.42 !important;
+        }
+      }
+
+      @media (max-width: 560px) {
+        .participationSheet {
+          left: 4px !important;
+          right: 4px !important;
+          bottom: max(4px, env(safe-area-inset-bottom)) !important;
+          height: min(88dvh, 760px) !important;
+          border-radius: 16px !important;
+        }
+        .persistentWorldItems > button {
+          grid-template-columns: 1fr !important;
+          gap: 3px !important;
+        }
+        .persistentWorldItems > button > span {
+          opacity: .58 !important;
+        }
+      }
+
     `}</style>
   );
 }
@@ -6618,8 +7094,8 @@ function App() {
               data-tooltip-kicker="STATUS"
               data-tooltip-body={tooltipStatus()}
             />
-            {transport !== "live" ? (
-              <i className="transportDot" aria-label={transport} />
+            {view.transport !== "live" ? (
+              <i className="transportDot" aria-label={view.transport} />
             ) : null}
           </div>
         </div>
@@ -6628,22 +7104,24 @@ function App() {
         </div>
         <ParticipationBoard />
         <WinnerRewardNotice />
-        {error ? (
+        {view.error ? (
           <div
             className="fatalBadge"
             data-rich-tooltip="1"
             data-tooltip-kicker="ERROR"
-            data-tooltip-body={error}
+            data-tooltip-body={view.error}
           >
             !
           </div>
         ) : null}
-        {room?.generation.paused ? (
+        {view.room?.generation.paused ? (
           <div
             className="fatalBadge warning"
             data-rich-tooltip="1"
             data-tooltip-kicker="GENERATION"
-            data-tooltip-body={room.generation.reason || "Generation paused"}
+            data-tooltip-body={
+              view.room.generation.reason || "Generation paused"
+            }
           >
             !
           </div>

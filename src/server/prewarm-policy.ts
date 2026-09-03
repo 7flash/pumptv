@@ -48,6 +48,7 @@ export function speculativeDirectiveMatches(input: {
     (input.directive.usedEpisode == null ||
       input.episode === input.directive.usedEpisode) &&
     input.proposalId === input.directive.proposalId &&
-    normalizedDirective(input.text) === normalizedDirective(input.directive.text)
+    normalizedDirective(input.text) ===
+      normalizedDirective(input.directive.text)
   );
 }

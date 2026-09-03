@@ -18,9 +18,9 @@ import {
   upsertWebProposal,
 } from "../../../src/server/repository.ts";
 import {
-  normalizeSolanaAddress,
+  normalizeEvmAddress,
   walletVotingPower,
-} from "../../../src/server/wallet-score.ts";
+} from "../../../src/server/evm-wallet.ts";
 import { participationCohortKey } from "../../../src/server/participant-identity.ts";
 
 function anonymousKey(value: unknown) {
@@ -54,7 +54,7 @@ export function POST(request: Request) {
       const text = sanitizeLine(String(body.text || ""), 500);
       if (!text) throw new Error("Idea cannot be empty");
       const identity = body.ownerId ?? body.viewerId;
-      const walletAddress = normalizeSolanaAddress(body.walletAddress);
+      const walletAddress = normalizeEvmAddress(body.walletAddress);
       const subjectKey = ownerKey(identity, walletAddress);
       participationSlot = claimParticipationSlot({
         originIpHash,
@@ -137,7 +137,7 @@ export function DELETE(request: Request) {
           return raw as Record<string, unknown>;
         },
       );
-      const walletAddress = normalizeSolanaAddress(body.walletAddress);
+      const walletAddress = normalizeEvmAddress(body.walletAddress);
       const identity = body.ownerId ?? body.viewerId;
       const removed = await httpMeasure.measure(
         "Cancel persistent proposal",

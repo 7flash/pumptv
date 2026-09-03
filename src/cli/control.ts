@@ -230,7 +230,7 @@ async function handleRemoteCommand() {
   }
   if (command === "wallet") {
     const address = args.find((arg) => !arg.startsWith("--")) || "";
-    if (!address) throw new Error("wallet requires a Solana address");
+    if (!address) throw new Error("wallet requires an EVM address");
     const refresh = args.includes("--refresh") ? "&refresh=1" : "";
     const payload = await remoteJson(
       `/api/wallet/score?walletAddress=${encodeURIComponent(address)}${refresh}`,
@@ -508,18 +508,20 @@ if (command === "doctor") {
     usage();
     process.exit(1);
   }
-  const { walletVotingPower } = await import("../server/wallet-score.ts");
+  const { walletVotingPower } = await import("../server/evm-wallet.ts");
   const result = await walletVotingPower(address, {
     fresh: args.includes("--refresh"),
   });
   console.log(JSON.stringify({ walletAddress: address, ...result }, null, 2));
 } else if (command === "reward-wallet") {
   const { rewardWalletInfo } = await import("../server/rewards.ts");
-  console.log(JSON.stringify(rewardWalletInfo(), null, 2));
+  console.log(JSON.stringify(await rewardWalletInfo(), null, 2));
 } else if (command === "rewards") {
   const rows = db.raw<any>(
-    `SELECT id, roundId, proposalId, walletAddress, amountLamports, status,
-            signature, lastError, claimedAtMs, sentAtMs, createdAt, updatedAt
+    `SELECT id, roundId, proposalId, walletAddress, chainId, asset,
+            targetUsdCents, amountWei, quotedEthUsdMicros, quoteSource,
+            status, signature, lastError, claimedAtMs, sentAtMs,
+            createdAt, updatedAt
      FROM ideaRewards ORDER BY id DESC LIMIT 50`,
   );
   console.log(JSON.stringify(rows, null, 2));

@@ -1,17 +1,46 @@
-import { Solard, sol } from "@solard/sdk";
+import {
+  createPublicClient,
+  createWalletClient,
+  formatEther,
+  http,
+  type Hex,
+} from "viem";
+import { privateKeyToAccount } from "viem/accounts";
 import { db } from "./db.ts";
+import {
+  normalizeEvmAddress,
+  ROBINHOOD_CHAIN_ID,
+  ROBINHOOD_EXPLORER_URL,
+  ROBINHOOD_RPC_URL,
+  robinhoodChain,
+} from "./evm-wallet.ts";
 import { dbMeasure, rewardMeasure } from "./observability.ts";
+import { ethUsdToMicros, rewardWeiForUsdCents } from "./reward-amount.ts";
 
-const WALLET_NAME = (
-  process.env.PUMPTV_REWARD_WALLET_NAME || "pumptv-winner-rewards"
+const PRICE_URL = (
+  process.env.PUMPTV_REWARD_ETH_USD_URL ||
+  "https://api.coinbase.com/v2/prices/ETH-USD/spot"
 ).trim();
+const PRICE_CACHE_MS = Math.max(
+  10_000,
+  Number(process.env.PUMPTV_REWARD_PRICE_CACHE_MS || 60_000),
+);
+const PRICE_RETRY_MS = Math.max(
+  5_000,
+  Number(process.env.PUMPTV_REWARD_PRICE_RETRY_MS || 30_000),
+);
 const SENDING_STALE_MS = Math.max(
   30_000,
   Number(process.env.PUMPTV_REWARD_SENDING_STALE_MS || 180_000),
 );
 
-let solard: Solard | null = null;
 let sending: Promise<void> | null = null;
+let quoteCache: { atMs: number; ethUsdMicros: number; source: string } | null =
+  null;
+let nextQuoteAttemptAtMs = 0;
+
+class RewardDeferredError extends Error {}
+class RewardSkippedError extends Error {}
 
 function cleanError(error: unknown) {
   return (
@@ -24,52 +53,93 @@ function cleanError(error: unknown) {
     .slice(0, 600);
 }
 
-function sdk() {
-  if (!solard) solard = new Solard();
-  return solard;
-}
-
-function resolveRewardWallet(client: Solard): any {
-  const wallets = (client.listWallets?.() || []) as any[];
-  const existing = wallets.find((wallet) => {
-    const values = [wallet?.name, wallet?.id, wallet?.label].map((value) =>
-      String(value || "").trim(),
+function rewardPrivateKey(): Hex {
+  const raw = (process.env.PUMPTV_REWARD_PRIVATE_KEY || "").trim();
+  if (!/^0x[0-9a-fA-F]{64}$/.test(raw))
+    throw new Error(
+      "PUMPTV_REWARD_PRIVATE_KEY must be a 32-byte 0x-prefixed EVM private key",
     );
-    return values.includes(WALLET_NAME);
-  });
-  return existing || client.createWallet(WALLET_NAME);
+  return raw as Hex;
 }
 
-export function rewardWalletInfo() {
-  return rewardMeasure.measureSync("Resolve reward wallet", () => {
-    const wallet = resolveRewardWallet(sdk());
-    return {
-      name: WALLET_NAME,
-      address: String(wallet?.address || "") || null,
-    };
+function clients() {
+  const account = privateKeyToAccount(rewardPrivateKey());
+  const publicClient = createPublicClient({
+    chain: robinhoodChain,
+    transport: http(ROBINHOOD_RPC_URL, { timeout: 10_000 }),
   });
+  const walletClient = createWalletClient({
+    account,
+    chain: robinhoodChain,
+    transport: http(ROBINHOOD_RPC_URL, { timeout: 10_000 }),
+  });
+  return { account, publicClient, walletClient };
+}
+
+export async function rewardWalletInfo() {
+  return rewardMeasure.measure(
+    {
+      start: () => "Inspect Robinhood reward wallet",
+      end: (value) => ({
+        address: value.address,
+        chainId: value.chainId,
+        balanceEth: value.balanceEth,
+      }),
+    },
+    async () => {
+      const { account, publicClient } = clients();
+      const balanceWei = await publicClient.getBalance({
+        address: account.address,
+      });
+      return {
+        address: account.address,
+        chainId: ROBINHOOD_CHAIN_ID,
+        network: robinhoodChain.name,
+        rpc: ROBINHOOD_RPC_URL,
+        explorer: ROBINHOOD_EXPLORER_URL,
+        balanceEth: Number(formatEther(balanceWei)),
+      };
+    },
+  );
 }
 
 export function latestRewardForWallet(walletAddress: string) {
-  return dbMeasure.measureSync("Load wallet reward status", () => {
+  const address = normalizeEvmAddress(walletAddress);
+  if (!address) return null;
+  return dbMeasure.measureSync("Load Robinhood wallet reward status", () => {
     const row =
       db.raw<any>(
-        `SELECT id, roundId, proposalId, walletAddress, amountLamports, status,
-                signature, lastError, claimedAtMs, sentAtMs, createdAt, updatedAt
+        `SELECT id, roundId, proposalId, walletAddress, chainId, asset,
+                targetUsdCents, amountWei, quotedEthUsdMicros, quoteSource,
+                status, signature, lastError, claimedAtMs, sentAtMs,
+                createdAt, updatedAt
          FROM ideaRewards
-         WHERE walletAddress = ?
+         WHERE lower(walletAddress) = lower(?) AND chainId = ? AND asset = 'ETH'
          ORDER BY id DESC LIMIT 1`,
-        walletAddress,
+        address,
+        ROBINHOOD_CHAIN_ID,
       )[0] || null;
     if (!row) return null;
+    const amountWei =
+      row.amountWei == null ? null : BigInt(String(row.amountWei));
     return {
       id: Number(row.id),
       roundId: Number(row.roundId),
       proposalId: Number(row.proposalId),
-      amountLamports: Number(row.amountLamports),
-      amountSol: Number(row.amountLamports) / 1_000_000_000,
+      walletAddress: String(row.walletAddress),
+      chainId: Number(row.chainId),
+      asset: "ETH" as const,
+      targetUsd: Number(row.targetUsdCents || 0) / 100,
+      amountEth: amountWei == null ? null : Number(formatEther(amountWei)),
+      quotedEthUsd:
+        row.quotedEthUsdMicros == null
+          ? null
+          : Number(row.quotedEthUsdMicros) / 1_000_000,
       status: String(row.status),
-      signature: row.signature ?? null,
+      transactionHash: row.signature ?? null,
+      explorerUrl: row.signature
+        ? `${ROBINHOOD_EXPLORER_URL}/tx/${String(row.signature)}`
+        : null,
       lastError: row.lastError ?? null,
       claimedAtMs: row.claimedAtMs == null ? null : Number(row.claimedAtMs),
       sentAtMs: row.sentAtMs == null ? null : Number(row.sentAtMs),
@@ -77,33 +147,102 @@ export function latestRewardForWallet(walletAddress: string) {
   });
 }
 
-function markStaleSendingUncertain(now = Date.now()) {
-  return dbMeasure.measureSync("Quarantine stale reward sends", () => {
-    const rows = db.raw<any>(
-      `SELECT id FROM ideaRewards
-       WHERE status = 'sending' AND claimedAtMs IS NOT NULL AND claimedAtMs <= ?`,
-      now - SENDING_STALE_MS,
-    );
-    for (const row of rows) {
-      db.exec(
-        `UPDATE ideaRewards
-         SET status = 'uncertain', lastError = ?
-         WHERE id = ? AND status = 'sending'`,
-        "Reward worker restarted or timed out after send began; not retried automatically to prevent a duplicate SOL payment.",
-        row.id,
-      );
-    }
-    return { quarantined: rows.length };
-  });
+async function loadEthUsdQuote() {
+  const now = Date.now();
+  if (quoteCache && now - quoteCache.atMs < PRICE_CACHE_MS) return quoteCache;
+  if (now < nextQuoteAttemptAtMs)
+    throw new RewardDeferredError("Waiting before retrying ETH/USD quote");
+
+  return rewardMeasure.measure(
+    {
+      start: () => "Quote ETH/USD for winner reward",
+      end: (quote) => ({
+        ethUsd: quote.ethUsdMicros / 1_000_000,
+        source: quote.source,
+      }),
+    },
+    async () => {
+      try {
+        const response = await fetch(PRICE_URL, {
+          headers: { accept: "application/json" },
+          signal: AbortSignal.timeout(6_000),
+        });
+        if (!response.ok)
+          throw new Error(`ETH/USD quote HTTP ${response.status}`);
+        const payload: any = await response.json();
+        const raw =
+          payload?.data?.amount ??
+          payload?.ethereum?.usd ??
+          payload?.price ??
+          payload?.amount ??
+          null;
+        const ethUsdMicros = ethUsdToMicros(raw);
+        const dollars = ethUsdMicros / 1_000_000;
+        if (dollars < 100 || dollars > 1_000_000)
+          throw new Error(`ETH/USD quote outside safety bounds: ${dollars}`);
+        quoteCache = { atMs: Date.now(), ethUsdMicros, source: PRICE_URL };
+        nextQuoteAttemptAtMs = 0;
+        return quoteCache;
+      } catch (error) {
+        nextQuoteAttemptAtMs = Date.now() + PRICE_RETRY_MS;
+        throw error;
+      }
+    },
+  );
+}
+
+async function quoteOnePendingReward() {
+  const row = dbMeasure.measureSync(
+    "Find unquoted winner reward",
+    () =>
+      db.raw<any>(
+        `SELECT * FROM ideaRewards
+       WHERE status = 'pending' AND chainId = ? AND asset = 'ETH'
+         AND amountWei IS NULL
+       ORDER BY id ASC LIMIT 1`,
+        ROBINHOOD_CHAIN_ID,
+      )[0] || null,
+  );
+  if (!row) return false;
+
+  const quote = await loadEthUsdQuote();
+  const targetUsdCents = Math.max(1, Number(row.targetUsdCents || 100));
+  const amountWei = rewardWeiForUsdCents(targetUsdCents, quote.ethUsdMicros);
+  if (amountWei <= 0n) throw new Error("Calculated reward is zero wei");
+
+  dbMeasure.measureSync("Persist winner reward quote", () =>
+    db.raw<any>(
+      `UPDATE ideaRewards
+       SET amountWei = ?, quotedEthUsdMicros = ?, quoteSource = ?, lastError = NULL
+       WHERE id = ? AND status = 'pending' AND amountWei IS NULL
+       RETURNING id`,
+      amountWei.toString(),
+      quote.ethUsdMicros,
+      quote.source,
+      row.id,
+    ),
+  );
+  rewardMeasure.measureSync("Winner reward quoted", () => ({
+    rewardId: Number(row.id),
+    proposalId: Number(row.proposalId),
+    targetUsd: targetUsdCents / 100,
+    ethUsd: quote.ethUsdMicros / 1_000_000,
+    amountEth: Number(formatEther(amountWei)),
+  }));
+  return true;
 }
 
 function claimPendingReward() {
-  return dbMeasure.measureSync("Claim pending winner reward", () => {
+  return dbMeasure.measureSync("Claim pending Robinhood winner reward", () => {
     db.exec("BEGIN IMMEDIATE");
     try {
       const row =
         db.raw<any>(
-          `SELECT * FROM ideaRewards WHERE status = 'pending' ORDER BY id ASC LIMIT 1`,
+          `SELECT * FROM ideaRewards
+           WHERE status = 'pending' AND chainId = ? AND asset = 'ETH'
+             AND amountWei IS NOT NULL
+           ORDER BY id ASC LIMIT 1`,
+          ROBINHOOD_CHAIN_ID,
         )[0] || null;
       if (!row) {
         db.exec("COMMIT");
@@ -129,78 +268,222 @@ function claimPendingReward() {
   });
 }
 
-function extractSignature(result: any) {
-  const value =
-    result?.signature ??
-    result?.txid ??
-    result?.transactionSignature ??
-    result?.hash ??
-    result?.context?.signature ??
-    null;
-  return value == null ? null : String(value);
+function markSent(rewardId: number, hash: string) {
+  dbMeasure.measureSync("Complete Robinhood winner reward", () =>
+    db.raw<any>(
+      `UPDATE ideaRewards
+       SET status = 'sent', signature = ?, sentAtMs = ?, lastError = NULL
+       WHERE id = ? AND status = 'sending'
+       RETURNING id`,
+      hash,
+      Date.now(),
+      rewardId,
+    ),
+  );
+}
+
+async function reconcileSendingRewards() {
+  const rows = dbMeasure.measureSync("Load in-flight Robinhood rewards", () =>
+    db.raw<any>(
+      `SELECT * FROM ideaRewards
+       WHERE status = 'sending' AND chainId = ? AND asset = 'ETH'
+       ORDER BY id ASC`,
+      ROBINHOOD_CHAIN_ID,
+    ),
+  );
+  if (!rows.length) return;
+
+  const { publicClient } = clients();
+  for (const row of rows) {
+    if (!row.signature) {
+      if (
+        row.claimedAtMs != null &&
+        Number(row.claimedAtMs) <= Date.now() - SENDING_STALE_MS
+      ) {
+        dbMeasure.measureSync("Quarantine ambiguous Robinhood reward", () =>
+          db.exec(
+            `UPDATE ideaRewards
+             SET status = 'uncertain', lastError = ?
+             WHERE id = ? AND status = 'sending'`,
+            "Reward worker stopped after broadcast may have begun but before a transaction hash was persisted; not retried automatically.",
+            row.id,
+          ),
+        );
+      }
+      continue;
+    }
+
+    try {
+      const receipt = await publicClient.getTransactionReceipt({
+        hash: String(row.signature) as Hex,
+      });
+      if (receipt.status === "success")
+        markSent(Number(row.id), String(row.signature));
+      else
+        dbMeasure.measureSync("Mark reverted Robinhood reward", () =>
+          db.exec(
+            `UPDATE ideaRewards SET status = 'skipped', lastError = ?
+             WHERE id = ? AND status = 'sending'`,
+            "Robinhood Chain reward transaction reverted.",
+            row.id,
+          ),
+        );
+    } catch {
+      // Receipt not available yet. Keep the persisted transaction hash and let
+      // the next worker tick reconcile it without ever broadcasting again.
+    }
+  }
+}
+
+async function preflightReward(row: any) {
+  try {
+    const { account, publicClient } = clients();
+    const amountWei = BigInt(String(row.amountWei));
+    const [balanceWei, fees] = await Promise.all([
+      publicClient.getBalance({ address: account.address }),
+      publicClient.estimateFeesPerGas(),
+    ]);
+    const maxFeePerGas = fees.maxFeePerGas ?? fees.gasPrice ?? 0n;
+    const reserveWei = maxFeePerGas * 30_000n;
+    if (balanceWei < amountWei + reserveWei)
+      throw new RewardDeferredError(
+        `Reward wallet needs more ETH on Robinhood Chain (balance ${formatEther(balanceWei)} ETH).`,
+      );
+    return { amountWei, balanceWei, reserveWei };
+  } catch (error) {
+    if (error instanceof RewardDeferredError) throw error;
+    // Nothing has been broadcast yet, so configuration/RPC failures are safe
+    // to retry after the operator fixes the worker environment.
+    throw new RewardDeferredError(cleanError(error));
+  }
 }
 
 async function sendOneReward(row: any) {
-  const amountSol = Number(row.amountLamports) / 1_000_000_000;
+  const amountWei = BigInt(String(row.amountWei));
+  const address = normalizeEvmAddress(row.walletAddress);
+  if (!address)
+    throw new RewardSkippedError("Winner reward has an invalid EVM address");
+
   return rewardMeasure.measure(
     {
       start: () =>
-        `Send winner reward #${Number(row.proposalId)} · ${amountSol.toFixed(3)} SOL`,
+        `Send winner reward #${Number(row.proposalId)} · ${Number(row.targetUsdCents || 0) / 100} USD in ETH`,
       end: (result) => ({
         rewardId: Number(row.id),
         proposalId: Number(row.proposalId),
-        wallet: `${String(row.walletAddress).slice(0, 5)}…${String(row.walletAddress).slice(-4)}`,
-        amountSol,
-        signature: result.signature,
+        wallet: `${address.slice(0, 6)}…${address.slice(-4)}`,
+        amountEth: Number(formatEther(amountWei)),
+        transactionHash: result.transactionHash,
+        confirmed: result.confirmed,
       }),
     },
     async () => {
-      const client = sdk();
-      const wallet = resolveRewardWallet(client);
-      if (!wallet?.address)
-        throw new Error("Solard reward wallet has no address");
+      await preflightReward(row);
+      const { walletClient, publicClient } = clients();
 
-      // Solard owns key custody/signing. PumpTV only requests the transfer.
-      const result = await client
-        .tx(String(wallet.address))
-        .transferSol(String(row.walletAddress), sol(amountSol.toFixed(9)))
-        .send();
-      const signature = extractSignature(result);
-      if (!signature)
-        throw new Error("Solard returned no transaction signature");
+      let hash: Hex;
+      try {
+        hash = await walletClient.sendTransaction({
+          to: address,
+          value: amountWei,
+        });
+      } catch (error) {
+        // No transaction hash was returned. The RPC could have accepted the
+        // broadcast before the connection failed, so automatic retry is unsafe.
+        throw error;
+      }
 
-      dbMeasure.measureSync("Complete winner reward", () =>
-        db.raw<any>(
-          `UPDATE ideaRewards
-           SET status = 'sent', signature = ?, sentAtMs = ?, lastError = NULL
-           WHERE id = ? AND status = 'sending'
-           RETURNING id`,
-          signature,
-          Date.now(),
+      dbMeasure.measureSync("Persist Robinhood reward transaction hash", () =>
+        db.exec(
+          `UPDATE ideaRewards SET signature = ?, lastError = NULL
+           WHERE id = ? AND status = 'sending'`,
+          hash,
           row.id,
         ),
       );
-      return { signature };
+
+      try {
+        const receipt = await publicClient.waitForTransactionReceipt({
+          hash,
+          timeout: 60_000,
+        });
+        if (receipt.status === "success") {
+          markSent(Number(row.id), hash);
+          return { transactionHash: hash, confirmed: true };
+        }
+        dbMeasure.measureSync("Mark reverted Robinhood reward", () =>
+          db.exec(
+            `UPDATE ideaRewards SET status = 'skipped', lastError = ?
+             WHERE id = ? AND status = 'sending'`,
+            "Robinhood Chain reward transaction reverted.",
+            row.id,
+          ),
+        );
+        return { transactionHash: hash, confirmed: false };
+      } catch {
+        // Hash is durable. Do not rebroadcast; reconciliation will finish this
+        // row on a later worker tick when the receipt becomes available.
+        return { transactionHash: hash, confirmed: false };
+      }
     },
   );
 }
 
 async function drainRewards() {
-  markStaleSendingUncertain();
+  await reconcileSendingRewards();
+
+  try {
+    await quoteOnePendingReward();
+  } catch (error) {
+    if (!(error instanceof RewardDeferredError))
+      rewardMeasure.measureSync("Winner reward quote deferred", () => ({
+        error: cleanError(error),
+        retryAfterMs: PRICE_RETRY_MS,
+      }));
+    return;
+  }
+
   while (true) {
     const row = claimPendingReward();
     if (!row) return;
     try {
       await sendOneReward(row);
     } catch (error) {
-      // A transport error can occur after broadcast. Never automatically retry
-      // an ambiguous SOL send: duplicate payout is worse than a reward that
-      // needs operator reconciliation.
       const message = cleanError(error);
-      dbMeasure.measureSync("Quarantine ambiguous winner reward", () =>
+      if (error instanceof RewardSkippedError) {
+        dbMeasure.measureSync("Skip invalid Robinhood reward", () =>
+          db.exec(
+            `UPDATE ideaRewards
+             SET status = 'skipped', lastError = ?
+             WHERE id = ? AND status = 'sending' AND signature IS NULL`,
+            message,
+            row.id,
+          ),
+        );
+        continue;
+      }
+      if (error instanceof RewardDeferredError) {
+        dbMeasure.measureSync("Defer unfunded Robinhood reward", () =>
+          db.exec(
+            `UPDATE ideaRewards
+             SET status = 'pending', claimedAtMs = NULL, lastError = ?
+             WHERE id = ? AND status = 'sending' AND signature IS NULL`,
+            message,
+            row.id,
+          ),
+        );
+        rewardMeasure.measureSync("Winner reward waiting for funding", () => ({
+          rewardId: Number(row.id),
+          proposalId: Number(row.proposalId),
+          error: message,
+        }));
+        return;
+      }
+
+      dbMeasure.measureSync("Quarantine ambiguous Robinhood reward", () =>
         db.exec(
           `UPDATE ideaRewards SET status = 'uncertain', lastError = ?
-           WHERE id = ? AND status = 'sending'`,
+           WHERE id = ? AND status = 'sending' AND signature IS NULL`,
           message,
           row.id,
         ),

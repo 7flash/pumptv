@@ -68,7 +68,8 @@ async function maybeAutoLock(now = Date.now()) {
 async function waitForPrewarmIfWinnerIsAlreadyRendering(
   queuedDirective: Directive | null,
 ) {
-  if (!(await prewarm.shouldWaitForLockedDirective(queuedDirective))) return false;
+  if (!(await prewarm.shouldWaitForLockedDirective(queuedDirective)))
+    return false;
   await setWorkerState("idle", null, "full");
   return true;
 }
@@ -229,7 +230,9 @@ async function generationTick() {
       } else {
         const claimed = await claimQueuedDirective(episode);
         if (!claimed)
-          throw new Error("No triggered proposal is queued for the next episode.");
+          throw new Error(
+            "No triggered proposal is queued for the next episode.",
+          );
 
         let usedPrewarm = false;
         clip = await workerMeasure.measure(
@@ -244,7 +247,10 @@ async function generationTick() {
             }),
           },
           async () => {
-            const promotion = await prewarm.promoteIfReady({ episode, claimed });
+            const promotion = await prewarm.promoteIfReady({
+              episode,
+              claimed,
+            });
             if (promotion.kind === "promoted") {
               usedPrewarm = true;
               return promotion.clip;
