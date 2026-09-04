@@ -524,7 +524,7 @@ function getMetaMaskClient() {
     metamaskClientPromise = getWalletNetwork().then((network) =>
       createEVMClient({
         dapp: {
-          name: "PumpTV",
+          name: "MEME TV",
           url: window.location.origin,
           iconUrl: new URL("/api/logo", window.location.href).href,
         },
@@ -2173,7 +2173,7 @@ function engineState() {
 }
 
 function tooltipStatus() {
-  if (!view.program || !view.room) return "PumpTV is starting";
+  if (!view.program || !view.room) return "MEME TV is starting";
   if (view.program.reason) return view.program.reason;
   if (view.program.phase === "starting") return "Generation worker is starting";
   if (view.program.phase === "locked")
@@ -5353,13 +5353,13 @@ function OutsideInterfaceStyles() {
 
       /* v15 — PumpTV brass / silver hardware language. */
       :root {
-        --pump-gold: #d7a43b;
-        --pump-gold-hi: #f3cc72;
-        --pump-gold-low: #8f661f;
-        --pump-silver: #c8c9cb;
-        --pump-silver-dim: #7d8085;
-        --pump-black: #090a0b;
-        --pump-panel: #111214;
+        --pump-gold: #c8ff00;
+        --pump-gold-hi: #d9ff33;
+        --pump-gold-low: #86ad00;
+        --pump-silver: #f6f7f2;
+        --pump-silver-dim: #747a70;
+        --pump-black: #000000;
+        --pump-panel: #080a07;
       }
 
       .minimalTop .wordmark {
@@ -5386,7 +5386,7 @@ function OutsideInterfaceStyles() {
       .statusDot.work,
       .powerLamp.work {
         background: var(--pump-gold-hi) !important;
-        box-shadow: 0 0 0 1px rgba(215,164,59,.22), 0 0 12px rgba(215,164,59,.28) !important;
+        box-shadow: 0 0 0 1px rgba(200,255,0,.22), 0 0 12px rgba(200,255,0,.28) !important;
       }
 
       /* These are machined hardware keys now, not glowing arcade knobs. */
@@ -5430,9 +5430,9 @@ function OutsideInterfaceStyles() {
       }
       .knobControl.on {
         color: var(--pump-gold-hi) !important;
-        border-color: rgba(215,164,59,.48) !important;
+        border-color: rgba(200,255,0,.48) !important;
         background:
-          linear-gradient(180deg, rgba(215,164,59,.12), rgba(255,255,255,.015)),
+          linear-gradient(180deg, rgba(200,255,0,.12), rgba(255,255,255,.015)),
           #171713 !important;
       }
       .knobNeedle {
@@ -5484,7 +5484,7 @@ function OutsideInterfaceStyles() {
       .episodeCard.active {
         opacity: 1 !important;
         transform: translateX(-2px) !important;
-        background: linear-gradient(90deg, rgba(215,164,59,.09), rgba(200,201,203,.025)) !important;
+        background: linear-gradient(90deg, rgba(200,255,0,.09), rgba(200,201,203,.025)) !important;
       }
       .episodeCard.active > b::before {
         content: "▶";
@@ -5495,20 +5495,20 @@ function OutsideInterfaceStyles() {
       }
       .episodeCard.live .episodeThumb > em {
         color: var(--pump-gold-hi) !important;
-        text-shadow: 0 0 8px rgba(215,164,59,.45) !important;
+        text-shadow: 0 0 8px rgba(200,255,0,.45) !important;
       }
       .episodeCard.active .episodeThumb {
-        border-color: rgba(215,164,59,.32) !important;
+        border-color: rgba(200,255,0,.32) !important;
         box-shadow:
           inset 0 1px rgba(255,255,255,.07),
           0 7px 20px rgba(0,0,0,.30),
-          -3px 0 0 rgba(215,164,59,.72) !important;
+          -3px 0 0 rgba(200,255,0,.72) !important;
       }
       .liveCap.active { color: var(--pump-gold-hi) !important; }
 
       .programShelfSlot {
-        border-color: rgba(215,164,59,.24) !important;
-        background: linear-gradient(180deg, rgba(215,164,59,.07), rgba(255,255,255,.012)) !important;
+        border-color: rgba(200,255,0,.24) !important;
+        background: linear-gradient(180deg, rgba(200,255,0,.07), rgba(255,255,255,.012)) !important;
       }
       .programShelfPulse { color: var(--pump-gold-hi) !important; }
 
@@ -5533,8 +5533,8 @@ function OutsideInterfaceStyles() {
         grid-template-columns: 24px minmax(0, 1fr) auto !important;
       }
       .persistentProposal:first-child {
-        border-color: rgba(215,164,59,.26) !important;
-        background: linear-gradient(180deg, rgba(215,164,59,.055), rgba(255,255,255,.015)) !important;
+        border-color: rgba(200,255,0,.26) !important;
+        background: linear-gradient(180deg, rgba(200,255,0,.055), rgba(255,255,255,.015)) !important;
       }
       .persistentProposal.own {
         border-color: rgba(200,201,203,.24) !important;
@@ -5564,7 +5564,7 @@ function OutsideInterfaceStyles() {
         color: rgba(200,201,203,.46) !important;
       }
       .persistentProposalText > i > code {
-        color: rgba(243,204,114,.72) !important;
+        color: rgba(217,255,51,.72) !important;
         font: inherit !important;
       }
       .persistentProposalText > i > small {
@@ -5591,7 +5591,7 @@ function OutsideInterfaceStyles() {
       .persistentIdeaForm > button:hover,
       .boardToggle:hover,
       .walletMetric:hover {
-        border-color: rgba(215,164,59,.38) !important;
+        border-color: rgba(200,255,0,.38) !important;
         color: var(--pump-gold-hi) !important;
       }
       .proposalVote > b { color: var(--pump-gold-hi) !important; }
@@ -5652,7 +5652,7 @@ function OutsideInterfaceStyles() {
       }
       .knobControl.on::after {
         background: var(--pump-gold-hi);
-        box-shadow: 0 0 5px rgba(243,204,114,.26);
+        box-shadow: 0 0 5px rgba(217,255,51,.26);
       }
       .knobControl[data-control="fullscreen"]::after { display: none; }
       .knobControl:hover {
@@ -5669,9 +5669,9 @@ function OutsideInterfaceStyles() {
       }
       .knobControl.on {
         color: var(--pump-gold-hi) !important;
-        border-color: rgba(215,164,59,.34) !important;
+        border-color: rgba(200,255,0,.34) !important;
         background:
-          linear-gradient(180deg, rgba(215,164,59,.09), rgba(255,255,255,.012) 58%, rgba(0,0,0,.09)),
+          linear-gradient(180deg, rgba(200,255,0,.09), rgba(255,255,255,.012) 58%, rgba(0,0,0,.09)),
           #171714 !important;
       }
       .knobNeedle { display: none !important; }
@@ -5693,7 +5693,7 @@ function OutsideInterfaceStyles() {
       .episodeCard.active {
         opacity: 1 !important;
         transform: translateX(-4px) !important;
-        background: linear-gradient(90deg, rgba(215,164,59,.07), rgba(255,255,255,.022)) !important;
+        background: linear-gradient(90deg, rgba(200,255,0,.07), rgba(255,255,255,.022)) !important;
         box-shadow: 0 5px 14px rgba(0,0,0,.18) !important;
       }
       .episodeCard.active::after {
@@ -5706,7 +5706,7 @@ function OutsideInterfaceStyles() {
         border-radius: 1px 3px 3px 1px !important;
         transform: translateY(-50%) !important;
         background: linear-gradient(180deg, var(--pump-gold-hi), var(--pump-gold-low)) !important;
-        box-shadow: 0 0 7px rgba(215,164,59,.20) !important;
+        box-shadow: 0 0 7px rgba(200,255,0,.20) !important;
       }
       .episodeCard.active > b::before { content: none !important; }
       .episodeCard.active > b { color: var(--pump-gold-hi) !important; }
@@ -5734,8 +5734,8 @@ function OutsideInterfaceStyles() {
         background: rgba(255,255,255,.03) !important;
       }
       .persistentProposal:first-child {
-        border-color: rgba(215,164,59,.18) !important;
-        background: linear-gradient(90deg, rgba(215,164,59,.045), rgba(255,255,255,.016)) !important;
+        border-color: rgba(200,255,0,.18) !important;
+        background: linear-gradient(90deg, rgba(200,255,0,.045), rgba(255,255,255,.016)) !important;
       }
       .persistentProposal.own {
         border-color: rgba(200,201,203,.16) !important;
@@ -5905,7 +5905,7 @@ function OutsideInterfaceStyles() {
         border: 0 !important;
         border-radius: 2px !important;
         background: linear-gradient(90deg, var(--pump-gold-low), var(--pump-gold-hi), var(--pump-gold-low)) !important;
-        box-shadow: 0 1px 5px rgba(215,164,59,.24) !important;
+        box-shadow: 0 1px 5px rgba(200,255,0,.24) !important;
       }
       .episodeCard.active > b {
         color: var(--pump-gold-hi) !important;
@@ -6020,7 +6020,7 @@ function OutsideInterfaceStyles() {
         bottom: -4px !important;
         width: 24px !important;
         height: 2px !important;
-        box-shadow: 0 1px 4px rgba(215,164,59,.18) !important;
+        box-shadow: 0 1px 4px rgba(200,255,0,.18) !important;
       }
 
       /* v25: scene index + ranked control surface. */
@@ -6118,9 +6118,9 @@ function OutsideInterfaceStyles() {
         height: 20px !important;
         min-width: 26px !important;
         padding: 0 6px !important;
-        border: 1px solid rgba(215,164,59,.18) !important;
+        border: 1px solid rgba(200,255,0,.18) !important;
         border-radius: 5px !important;
-        background: rgba(215,164,59,.045) !important;
+        background: rgba(200,255,0,.045) !important;
         color: var(--pump-gold) !important;
         font: 700 8px/1 ui-monospace, SFMono-Regular, Menlo, monospace !important;
       }
@@ -6214,8 +6214,8 @@ function OutsideInterfaceStyles() {
         background: rgba(255,255,255,.02) !important;
       }
       .proposalVote:hover {
-        border-color: rgba(215,164,59,.28) !important;
-        background: rgba(215,164,59,.045) !important;
+        border-color: rgba(200,255,0,.28) !important;
+        background: rgba(200,255,0,.045) !important;
       }
       .proposalTotal {
         min-width: 20px !important;
@@ -6248,10 +6248,10 @@ function OutsideInterfaceStyles() {
         grid-template-columns: 24px minmax(0, 1fr) 22px !important;
         gap: 6px !important;
         padding: 6px 7px !important;
-        border-color: rgba(215,164,59,.12) !important;
+        border-color: rgba(200,255,0,.12) !important;
         border-radius: 9px !important;
         background:
-          linear-gradient(180deg, rgba(215,164,59,.025), transparent 58%),
+          linear-gradient(180deg, rgba(200,255,0,.025), transparent 58%),
           rgba(255,255,255,.012) !important;
         box-shadow: inset 0 1px rgba(255,255,255,.025) !important;
         overflow: hidden !important;
@@ -6270,7 +6270,7 @@ function OutsideInterfaceStyles() {
       .programShelfSlot.phase-rendering .programShelfState,
       .programShelfSlot.phase-finalizing .programShelfState {
         color: var(--pump-gold-hi) !important;
-        text-shadow: 0 0 7px rgba(215,164,59,.22) !important;
+        text-shadow: 0 0 7px rgba(200,255,0,.22) !important;
       }
       .programShelfSlot.phase-planning::after,
       .programShelfSlot.phase-rendering::after,
@@ -6329,7 +6329,7 @@ function OutsideInterfaceStyles() {
         box-shadow: none !important;
       }
       .proposalVote:hover {
-        background: rgba(215,164,59,.055) !important;
+        background: rgba(200,255,0,.055) !important;
       }
       .proposalVote > b {
         min-width: 14px !important;
@@ -6385,8 +6385,8 @@ function OutsideInterfaceStyles() {
         align-items: center !important;
         justify-content: center !important;
         gap: 6px !important;
-        border: 1px solid rgba(215,164,59,.18) !important;
-        background: rgba(215,164,59,.045) !important;
+        border: 1px solid rgba(200,255,0,.18) !important;
+        background: rgba(200,255,0,.045) !important;
         color: rgba(241,211,132,.9) !important;
       }
       .boardToggle > span {
@@ -6485,8 +6485,8 @@ function OutsideInterfaceStyles() {
       }
       .persistentIdeaForm > button:not(:disabled) {
         color: var(--pump-gold-hi) !important;
-        border-color: rgba(215,164,59,.28) !important;
-        background: rgba(215,164,59,.045) !important;
+        border-color: rgba(200,255,0,.28) !important;
+        background: rgba(200,255,0,.045) !important;
       }
       .persistentIdeaForm > button:disabled {
         opacity: .22 !important;
@@ -6550,7 +6550,7 @@ function OutsideInterfaceStyles() {
         justify-items: center;
         gap: 8px;
         padding: 16px 18px 15px;
-        border: 1px solid rgba(226,185,83,.19);
+        border: 1px solid rgba(200,255,0,.19);
         border-radius: 14px;
         background: rgba(8,9,10,.68);
         box-shadow: inset 0 1px rgba(255,255,255,.04), 0 16px 42px rgba(0,0,0,.3);
@@ -6579,9 +6579,9 @@ function OutsideInterfaceStyles() {
         min-height: 36px;
         margin-top: 1px;
         padding: 0 15px;
-        border: 1px solid rgba(226,185,83,.3);
+        border: 1px solid rgba(200,255,0,.3);
         border-radius: 9px;
-        background: rgba(215,164,59,.1);
+        background: rgba(200,255,0,.1);
         color: var(--pump-gold-hi);
         box-shadow: inset 0 1px rgba(255,255,255,.05);
         font: 800 9px/1 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -6613,7 +6613,7 @@ function OutsideInterfaceStyles() {
         height: 6px;
         border-radius: 999px;
         background: var(--pump-gold-hi);
-        box-shadow: 0 0 10px rgba(226,185,83,.55);
+        box-shadow: 0 0 10px rgba(200,255,0,.55);
         animation: generationPulse 1.15s ease-in-out infinite alternate;
       }
       @keyframes generationPulse {
@@ -6669,7 +6669,7 @@ function OutsideInterfaceStyles() {
         grid-template-columns: 1fr auto;
         gap: 5px 14px;
         padding: 13px 38px 13px 14px;
-        border: 1px solid rgba(226,185,83,.28);
+        border: 1px solid rgba(200,255,0,.28);
         border-radius: 14px;
         background: rgba(10,11,13,.94);
         box-shadow: 0 18px 48px rgba(0,0,0,.46), inset 0 1px rgba(255,255,255,.05);
@@ -7072,6 +7072,183 @@ function OutsideInterfaceStyles() {
         }
       }
 
+
+      /* v52 — MEME TV: black / white / acid visual system from the supplied mark. */
+      :root {
+        --meme-acid: #c8ff00;
+        --meme-acid-hi: #d9ff33;
+        --meme-acid-low: #86ad00;
+        --meme-ink: #000;
+        --meme-panel: #080a07;
+        --meme-white: #f7f8f4;
+      }
+
+      html,
+      body,
+      #pumptv-page,
+      .viewerApp {
+        background: #000 !important;
+        color: var(--meme-white) !important;
+      }
+
+      .minimalTop .wordmark {
+        width: 178px !important;
+        height: 54px !important;
+        overflow: visible !important;
+        opacity: 1 !important;
+      }
+      .pumptvLogo {
+        width: 100% !important;
+        height: 100% !important;
+        object-fit: contain !important;
+        object-position: left center !important;
+        mix-blend-mode: normal !important;
+        filter: drop-shadow(0 5px 18px rgba(200,255,0,.08)) !important;
+      }
+
+      .participationDock,
+      .participationSheet,
+      .episodeShelf,
+      .richHoverTooltip,
+      .winnerRewardNotice {
+        background-color: rgba(4,5,4,.965) !important;
+        border-color: rgba(200,255,0,.12) !important;
+      }
+
+      .participationDock {
+        background:
+          linear-gradient(180deg, rgba(15,18,12,.96), rgba(3,4,3,.96)) !important;
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.045),
+          0 16px 42px rgba(0,0,0,.38) !important;
+      }
+
+      .drawerGrab > i {
+        background: linear-gradient(
+          90deg,
+          transparent,
+          var(--meme-acid),
+          transparent
+        ) !important;
+      }
+
+      .yourTurnCard {
+        border-color: rgba(200,255,0,.28) !important;
+        background: rgba(0,0,0,.78) !important;
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.04),
+          0 18px 50px rgba(0,0,0,.48),
+          0 0 30px rgba(200,255,0,.035) !important;
+      }
+      .yourTurnKicker,
+      .persistentIdeasHead strong,
+      .proposalVote > b,
+      .episodeCard.active > b,
+      .dockIdeaSummary > b,
+      .walletMetric.connected {
+        color: var(--meme-acid-hi) !important;
+      }
+      .yourTurnCard > button,
+      .persistentIdeaForm > button:not(:disabled) {
+        border-color: var(--meme-acid) !important;
+        background: var(--meme-acid) !important;
+        color: #050604 !important;
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.34),
+          0 0 18px rgba(200,255,0,.08) !important;
+      }
+      .yourTurnCard > button:hover,
+      .persistentIdeaForm > button:not(:disabled):hover {
+        background: var(--meme-acid-hi) !important;
+        color: #000 !important;
+      }
+
+      .persistentIdeaForm > input:focus,
+      .ideaForm > input:focus {
+        border-color: rgba(200,255,0,.52) !important;
+        box-shadow: 0 0 0 2px rgba(200,255,0,.06) !important;
+      }
+
+      .proposalVote:hover,
+      .boardToggle:hover,
+      .participationBoard.open .boardToggle,
+      .walletMetric:hover {
+        border-color: rgba(200,255,0,.34) !important;
+        color: var(--meme-acid-hi) !important;
+      }
+
+      .episodeCard.active {
+        background: linear-gradient(
+          90deg,
+          rgba(200,255,0,.075),
+          rgba(255,255,255,.012)
+        ) !important;
+      }
+      .episodeCard.active::after {
+        background: linear-gradient(
+          180deg,
+          var(--meme-acid-hi),
+          var(--meme-acid-low)
+        ) !important;
+        box-shadow: 0 0 10px rgba(200,255,0,.28) !important;
+      }
+
+      .statusDot.ready,
+      .statusDot.work,
+      .powerLamp.ready,
+      .powerLamp.work,
+      .generationPulse > i {
+        background: var(--meme-acid-hi) !important;
+        box-shadow:
+          0 0 0 1px rgba(200,255,0,.20),
+          0 0 12px rgba(200,255,0,.32) !important;
+      }
+
+      .knobControl.on {
+        border-color: rgba(200,255,0,.32) !important;
+        color: var(--meme-acid-hi) !important;
+        background:
+          linear-gradient(180deg, rgba(200,255,0,.075), rgba(255,255,255,.01)),
+          #0c0e0b !important;
+      }
+      .knobControl.on::after {
+        background: var(--meme-acid-hi) !important;
+        box-shadow: 0 0 7px rgba(200,255,0,.30) !important;
+      }
+
+      .tvShell {
+        border-color: rgba(200,255,0,.10) !important;
+        background:
+          linear-gradient(145deg, #171b15 0%, #090b08 62%, #050605 100%) !important;
+        box-shadow:
+          inset 0 1px rgba(255,255,255,.045),
+          inset 0 0 0 1px rgba(0,0,0,.72),
+          0 24px 80px rgba(0,0,0,.46) !important;
+      }
+      .tvScreenFrame {
+        border-color: rgba(200,255,0,.07) !important;
+        background: #020302 !important;
+      }
+
+      .winnerRewardNotice > b,
+      .winnerRewardNotice > a {
+        color: var(--meme-acid-hi) !important;
+      }
+
+      @media (max-width: 820px) {
+        .minimalTop .wordmark {
+          width: 132px !important;
+          height: 40px !important;
+        }
+      }
+
+      @media (max-width: 560px) {
+        .minimalTop .wordmark {
+          width: 116px !important;
+          height: 36px !important;
+        }
+      }
+
     `}</style>
   );
 }
@@ -7085,7 +7262,7 @@ function App() {
       <section className="watchDeck">
         <div className="minimalTop">
           <div className="wordmark">
-            <img className="pumptvLogo" src="/api/logo" alt="PumpTV" />
+            <img className="pumptvLogo" src="/api/logo" alt="MEME TV" />
           </div>
           <div className="tinyStatus">
             <i
