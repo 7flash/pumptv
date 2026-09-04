@@ -28,6 +28,12 @@ import {
   nextDecisionDeadline,
   type DecisionActivity,
 } from "./decision-policy.ts";
+import {
+  WINNER_REWARD_ASSET,
+  WINNER_REWARD_CHAIN_ID,
+  WINNER_REWARD_TOKEN_ADDRESS,
+  WINNER_REWARD_USD_CENTS,
+} from "./reward-config.ts";
 
 const PUMPFUN_MINT = (process.env.PUMPTV_PUMPFUN_MINT || "").trim();
 const PUMPFUN_PREFIX = process.env.PUMPTV_PUMPFUN_PREFIX ?? "!next";
@@ -41,14 +47,6 @@ const MAX_PROPOSALS_PER_ROUND = Math.max(
 );
 const AUTO_TRIGGER_ENABLED = process.env.PUMPTV_AUTO_TRIGGER !== "0";
 const DECISION_POLICY = decisionPolicyFromEnv();
-const winnerRewardUsd = Number(process.env.PUMPTV_WINNER_REWARD_USD ?? 1);
-const WINNER_REWARD_USD_CENTS = Number.isFinite(winnerRewardUsd)
-  ? Math.max(0, Math.round(winnerRewardUsd * 100))
-  : 100;
-const WINNER_REWARD_CHAIN_ID = Math.max(
-  1,
-  Number(process.env.PUMPTV_ROBINHOOD_CHAIN_ID || 4663),
-);
 
 export class DecisionWindowClosedError extends Error {}
 
@@ -1687,8 +1685,11 @@ export async function triggerNextProposal(
               walletAddress: selected.authorAddress,
               amountLamports: 0,
               chainId: WINNER_REWARD_CHAIN_ID,
-              asset: "ETH",
+              asset: WINNER_REWARD_ASSET,
               targetUsdCents: WINNER_REWARD_USD_CENTS,
+              tokenAddress: WINNER_REWARD_TOKEN_ADDRESS,
+              tokenDecimals: null,
+              amountAtomic: null,
               amountWei: null,
               quotedEthUsdMicros: null,
               quoteSource: null,

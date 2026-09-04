@@ -10,6 +10,7 @@ import {
   type LiveSlotState,
 } from "../src/client/media-deck.ts";
 import { createVisualViewportController } from "../src/client/visual-viewport.ts";
+import { createStreamStateController } from "../src/client/stream-state.ts";
 import {
   createParticipationController,
   winnerRewardStatusLabel,
@@ -33,13 +34,9 @@ import type {
 
 const uiMeasure = createMeasure("ui");
 
-let serverOffsetMs = 0;
-let longPollAbort: AbortController | null = null;
-let streamRevision = 0;
 let viewerId = "";
 let proposalOwnerId = "";
 let initialCatchupPending = false;
-const NEW_VIEWER_HISTORY_OFFSET = 7;
 let timer: ReturnType<typeof setInterval> | null = null;
 
 type WalletState = "idle" | "connecting" | "connected" | "error";
@@ -94,7 +91,7 @@ const participation = createParticipationController({
 const renderQueue = createInvalidationQueue((reasons) => renderApp(reasons));
 const media = createMediaDeckController({
   state: view,
-  nowMs: () => Date.now() + serverOffsetMs,
+  nowMs: liveNowMs,
   refreshStreamState,
   syncLocalUiState,
   syncLocalPresentation,
@@ -102,6 +99,41 @@ const media = createMediaDeckController({
   centerSelectedEpisode,
   scheduleViewRender,
 });
+const streamState = createStreamStateController({
+  state: view,
+  json,
+  viewerId: () => viewerId,
+  initialCatchupPending: () => initialCatchupPending,
+  completeInitialCatchup: () => {
+    initialCatchupPending = false;
+    localStorage.removeItem("pumptv-new-viewer-catchup");
+  },
+  newViewerHistoryOffset: 7,
+  onWinnerDirective: (state) => {
+    if (
+      !view.walletAddress ||
+      !state.program.directive?.proposalId ||
+      state.program.directive.authorAddress?.toLowerCase() !==
+        view.walletAddress.toLowerCase()
+    )
+      return;
+
+    const proposalId = state.program.directive.proposalId;
+    if (view.winnerNoticeProposalId !== proposalId) {
+      view.winnerNoticeProposalId = proposalId;
+      view.winnerNoticeDismissed =
+        sessionStorage.getItem(
+          `pumptv-reward-dismissed:${view.walletAddress}:${proposalId}`,
+        ) === "1";
+    }
+    void participation.refreshWinnerReward();
+  },
+  onStateApplied: () => participation.syncDraftFromBoard(),
+});
+
+async function refreshStreamState() {
+  await streamState.refresh();
+}
 
 viewSignals.subscribe((change) => {
   renderQueue.invalidate(`signal:${String(change.key)}`);
@@ -124,7 +156,7 @@ function scheduleViewRender(reason: string) {
 }
 
 function liveNowMs() {
-  return Date.now() + serverOffsetMs;
+  return streamState.nowMs();
 }
 
 function renderApp(reasons: readonly string[]) {
@@ -178,57 +210,6 @@ async function json<T>(url: string, init?: RequestInit): Promise<T> {
   if (!response.ok)
     throw new Error(payload.error || `Request failed: ${response.status}`);
   return payload as T;
-}
-
-function applyState(state: StreamState) {
-  serverOffsetMs = state.serverNowMs - Date.now();
-  view.room = state.room;
-  view.timeline = state.timeline;
-  view.nextDirective = state.nextDirective;
-  view.program = state.program;
-  view.worldState = state.worldState;
-  if (
-    view.walletAddress &&
-    state.program.directive?.proposalId &&
-    state.program.directive.authorAddress?.toLowerCase() ===
-      view.walletAddress.toLowerCase()
-  ) {
-    const proposalId = state.program.directive.proposalId;
-    if (view.winnerNoticeProposalId !== proposalId) {
-      view.winnerNoticeProposalId = proposalId;
-      view.winnerNoticeDismissed =
-        sessionStorage.getItem(
-          `pumptv-reward-dismissed:${view.walletAddress}:${proposalId}`,
-        ) === "1";
-    }
-    void participation.refreshWinnerReward();
-  }
-  participation.syncDraftFromBoard();
-
-  if (initialCatchupPending) {
-    const published = [...state.timeline]
-      .filter((clip) => clip.startsAtMs <= state.serverNowMs)
-      .sort((a, b) => a.episode - b.episode || a.id - b.id);
-    if (published.length) {
-      const targetIndex = Math.max(
-        0,
-        published.length - 1 - NEW_VIEWER_HISTORY_OFFSET,
-      );
-      const target = published[targetIndex] || published[0];
-      const latest = published[published.length - 1];
-      view.replayClipId =
-        target && latest && target.id !== latest.id ? target.id : null;
-      initialCatchupPending = false;
-      localStorage.removeItem("pumptv-new-viewer-catchup");
-    }
-  }
-
-  if (
-    view.replayClipId != null &&
-    !view.timeline.some((clip) => clip.id === view.replayClipId)
-  )
-    view.replayClipId = null;
-  view.error = null;
 }
 
 function walletFromAddress(value: unknown) {
@@ -301,12 +282,6 @@ async function connectMetaMask(interactive: boolean) {
     }
     return false;
   }
-}
-
-async function refreshStreamState() {
-  try {
-    applyState(await json<StreamState>("/api/state"));
-  } catch {}
 }
 
 function shouldAutofocusIdea() {
@@ -610,44 +585,6 @@ function ensureViewerIdAndPrefs() {
   view.liveOverlayEnabled = readPref("pumptv-v25-live-overlay", true);
 }
 
-async function runStateLongPoll() {
-  longPollAbort?.abort();
-  const controller = new AbortController();
-  longPollAbort = controller;
-  let retryMs = 850;
-
-  while (!controller.signal.aborted) {
-    try {
-      const response = await fetch(
-        `/api/events?viewerId=${encodeURIComponent(viewerId)}&since=${streamRevision}`,
-        { cache: "no-store", signal: controller.signal },
-      );
-      if (!response.ok)
-        throw new Error(`State poll failed: ${response.status}`);
-      const payload = (await response.json()) as {
-        revision?: number;
-        state?: StreamState | null;
-      };
-      if (Number.isSafeInteger(payload.revision))
-        streamRevision = Number(payload.revision);
-      if (payload.state) applyState(payload.state);
-      else view.error = null;
-      retryMs = 850;
-      if (view.transport !== "live") {
-        view.transport = "live";
-      }
-    } catch (cause) {
-      if (controller.signal.aborted) break;
-      view.transport = "reconnecting";
-      view.error =
-        cause instanceof Error ? cause.message : "state reconnecting";
-      const jitter = Math.floor(Math.random() * Math.min(500, retryMs / 3));
-      await new Promise((resolve) => setTimeout(resolve, retryMs + jitter));
-      retryMs = Math.min(8_000, Math.round(retryMs * 1.7));
-    }
-  }
-}
-
 async function boot() {
   ensureViewerIdAndPrefs();
   visualViewport.install();
@@ -657,13 +594,13 @@ async function boot() {
   scheduleViewRender("boot");
   void connectMetaMask(false);
   try {
-    applyState(await json<StreamState>("/api/state"));
+    streamState.apply(await json<StreamState>("/api/state"), "boot");
     view.transport = "live";
   } catch (cause) {
     view.error = cause instanceof Error ? cause.message : "offline";
   }
 
-  void runStateLongPoll();
+  void streamState.startLongPoll();
 
   timer = setInterval(() => {
     media.syncNow();
@@ -1796,7 +1733,7 @@ function WinnerRewardNotice() {
       ? view.winnerReward
       : null;
   const targetUsd = reward?.targetUsd ?? 1;
-  const amountEth = reward?.amountEth ?? null;
+  const amountUsdG = reward?.amountUsdG ?? null;
   const status = winnerRewardStatusLabel(reward);
   return (
     <aside
@@ -1813,8 +1750,9 @@ function WinnerRewardNotice() {
       </button>
       <b>YOUR IDEA WON</b>
       <strong>
-        {`$${targetUsd.toFixed(2)}`} ·{" "}
-        {amountEth == null ? "ETH" : `${amountEth.toFixed(6)} ETH`}
+        {amountUsdG == null
+          ? `${targetUsd.toFixed(2)} USDG`
+          : `${amountUsdG.toFixed(2)} USDG`}
       </strong>
       <span>{status}</span>
       {reward?.status === "sent" && reward.explorerUrl ? (

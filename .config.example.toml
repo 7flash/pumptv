@@ -81,13 +81,11 @@ robinhood_chain_id = 4663
 robinhood_rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 robinhood_explorer_url = "https://robinhoodchain.blockscout.com"
 
-# Each winning idea with a connected MetaMask wallet receives approximately
-# this USD value, paid as native ETH on Robinhood Chain. The worker quotes
-# ETH/USD immediately before sending, persists the exact wei amount, then sends.
-winner_reward_usd = 1.00
-reward_eth_usd_url = "https://api.coinbase.com/v2/prices/ETH-USD/spot"
-reward_price_cache_ms = 60000
-reward_price_retry_ms = 30000
+# Each winning idea with a connected MetaMask wallet receives USDG directly.
+# Robinhood Chain mainnet canonical USDG. Outside mainnet, set the token address
+# explicitly for that network rather than reusing this address.
+winner_reward_usdg = 1.00
+reward_token_address = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
 reward_sending_stale_ms = 180000
 # The payout signing key does NOT belong in the web config. Put
 # PUMPTV_REWARD_PRIVATE_KEY in .worker.toml only; see .worker.example.toml.

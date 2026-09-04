@@ -5,10 +5,10 @@ function reward(overrides: Partial<WinnerReward> = {}): WinnerReward {
   return {
     proposalId: 1,
     chainId: 4663,
-    asset: "ETH",
+    asset: "USDG",
+    tokenAddress: "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168",
     targetUsd: 1,
-    amountEth: null,
-    quotedEthUsd: null,
+    amountUsdG: null,
     status: "pending",
     transactionHash: null,
     explorerUrl: null,

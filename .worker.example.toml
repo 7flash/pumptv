@@ -23,9 +23,14 @@ robinhood_chain_id = 4663
 robinhood_rpc_url = "https://rpc.mainnet.chain.robinhood.com"
 robinhood_explorer_url = "https://robinhoodchain.blockscout.com"
 
+# USDG winner rewards. Robinhood Chain mainnet canonical USDG address.
+winner_reward_usdg = 1.00
+reward_token_address = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+reward_sending_stale_ms = 180000
+
 # Dedicated hot-wallet key used only by the reward worker. Never commit a real
-# key and do not place it in .config.toml. Fund only the amount you are willing
-# to use for winner rewards + gas.
+# key and do not place it in .config.toml. Fund it with USDG for rewards and a
+# small amount of ETH for Robinhood Chain gas.
 reward_private_key = ""
 
 [measure]

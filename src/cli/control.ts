@@ -519,7 +519,8 @@ if (command === "doctor") {
 } else if (command === "rewards") {
   const rows = db.raw<any>(
     `SELECT id, roundId, proposalId, walletAddress, chainId, asset,
-            targetUsdCents, amountWei, quotedEthUsdMicros, quoteSource,
+            targetUsdCents, tokenAddress, tokenDecimals, amountAtomic,
+            amountWei, quotedEthUsdMicros, quoteSource,
             status, signature, lastError, claimedAtMs, sentAtMs,
             createdAt, updatedAt
      FROM ideaRewards ORDER BY id DESC LIMIT 50`,

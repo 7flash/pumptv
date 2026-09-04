@@ -14,6 +14,10 @@ const { db, dbPath } = await import("../server/db.ts");
 const legacyRepair = process.argv.includes("--legacy-repair");
 let legacyRewardPendingSkipped = 0;
 let legacyRewardSendingQuarantined = 0;
+let ethRewardPendingConverted = 0;
+let ethRewardSendingQuarantined = 0;
+const { WINNER_REWARD_TOKEN_ADDRESS } =
+  await import("../server/reward-config.ts");
 const now = Date.now();
 const room =
   db.raw<any>(
@@ -97,7 +101,7 @@ try {
     db.exec(
       `UPDATE ideaRewards
        SET status = 'skipped',
-           lastError = 'Legacy SOL reward retired during Robinhood Chain migration; it was never converted or replayed as ETH.'
+           lastError = 'Legacy SOL reward retired during Robinhood Chain migration; it was never converted or replayed as a Robinhood Chain reward.'
        WHERE chainId = 0 AND asset = 'LEGACY' AND status = 'pending'`,
     );
   if (legacyRewardSendingQuarantined > 0)
@@ -106,6 +110,52 @@ try {
        SET status = 'uncertain',
            lastError = 'Legacy SOL reward was in-flight during Robinhood Chain migration; not replayed automatically because payout state is ambiguous.'
        WHERE chainId = 0 AND asset = 'LEGACY' AND status = 'sending'`,
+    );
+
+  // v51-v59 queued native-ETH rewards can be converted safely only before a
+  // broadcast begins. Anything already claimed without a durable hash is
+  // quarantined rather than replayed as USDG and risking a double payout.
+  ethRewardPendingConverted = Number(
+    (
+      db.raw<any>(
+        `SELECT COUNT(*) AS count FROM ideaRewards
+         WHERE chainId = ? AND asset = 'ETH' AND status = 'pending'`,
+        Number(process.env.PUMPTV_ROBINHOOD_CHAIN_ID || 4663),
+      )[0] || {}
+    ).count || 0,
+  );
+  ethRewardSendingQuarantined = Number(
+    (
+      db.raw<any>(
+        `SELECT COUNT(*) AS count FROM ideaRewards
+         WHERE chainId = ? AND asset = 'ETH' AND status = 'sending' AND signature IS NULL`,
+        Number(process.env.PUMPTV_ROBINHOOD_CHAIN_ID || 4663),
+      )[0] || {}
+    ).count || 0,
+  );
+  if (ethRewardPendingConverted > 0) {
+    if (!WINNER_REWARD_TOKEN_ADDRESS)
+      throw new Error(
+        "Cannot convert pending ETH rewards: USDG reward token is not configured",
+      );
+    db.exec(
+      `UPDATE ideaRewards
+       SET asset = 'USDG', tokenAddress = ?, tokenDecimals = NULL,
+           amountAtomic = NULL, amountWei = NULL,
+           quotedEthUsdMicros = NULL, quoteSource = NULL,
+           lastError = 'Queued ETH reward converted to USDG before broadcast.'
+       WHERE chainId = ? AND asset = 'ETH' AND status = 'pending'`,
+      WINNER_REWARD_TOKEN_ADDRESS,
+      Number(process.env.PUMPTV_ROBINHOOD_CHAIN_ID || 4663),
+    );
+  }
+  if (ethRewardSendingQuarantined > 0)
+    db.exec(
+      `UPDATE ideaRewards
+       SET status = 'uncertain',
+           lastError = 'ETH reward was in-flight during USDG migration without a durable transaction hash; not replayed automatically.'
+       WHERE chainId = ? AND asset = 'ETH' AND status = 'sending' AND signature IS NULL`,
+      Number(process.env.PUMPTV_ROBINHOOD_CHAIN_ID || 4663),
     );
 
   if (legacyRepair) {

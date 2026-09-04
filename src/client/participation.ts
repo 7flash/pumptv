@@ -10,10 +10,10 @@ const participationMeasure = createMeasure("participation");
 export type WinnerReward = {
   proposalId: number;
   chainId: number;
-  asset: "ETH";
+  asset: "USDG";
+  tokenAddress: string | null;
   targetUsd: number;
-  amountEth: number | null;
-  quotedEthUsd: number | null;
+  amountUsdG: number | null;
   status: "pending" | "sending" | "sent" | "uncertain" | "skipped";
   transactionHash: string | null;
   explorerUrl: string | null;

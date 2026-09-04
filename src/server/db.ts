@@ -114,6 +114,11 @@ const openedDb = dbMeasure.measureSync(
           chainId: z.number().default(0),
           asset: z.string().default("LEGACY"),
           targetUsdCents: z.number().default(0),
+          // Generic ERC-20 payout fields. USDG rewards use these; the ETH fields
+          // remain only so old v51-v59 rows can be reconciled without replay.
+          tokenAddress: z.string().nullable().default(null),
+          tokenDecimals: z.number().nullable().default(null),
+          amountAtomic: z.string().nullable().default(null),
           amountWei: z.string().nullable().default(null),
           quotedEthUsdMicros: z.number().nullable().default(null),
           quoteSource: z.string().nullable().default(null),
