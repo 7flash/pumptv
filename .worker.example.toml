@@ -14,6 +14,10 @@ model = "gpt-5.6"
 db_path = ".data/pumptv.sqlite"
 room = "main"
 
+# Worker-side override for the generated opening episode. Keep this identical to
+# .config.toml when the worker is launched with an independent environment.
+opening_prompt = "Begin in absolute emptiness: a silent black void with no stars, no objects, no characters, and no readable text. A single faint point of light appears, then expands like the first instant of a newborn universe. Matter, color, depth, and motion emerge from nothing as the world begins to exist. Cinematic, mysterious, physically grounded, no logos."
+
 # Robinhood Chain payout network. Testnet: chain_id=46630 and testnet RPC.
 robinhood_chain_id = 4663
 robinhood_rpc_url = "https://rpc.mainnet.chain.robinhood.com"

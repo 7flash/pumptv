@@ -1,8 +1,16 @@
 import type { WorldState } from "../shared/contracts.ts";
 import { worldStateForH3 } from "./world-state.ts";
 
+export const DEFAULT_OPENING =
+  "Begin in absolute emptiness: a silent black void with no stars, no objects, no characters, and no readable text. A single faint point of light appears, then expands like the first instant of a newborn universe. Matter, color, depth, and motion emerge from nothing as the world begins to exist. Cinematic, mysterious, physically grounded, no logos.";
+
+// The opening episode is infrastructure, not a baked-in story premise. Override it
+// from the generation worker with PUMPTV_OPENING_PROMPT / [pumptv].opening_prompt.
 export const OPENING =
-  "Open on a rain-soaked neon convenience store at 2:13 AM. A nervous raccoon in a tiny delivery jacket discovers a mysterious glowing VHS tape behind the counter. Play it completely straight, cinematic live action.";
+  String(process.env.PUMPTV_OPENING_PROMPT || DEFAULT_OPENING)
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 700) || DEFAULT_OPENING;
 
 export function sanitizeLine(value: string, max = 600) {
   return value.replace(/\s+/g, " ").trim().slice(0, max);

@@ -2957,6 +2957,256 @@ export function OutsideInterfaceStyles() {
         }
       }
 
+      /* v56: phone-first composition. The desktop television is decorative; on
+         phones the video itself is the product. Flatten the chassis, move the
+         controls over the picture, and keep participation/history compact. */
+      @media (max-width: 820px) {
+        html,
+        body,
+        #pumptv-page {
+          min-height: 100dvh !important;
+          background: #000 !important;
+        }
+
+        .viewerApp {
+          min-height: 0 !important;
+          display: block !important;
+          padding: max(8px, env(safe-area-inset-top)) 0
+            max(12px, env(safe-area-inset-bottom)) !important;
+        }
+
+        .watchDeck {
+          width: 100% !important;
+          padding: 0 10px !important;
+        }
+
+        .minimalTop {
+          min-height: 50px !important;
+          display: flex !important;
+          align-items: center !important;
+          justify-content: space-between !important;
+          gap: 12px !important;
+          padding: 2px 4px 8px !important;
+        }
+        .minimalTop .wordmark {
+          width: 124px !important;
+          height: 38px !important;
+        }
+        .tinyStatus {
+          position: static !important;
+          margin-left: auto !important;
+        }
+
+        .tvCenter {
+          width: 100% !important;
+          margin: 0 !important;
+        }
+
+        .tvShell {
+          position: relative !important;
+          display: block !important;
+          width: 100% !important;
+          max-width: none !important;
+          height: auto !important;
+          min-height: 0 !important;
+          aspect-ratio: auto !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          border: 0 !important;
+          border-radius: 18px !important;
+          background: transparent !important;
+          box-shadow: none !important;
+          overflow: visible !important;
+        }
+        .tvScrew { display: none !important; }
+
+        .tvScreenFrame {
+          position: relative !important;
+          inset: auto !important;
+          grid-column: auto !important;
+          width: 100% !important;
+          height: auto !important;
+          min-height: 0 !important;
+          aspect-ratio: 16 / 9 !important;
+          margin: 0 !important;
+          padding: 0 !important;
+          border: 1px solid rgba(200,255,0,.16) !important;
+          border-radius: 18px !important;
+          background: #030403 !important;
+          box-shadow: 0 14px 44px rgba(0,0,0,.36) !important;
+          overflow: hidden !important;
+        }
+        .tvGlass {
+          width: 100% !important;
+          height: 100% !important;
+          border-radius: inherit !important;
+          overflow: hidden !important;
+        }
+
+        /* Keep the useful controls, lose the side hardware column. */
+        .tvHardware {
+          position: absolute !important;
+          z-index: 32 !important;
+          top: 9px !important;
+          right: 9px !important;
+          width: auto !important;
+          height: auto !important;
+          min-width: 0 !important;
+          min-height: 0 !important;
+          display: block !important;
+          padding: 0 !important;
+          border: 0 !important;
+          background: transparent !important;
+          box-shadow: none !important;
+          pointer-events: none !important;
+        }
+        .tvHardware .powerLamp,
+        .tvHardware .speaker {
+          display: none !important;
+        }
+        .tvHardware .knobStack {
+          display: flex !important;
+          flex-direction: row !important;
+          gap: 5px !important;
+          pointer-events: auto !important;
+        }
+        .tvHardware .knobControl {
+          width: 34px !important;
+          height: 32px !important;
+          min-width: 34px !important;
+          min-height: 32px !important;
+          border-radius: 9px !important;
+          background: rgba(3,4,3,.72) !important;
+          backdrop-filter: blur(10px) !important;
+        }
+        .tvHardware .knobIcon,
+        .tvHardware .knobIcon svg {
+          width: 16px !important;
+          height: 16px !important;
+        }
+
+        /* Intermission is a compact action surface at the bottom of the image,
+           not a desktop modal floating in the middle. */
+        .yourTurnOverlay {
+          place-items: end stretch !important;
+          padding: 9px !important;
+        }
+        .yourTurnCard {
+          width: 100% !important;
+          max-width: none !important;
+          box-sizing: border-box !important;
+          gap: 7px !important;
+          padding: 12px !important;
+          border-radius: 13px !important;
+          background: rgba(0,0,0,.82) !important;
+          backdrop-filter: blur(12px) !important;
+        }
+        .yourTurnKicker { font-size: 9px !important; }
+        .yourTurnCountdown {
+          font-size: 28px !important;
+          line-height: .95 !important;
+        }
+        .yourTurnMeta { font-size: 9px !important; }
+        .yourTurnCard > button {
+          width: 100% !important;
+          min-height: 42px !important;
+          margin: 0 !important;
+          border-radius: 10px !important;
+          font-size: 10px !important;
+        }
+
+        .participationBoard {
+          width: 100% !important;
+          margin: 8px 0 0 !important;
+        }
+        .participationDock {
+          min-height: 46px !important;
+          grid-template-columns: auto auto 1fr !important;
+          gap: 8px !important;
+          padding: 6px !important;
+          border-radius: 13px !important;
+        }
+        .dockIdeaSummary,
+        .proposalMetric,
+        .participationError {
+          display: none !important;
+        }
+        .boardToggle {
+          width: auto !important;
+          min-width: 104px !important;
+          height: 34px !important;
+          padding: 0 10px !important;
+          display: inline-flex !important;
+          align-items: center !important;
+          justify-content: center !important;
+          gap: 7px !important;
+        }
+        .viewerMetric {
+          min-width: 48px !important;
+          justify-self: start !important;
+        }
+        .walletMetric {
+          justify-self: end !important;
+          min-width: 40px !important;
+        }
+
+        .episodeShelf {
+          width: 100% !important;
+          height: auto !important;
+          max-height: none !important;
+          margin: 8px 0 0 !important;
+          padding: 0 10px !important;
+          display: block !important;
+          border: 0 !important;
+          background: transparent !important;
+          box-shadow: none !important;
+          overflow: visible !important;
+        }
+        .episodeShelf > .liveCap { display: none !important; }
+        .episodeShelf > .episodeList {
+          width: 100% !important;
+          height: auto !important;
+          min-height: 0 !important;
+          display: flex !important;
+          flex-direction: row !important;
+          gap: 8px !important;
+          padding: 0 0 4px !important;
+          overflow-x: auto !important;
+          overflow-y: hidden !important;
+          scroll-snap-type: x proximity !important;
+          scrollbar-width: none !important;
+        }
+        .episodeShelf > .episodeList::-webkit-scrollbar { display: none !important; }
+        .episodeList > .episodeCard,
+        .episodeList > .programShelfSlot {
+          flex: 0 0 118px !important;
+          width: 118px !important;
+          min-width: 118px !important;
+          transform: none !important;
+          scroll-snap-align: start !important;
+        }
+      }
+
+      @media (max-width: 480px) {
+        .watchDeck { padding-inline: 8px !important; }
+        .minimalTop .wordmark {
+          width: 112px !important;
+          height: 34px !important;
+        }
+        .tvScreenFrame { border-radius: 15px !important; }
+        .tvHardware { top: 7px !important; right: 7px !important; }
+        .tvHardware .knobControl {
+          width: 32px !important;
+          height: 30px !important;
+          min-width: 32px !important;
+          min-height: 30px !important;
+        }
+        .participationDock { gap: 6px !important; }
+        .boardToggle { min-width: 96px !important; }
+        .viewerMetric { min-width: 42px !important; }
+        .episodeShelf { padding-inline: 8px !important; }
+      }
+
     `}</style>
   );
 }

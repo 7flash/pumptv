@@ -35,19 +35,14 @@ const SENDING_STALE_MS = Math.max(
 );
 
 let sending: Promise<void> | null = null;
-let quoteCache: { atMs: number; ethUsdMicros: number; source: string } | null =
-  null;
+let quoteCache: { atMs: number; ethUsdMicros: number; source: string } | null = null;
 let nextQuoteAttemptAtMs = 0;
 
 class RewardDeferredError extends Error {}
 class RewardSkippedError extends Error {}
 
 function cleanError(error: unknown) {
-  return (
-    error instanceof Error
-      ? error.message
-      : String(error || "Unknown reward error")
-  )
+  return (error instanceof Error ? error.message : String(error || "Unknown reward error"))
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 600);
@@ -88,9 +83,7 @@ export async function rewardWalletInfo() {
     },
     async () => {
       const { account, publicClient } = clients();
-      const balanceWei = await publicClient.getBalance({
-        address: account.address,
-      });
+      const balanceWei = await publicClient.getBalance({ address: account.address });
       return {
         address: account.address,
         chainId: ROBINHOOD_CHAIN_ID,
@@ -120,8 +113,7 @@ export function latestRewardForWallet(walletAddress: string) {
         ROBINHOOD_CHAIN_ID,
       )[0] || null;
     if (!row) return null;
-    const amountWei =
-      row.amountWei == null ? null : BigInt(String(row.amountWei));
+    const amountWei = row.amountWei == null ? null : BigInt(String(row.amountWei));
     return {
       id: Number(row.id),
       roundId: Number(row.roundId),
@@ -192,16 +184,14 @@ async function loadEthUsdQuote() {
 }
 
 async function quoteOnePendingReward() {
-  const row = dbMeasure.measureSync(
-    "Find unquoted winner reward",
-    () =>
-      db.raw<any>(
-        `SELECT * FROM ideaRewards
+  const row = dbMeasure.measureSync("Find unquoted winner reward", () =>
+    db.raw<any>(
+      `SELECT * FROM ideaRewards
        WHERE status = 'pending' AND chainId = ? AND asset = 'ETH'
          AND amountWei IS NULL
        ORDER BY id ASC LIMIT 1`,
-        ROBINHOOD_CHAIN_ID,
-      )[0] || null,
+      ROBINHOOD_CHAIN_ID,
+    )[0] || null,
   );
   if (!row) return false;
 
@@ -317,8 +307,7 @@ async function reconcileSendingRewards() {
       const receipt = await publicClient.getTransactionReceipt({
         hash: String(row.signature) as Hex,
       });
-      if (receipt.status === "success")
-        markSent(Number(row.id), String(row.signature));
+      if (receipt.status === "success") markSent(Number(row.id), String(row.signature));
       else
         dbMeasure.measureSync("Mark reverted Robinhood reward", () =>
           db.exec(
@@ -361,8 +350,7 @@ async function preflightReward(row: any) {
 async function sendOneReward(row: any) {
   const amountWei = BigInt(String(row.amountWei));
   const address = normalizeEvmAddress(row.walletAddress);
-  if (!address)
-    throw new RewardSkippedError("Winner reward has an invalid EVM address");
+  if (!address) throw new RewardSkippedError("Winner reward has an invalid EVM address");
 
   return rewardMeasure.measure(
     {

@@ -16,6 +16,10 @@ room = "main"
 admin_token = ""
 resolution = "480P"
 
+# Episode 1 opening premise. This is generated without a viewer proposal. Keep
+# it broad enough that later community ideas are not trapped in a fixed setting.
+opening_prompt = "Begin in absolute emptiness: a silent black void with no stars, no objects, no characters, and no readable text. A single faint point of light appears, then expands like the first instant of a newborn universe. Matter, color, depth, and motion emerge from nothing as the world begins to exist. Cinematic, mysterious, physically grounded, no logos."
+
 min_generation_interval_ms = 0
 lease_ttl_ms = 30000
 web_heartbeat_ttl_ms = 6000
