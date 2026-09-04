@@ -9,6 +9,7 @@ import {
   createMediaDeckController,
   type LiveSlotState,
 } from "../src/client/media-deck.ts";
+import { createVisualViewportController } from "../src/client/visual-viewport.ts";
 import {
   createMetaMaskController,
   normalizeEvmAddress,
@@ -48,6 +49,7 @@ let ideaDraft = "";
 let ideaDraftDirty = false;
 let syncedOwnProposalSignature = "";
 let rewardPollAtMs = 0;
+let ideaComposerFocused = false;
 
 type WinnerReward = {
   proposalId: number;
@@ -97,6 +99,7 @@ const viewSignals = createReactiveState({
   lastEndedLiveClipId: null as number | null,
 });
 const view = viewSignals.state;
+const visualViewport = createVisualViewportController();
 const renderQueue = createInvalidationQueue((reasons) => renderApp(reasons));
 const media = createMediaDeckController({
   state: view,
@@ -457,6 +460,9 @@ async function submitIdea() {
     ideaDraftDirty = false;
     syncedOwnProposalSignature = "";
     await refreshStreamState();
+    if (ideaComposerFocused && !shouldAutofocusIdea()) {
+      document.querySelector<HTMLInputElement>("[data-idea-input]")?.blur();
+    }
   } catch (cause) {
     view.participationError =
       cause instanceof Error ? cause.message : "Could not save idea";
@@ -534,10 +540,23 @@ function focusIdeaInputIfAppropriate() {
   );
 }
 
+function closeTray() {
+  const input = document.querySelector<HTMLInputElement>("[data-idea-input]");
+  if (document.activeElement === input) input.blur();
+  ideaComposerFocused = false;
+  document.documentElement.dataset.pumptvComposer = "closed";
+  view.trayOpen = false;
+  visualViewport.refresh("tray-close");
+}
+
 function toggleTray() {
   const opening = !view.trayOpen;
-  view.trayOpen = opening;
-  if (opening) focusIdeaInputIfAppropriate();
+  if (!opening) {
+    closeTray();
+    return;
+  }
+  view.trayOpen = true;
+  focusIdeaInputIfAppropriate();
 }
 
 function openTray() {
@@ -849,6 +868,7 @@ async function runStateLongPoll() {
 
 async function boot() {
   ensureViewerIdAndPrefs();
+  visualViewport.install();
   installInteractionLayer();
   installRichTooltips();
   syncLocalUiState();
@@ -963,7 +983,7 @@ function installInteractionLayer() {
       )
         return;
 
-      view.trayOpen = false;
+      closeTray();
     },
     true,
   );
@@ -991,9 +1011,7 @@ function installInteractionLayer() {
         }
       } else if (action === "tray-toggle") toggleTray();
       else if (action === "close-tray") {
-        if (view.trayOpen) {
-          view.trayOpen = false;
-        }
+        if (view.trayOpen) closeTray();
       } else if (action === "close-reward") {
         view.winnerNoticeDismissed = true;
         if (view.walletAddress && view.winnerNoticeProposalId)
@@ -1040,6 +1058,41 @@ function installInteractionLayer() {
   );
 
   document.addEventListener(
+    "focusin",
+    (event) => {
+      const target =
+        event.target instanceof HTMLInputElement ? event.target : null;
+      if (!target?.matches("[data-idea-input]")) return;
+      ideaComposerFocused = true;
+      document.documentElement.dataset.pumptvComposer = "open";
+      visualViewport.refresh("idea-focus");
+      requestAnimationFrame(() => target.scrollIntoView({ block: "nearest" }));
+    },
+    true,
+  );
+
+  document.addEventListener(
+    "focusout",
+    (event) => {
+      const target =
+        event.target instanceof HTMLInputElement ? event.target : null;
+      if (!target?.matches("[data-idea-input]")) return;
+      requestAnimationFrame(() => {
+        const active = document.activeElement;
+        if (
+          !(active instanceof HTMLInputElement) ||
+          !active.matches("[data-idea-input]")
+        ) {
+          ideaComposerFocused = false;
+          document.documentElement.dataset.pumptvComposer = "closed";
+          visualViewport.refresh("idea-blur");
+        }
+      });
+    },
+    true,
+  );
+
+  document.addEventListener(
     "submit",
     (event) => {
       const form =
@@ -1059,7 +1112,7 @@ function installInteractionLayer() {
       return;
     }
     if (view.trayOpen) {
-      view.trayOpen = false;
+      closeTray();
       return;
     }
     if (view.infoOpen) {
@@ -1504,6 +1557,14 @@ function PersistentIdeas() {
             <strong data-drawer-countdown>{countdown}</strong>
           </span>
         ) : null}
+        <button
+          type="button"
+          className="mobileSheetClose"
+          data-action="close-tray"
+          aria-label="Close ideas"
+        >
+          ×
+        </button>
       </div>
       <form
         className={`persistentIdeaForm ${own ? "editing" : ""}`}

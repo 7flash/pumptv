@@ -3207,6 +3207,121 @@ export function OutsideInterfaceStyles() {
         .episodeShelf { padding-inline: 8px !important; }
       }
 
+
+      /* v57: keyboard-safe mobile composer. The on-screen keyboard changes the
+         VisualViewport without reliably changing the layout viewport on every
+         browser. JS publishes the real visible height as --pumptv-vv-height;
+         focused composition uses that exact space and drops secondary world
+         content until the keyboard closes. */
+      .mobileSheetClose {
+        display: none;
+      }
+
+      @media (max-width: 900px) {
+        .mobileSheetClose {
+          width: 30px !important;
+          height: 30px !important;
+          min-width: 30px !important;
+          display: inline-grid !important;
+          place-items: center !important;
+          margin-left: auto !important;
+          border: 1px solid rgba(255,255,255,.10) !important;
+          border-radius: 9px !important;
+          background: rgba(255,255,255,.035) !important;
+          color: rgba(255,255,255,.82) !important;
+          font: 500 20px/1 system-ui, sans-serif !important;
+          cursor: pointer !important;
+        }
+
+        .persistentIdeasHead {
+          display: flex !important;
+          align-items: center !important;
+          gap: 10px !important;
+        }
+        .persistentIdeasHead > span {
+          margin-left: auto !important;
+        }
+        .persistentIdeasHead > span + .mobileSheetClose {
+          margin-left: 0 !important;
+        }
+
+        html[data-pumptv-composer="open"] .participationSheet {
+          top: 6px !important;
+          bottom: auto !important;
+          left: 6px !important;
+          right: 6px !important;
+          width: auto !important;
+          height: calc(var(--pumptv-vv-height, 100dvh) - 12px) !important;
+          max-height: calc(var(--pumptv-vv-height, 100dvh) - 12px) !important;
+          min-height: 0 !important;
+          grid-template-rows: minmax(0, 1fr) !important;
+          border-radius: 15px !important;
+          transform: none !important;
+        }
+        html[data-pumptv-composer="open"] .drawerGrab {
+          display: none !important;
+        }
+        html[data-pumptv-composer="open"] .participationColumns {
+          height: 100% !important;
+          min-height: 0 !important;
+          overflow: hidden !important;
+          padding: 0 !important;
+        }
+        html[data-pumptv-composer="open"] .persistentWorld {
+          display: none !important;
+        }
+        html[data-pumptv-composer="open"] .persistentIdeas {
+          display: grid !important;
+          grid-template-rows: auto auto minmax(0, 1fr) !important;
+          align-content: stretch !important;
+          height: 100% !important;
+          min-height: 0 !important;
+          overflow: hidden !important;
+          padding: 10px !important;
+          border: 0 !important;
+        }
+        html[data-pumptv-composer="open"] .persistentIdeaForm {
+          display: grid !important;
+          grid-template-columns: minmax(0, 1fr) auto auto !important;
+          gap: 6px !important;
+          margin: 8px 0 10px !important;
+          padding: 0 !important;
+        }
+        html[data-pumptv-composer="open"] .persistentIdeaForm > input {
+          width: 100% !important;
+          min-width: 0 !important;
+          height: 46px !important;
+          padding-inline: 13px !important;
+          border: 1px solid rgba(200,255,0,.48) !important;
+          border-radius: 11px !important;
+          background: #090b09 !important;
+          color: #fff !important;
+          font-size: 16px !important;
+          line-height: 1.2 !important;
+          box-shadow: 0 0 0 2px rgba(200,255,0,.06) !important;
+        }
+        html[data-pumptv-composer="open"] .persistentIdeaForm > button {
+          width: 46px !important;
+          height: 46px !important;
+          min-width: 46px !important;
+          border-radius: 11px !important;
+        }
+        html[data-pumptv-composer="open"] .persistentProposalList {
+          min-height: 0 !important;
+          max-height: none !important;
+          overflow-y: auto !important;
+          overflow-x: hidden !important;
+          overscroll-behavior-y: contain !important;
+          -webkit-overflow-scrolling: touch !important;
+          padding: 0 1px max(10px, env(safe-area-inset-bottom)) 0 !important;
+        }
+
+        /* Prevent iOS focus zoom even outside the dedicated composer state. */
+        .persistentIdeaForm > input {
+          font-size: max(16px, 1em) !important;
+        }
+      }
+
     `}</style>
   );
 }
