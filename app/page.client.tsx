@@ -11,6 +11,11 @@ import {
 } from "../src/client/media-deck.ts";
 import { createVisualViewportController } from "../src/client/visual-viewport.ts";
 import {
+  createParticipationController,
+  winnerRewardStatusLabel,
+  type WinnerReward,
+} from "../src/client/participation.ts";
+import {
   createMetaMaskController,
   normalizeEvmAddress,
   type WalletNetwork,
@@ -28,12 +33,6 @@ import type {
 
 const uiMeasure = createMeasure("ui");
 
-function clientErrorText(error: unknown) {
-  return error instanceof Error
-    ? error.message
-    : String(error ?? "Unknown error");
-}
-
 let serverOffsetMs = 0;
 let longPollAbort: AbortController | null = null;
 let streamRevision = 0;
@@ -45,26 +44,7 @@ let timer: ReturnType<typeof setInterval> | null = null;
 
 type WalletState = "idle" | "connecting" | "connected" | "error";
 
-let ideaDraft = "";
-let ideaDraftDirty = false;
-let syncedOwnProposalSignature = "";
-let rewardPollAtMs = 0;
 let ideaComposerFocused = false;
-
-type WinnerReward = {
-  proposalId: number;
-  chainId: number;
-  asset: "ETH";
-  targetUsd: number;
-  amountEth: number | null;
-  quotedEthUsd: number | null;
-  status: "pending" | "sending" | "sent" | "uncertain" | "skipped";
-  transactionHash: string | null;
-  explorerUrl: string | null;
-  lastError: string | null;
-  claimedAtMs?: number | null;
-  sentAtMs?: number | null;
-};
 
 const viewSignals = createReactiveState({
   timeline: [] as Clip[],
@@ -100,6 +80,17 @@ const viewSignals = createReactiveState({
 });
 const view = viewSignals.state;
 const visualViewport = createVisualViewportController();
+const participation = createParticipationController({
+  state: view,
+  json,
+  viewerId: () => viewerId,
+  proposalOwnerId: () => proposalOwnerId,
+  refreshStreamState,
+  shouldDismissComposerAfterSubmit: () =>
+    ideaComposerFocused && !shouldAutofocusIdea(),
+  onSubmitComplete: () =>
+    document.querySelector<HTMLInputElement>("[data-idea-input]")?.blur(),
+});
 const renderQueue = createInvalidationQueue((reasons) => renderApp(reasons));
 const media = createMediaDeckController({
   state: view,
@@ -156,7 +147,7 @@ function renderApp(reasons: readonly string[]) {
       media.ensureMediaDeck();
       media.observeMediaTarget();
       syncLocalPresentation();
-      syncIdeaFormState();
+      participation.syncFormState();
       updateLiveMeters();
 
       const selectionRelevant = reasons.some(
@@ -210,9 +201,9 @@ function applyState(state: StreamState) {
           `pumptv-reward-dismissed:${view.walletAddress}:${proposalId}`,
         ) === "1";
     }
-    void refreshWinnerReward();
+    void participation.refreshWinnerReward();
   }
-  syncIdeaDraftFromBoard();
+  participation.syncDraftFromBoard();
 
   if (initialCatchupPending) {
     const published = [...state.timeline]
@@ -243,6 +234,7 @@ function applyState(state: StreamState) {
 function walletFromAddress(value: unknown) {
   const next = normalizeEvmAddress(value);
   if (view.walletAddress !== next) {
+    view.walletScoreLoading = false;
     view.winnerReward = null;
     view.winnerNoticeProposalId = null;
     view.winnerNoticeDismissed = false;
@@ -271,8 +263,8 @@ function getMetaMaskController() {
       view.walletEthBalance = 0;
       view.walletPower = 1;
       if (view.walletAddress) {
-        void refreshWalletScore();
-        void refreshWinnerReward();
+        void participation.refreshWalletScore();
+        void participation.refreshWinnerReward();
       }
     },
     onDisconnect: () => {
@@ -281,7 +273,7 @@ function getMetaMaskController() {
       view.walletPower = 1;
     },
     onChainChanged: () => {
-      if (view.walletAddress) void refreshWalletScore();
+      if (view.walletAddress) void participation.refreshWalletScore();
     },
   });
   return metamaskController;
@@ -294,8 +286,8 @@ async function connectMetaMask(interactive: boolean) {
     const result = await getMetaMaskController().connect(interactive);
     walletFromAddress(result.address);
     if (view.walletAddress) {
-      await refreshWalletScore();
-      await refreshWinnerReward();
+      await participation.refreshWalletScore();
+      await participation.refreshWinnerReward();
     }
     return Boolean(view.walletAddress);
   } catch (cause: any) {
@@ -315,216 +307,6 @@ async function refreshStreamState() {
   try {
     applyState(await json<StreamState>("/api/state"));
   } catch {}
-}
-
-function ownerKey() {
-  return view.walletAddress
-    ? `wallet:${view.walletAddress}`
-    : `web:${proposalOwnerId}`;
-}
-
-function currentBoardRound() {
-  return view.program?.votingRound || null;
-}
-
-function ownProposal() {
-  return (
-    currentBoardRound()?.proposals.find(
-      (proposal) =>
-        proposal.source === "web" && proposal.sourceId === ownerKey(),
-    ) || null
-  );
-}
-
-function normalizedIdea(value: string) {
-  return value.replace(/\s+/g, " ").trim().slice(0, 500);
-}
-
-function syncIdeaDraftFromBoard() {
-  if (ideaDraftDirty) return;
-  const own = ownProposal();
-  const signature = own ? `${own.id}:${own.text}` : "";
-  if (signature === syncedOwnProposalSignature) return;
-  syncedOwnProposalSignature = signature;
-  ideaDraft = own?.text || "";
-}
-
-function ideaCanSubmit() {
-  if (view.ideaSubmitting) return false;
-  if (
-    view.program?.phase === "locked" ||
-    view.program?.phase === "planning" ||
-    view.program?.phase === "rendering" ||
-    view.program?.phase === "finalizing"
-  )
-    return false;
-  const text = normalizedIdea(ideaDraft);
-  if (!text) return false;
-  const own = ownProposal();
-  if (own && currentBoardRound()?.decisionMode === "voting") return false;
-  return !own || normalizedIdea(own.text) !== text;
-}
-
-function syncIdeaFormState() {
-  const enabled = ideaCanSubmit();
-  document
-    .querySelectorAll<HTMLButtonElement>('[data-action="submit-idea"]')
-    .forEach((button) => {
-      button.disabled = !enabled;
-      button.setAttribute("aria-disabled", String(!enabled));
-    });
-}
-
-async function refreshWalletScore() {
-  if (!view.walletAddress || view.walletScoreLoading) return;
-  view.walletScoreLoading = true;
-  view.participationError = null;
-  try {
-    const result = await json<{
-      ethBalance: number;
-      power: number;
-      chainId: number;
-    }>("/api/wallet/score", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        viewerId,
-        ownerId: proposalOwnerId,
-        walletAddress: view.walletAddress,
-      }),
-    });
-    view.walletEthBalance = Number(result.ethBalance || 0);
-    view.walletPower = Math.max(1, Number(result.power || 1));
-    await refreshStreamState();
-  } catch (cause) {
-    view.walletEthBalance = 0;
-    view.walletPower = 1;
-    view.participationError =
-      cause instanceof Error
-        ? cause.message
-        : "Could not read Robinhood wallet";
-  } finally {
-    view.walletScoreLoading = false;
-  }
-}
-
-async function refreshWinnerReward() {
-  if (!view.walletAddress) return;
-  const address = view.walletAddress;
-  try {
-    const payload = await json<{ reward: WinnerReward | null }>(
-      `/api/rewards/mine?walletAddress=${encodeURIComponent(address)}`,
-      { cache: "no-store" },
-    );
-    if (view.walletAddress !== address) return;
-    view.winnerReward = payload.reward;
-    if (payload.reward) {
-      const recentSent =
-        payload.reward.status !== "sent" ||
-        !payload.reward.sentAtMs ||
-        Date.now() - payload.reward.sentAtMs < 10 * 60_000;
-      if (
-        recentSent ||
-        view.winnerNoticeProposalId === payload.reward.proposalId
-      ) {
-        view.winnerNoticeProposalId = payload.reward.proposalId;
-        view.winnerNoticeDismissed =
-          sessionStorage.getItem(
-            `pumptv-reward-dismissed:${address}:${payload.reward.proposalId}`,
-          ) === "1";
-      }
-    }
-  } catch {
-    // Reward status is non-critical viewer metadata. The worker owns payment.
-  }
-}
-
-async function submitIdea() {
-  if (view.ideaSubmitting) return;
-  const text = normalizedIdea(ideaDraft);
-  if (!text) return;
-
-  view.ideaSubmitting = true;
-  view.participationError = null;
-  try {
-    await json("/api/proposals", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        text,
-        viewerId,
-        ownerId: proposalOwnerId,
-        walletAddress: view.walletAddress,
-      }),
-    });
-    ideaDraftDirty = false;
-    syncedOwnProposalSignature = "";
-    await refreshStreamState();
-    if (ideaComposerFocused && !shouldAutofocusIdea()) {
-      document.querySelector<HTMLInputElement>("[data-idea-input]")?.blur();
-    }
-  } catch (cause) {
-    view.participationError =
-      cause instanceof Error ? cause.message : "Could not save idea";
-  } finally {
-    view.ideaSubmitting = false;
-  }
-}
-
-async function cancelOwnIdea() {
-  if (view.ideaSubmitting || !ownProposal()) return;
-  view.ideaSubmitting = true;
-  view.participationError = null;
-  try {
-    await json("/api/proposals", {
-      method: "DELETE",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        viewerId,
-        ownerId: proposalOwnerId,
-        walletAddress: view.walletAddress,
-      }),
-    });
-    ideaDraft = "";
-    ideaDraftDirty = false;
-    syncedOwnProposalSignature = "";
-    await refreshStreamState();
-  } catch (cause) {
-    view.participationError =
-      cause instanceof Error ? cause.message : "Could not cancel idea";
-  } finally {
-    view.ideaSubmitting = false;
-  }
-}
-
-async function voteForProposal(proposalId: number) {
-  if (
-    !Number.isSafeInteger(proposalId) ||
-    proposalId <= 0 ||
-    view.votePendingId
-  )
-    return;
-
-  view.votePendingId = proposalId;
-  view.participationError = null;
-  try {
-    await json("/api/votes", {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        proposalId,
-        viewerId,
-        ownerId: proposalOwnerId,
-        walletAddress: view.walletAddress,
-      }),
-    });
-    await refreshStreamState();
-  } catch (cause) {
-    view.participationError =
-      cause instanceof Error ? cause.message : "Could not vote";
-  } finally {
-    view.votePendingId = null;
-  }
 }
 
 function shouldAutofocusIdea() {
@@ -887,10 +669,7 @@ async function boot() {
     media.syncNow();
     media.reconcileLiveEdge();
     updateLiveMeters();
-    if (view.walletAddress && Date.now() - rewardPollAtMs >= 3_000) {
-      rewardPollAtMs = Date.now();
-      void refreshWinnerReward();
-    }
+    participation.maybePollWinnerReward();
   }, 100);
 }
 
@@ -1013,16 +792,11 @@ function installInteractionLayer() {
       else if (action === "close-tray") {
         if (view.trayOpen) closeTray();
       } else if (action === "close-reward") {
-        view.winnerNoticeDismissed = true;
-        if (view.walletAddress && view.winnerNoticeProposalId)
-          sessionStorage.setItem(
-            `pumptv-reward-dismissed:${view.walletAddress}:${view.winnerNoticeProposalId}`,
-            "1",
-          );
+        participation.dismissWinnerNotice();
       } else if (action === "tray-ideas") openTray();
       else if (action === "wallet") void connectMetaMask(true);
-      else if (action === "submit-idea") void submitIdea();
-      else if (action === "cancel-own") void cancelOwnIdea();
+      else if (action === "submit-idea") void participation.submitIdea();
+      else if (action === "cancel-own") void participation.cancelOwnIdea();
       else if (action === "world-detail") {
         const kind = control.dataset.worldKind as
           "location" | "character" | "prop" | undefined;
@@ -1033,7 +807,7 @@ function installInteractionLayer() {
         view.worldDetailId = null;
       } else if (action === "vote") {
         const id = Number(control.dataset.proposalId);
-        if (Number.isSafeInteger(id)) void voteForProposal(id);
+        if (Number.isSafeInteger(id)) void participation.voteForProposal(id);
       } else if (action === "fullscreen") void toggleFullscreen();
       else if (action === "live") media.returnLive();
       else if (action === "episode") {
@@ -1050,9 +824,8 @@ function installInteractionLayer() {
       const target =
         event.target instanceof HTMLInputElement ? event.target : null;
       if (!target?.matches("[data-idea-input]")) return;
-      ideaDraft = target.value.slice(0, 500);
-      ideaDraftDirty = true;
-      syncIdeaFormState();
+      participation.setDraft(target.value);
+      participation.syncFormState();
     },
     true,
   );
@@ -1099,7 +872,7 @@ function installInteractionLayer() {
         event.target instanceof HTMLFormElement ? event.target : null;
       if (!form?.matches("[data-idea-form]")) return;
       event.preventDefault();
-      void submitIdea();
+      void participation.submitIdea();
     },
     true,
   );
@@ -1538,8 +1311,8 @@ function ProposalCard({
 }
 
 function PersistentIdeas() {
-  const round = currentBoardRound();
-  const own = ownProposal();
+  const round = participation.currentRound();
+  const own = participation.ownProposal();
   const proposals = sortedCandidates(round);
   const ownLocked = Boolean(own && round?.decisionMode === "voting");
   const countdown = view.program?.countdownEndsAtMs
@@ -1572,7 +1345,7 @@ function PersistentIdeas() {
       >
         <input
           data-idea-input
-          value={ideaDraft}
+          value={participation.draft()}
           maxLength={500}
           autoComplete="off"
           spellCheck="true"
@@ -1589,7 +1362,7 @@ function PersistentIdeas() {
         <button
           type="submit"
           data-action="submit-idea"
-          disabled={!ideaCanSubmit()}
+          disabled={!participation.canSubmit()}
           aria-label={own ? "Save changed idea" : "Submit idea"}
         >
           <BoardIcon name="send" />
@@ -1780,13 +1553,13 @@ function PersistentWorld() {
 }
 
 function ParticipationBoard() {
-  const round = currentBoardRound();
+  const round = participation.currentRound();
   const candidates = sortedCandidates(round);
   const leader = candidates[0] || null;
   const walletTitle = view.walletAddress
     ? `${shortAddress(view.walletAddress)} · Robinhood Chain · ${view.walletEthBalance.toFixed(4)} ETH · 1 vote`
     : "Connect MetaMask";
-  const own = ownProposal();
+  const own = participation.ownProposal();
 
   return (
     <section className={`participationBoard ${view.trayOpen ? "open" : ""}`}>
@@ -2024,12 +1797,7 @@ function WinnerRewardNotice() {
       : null;
   const targetUsd = reward?.targetUsd ?? 1;
   const amountEth = reward?.amountEth ?? null;
-  const status =
-    reward?.status === "sent"
-      ? "SENT"
-      : reward?.status === "uncertain"
-        ? "PAYMENT PENDING"
-        : "SENDING";
+  const status = winnerRewardStatusLabel(reward);
   return (
     <aside
       className={`winnerRewardNotice ${reward?.status || "pending"}`}
